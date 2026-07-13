@@ -1,0 +1,83 @@
+listen_addr = "127.0.0.1:8080"
+
+# Optional loopback-only admin web interface (monitoring + runtime config
+# editing). Disabled unless enable = true. Omitting listen_address binds
+# 127.0.0.1 with a random port, printed at startup. The UI is served from the
+# ui/ directory next to the binary: debug builds re-read files per request,
+# release builds read them once at startup and cache until restart.
+[admin]
+enable = false
+# listen_address = "127.0.0.1:11180"
+# ui_dir = "/path/to/llmproxy/ui"
+
+[upstream]
+base_url = "http://127.0.0.1:8000/v1"
+# api_key_env = "VLLM_API_KEY"
+timeout_secs = 600
+connect_timeout_secs = 10
+pool_max_idle_per_host = 64
+pool_idle_timeout_secs = 90
+
+[providers.embeddings]
+base_url = "http://127.0.0.1:18000/v1"
+timeout_secs = 600
+connect_timeout_secs = 10
+pool_max_idle_per_host = 64
+pool_idle_timeout_secs = 90
+
+# Optional local-first agent interceptor. The local provider receives a dynamic
+# Chat Completions copy of /chat/completions, /responses, or /messages requests.
+# A normal completion is returned to the client; a sole PASS function call sends
+# the untouched original request through the existing provider/model remapping.
+[providers.local_interceptor]
+base_url = "http://127.0.0.1:11434/v1"
+# api_key_env = "LOCAL_LLM_API_KEY"
+timeout_secs = 30
+connect_timeout_secs = 2
+pool_max_idle_per_host = 16
+pool_idle_timeout_secs = 90
+
+[interceptor]
+enabled = false
+provider = "local_interceptor"
+model = "qwen3:4b"
+timeout_ms = 60000
+fallback_on_error = true
+# Sampling for the local triage request. Completions that hit max_tokens fall
+# back to external routing instead of serving a clipped answer; max_tokens = 0
+# leaves the client's own limits in place.
+# temperature = 0.0
+# max_tokens = 512
+# parallel_tool_calls = false
+# instructions = """Override the default local routing instructions here."""
+# Launch Codex or Claude with this block enabled only for the child process:
+# llmproxy --config llmproxy.example.toml --intercept --codex
+# llmproxy --config llmproxy.example.toml --intercept --claude
+
+# Optional manual overrides. Without these, every incoming model is mapped to
+# the first id returned by the default upstream /v1/models. Inline route tables
+# select both a named provider and its upstream model.
+[model_aliases]
+# codex-qwen = "Qwen/Qwen2.5-Coder-32B-Instruct"
+# claude-sonnet = "Qwen/Qwen2.5-Coder-32B-Instruct"
+embedding = { provider = "embeddings", model = "Qwen/Qwen3-Embedding-0.6B" }
+
+[role_map]
+# Qwen/vLLM chat templates often reject Codex/OpenAI's newer roles.
+developer = "system"
+function = "user"
+tool = "user"
+
+[chat]
+# For Qwen thinking models, inject chat_template_kwargs.enable_thinking=false
+# so OpenAI-compatible clients receive normal message.content instead of a
+# vLLM reasoning field with null content.
+disable_thinking = false
+
+[responses]
+mode = "chat_completions"
+
+[models]
+expose_aliases = true
+expose_upstream = true
+# cache_ttl_secs = 300 # optional; unset caches /v1/models indefinitely, 0 disables

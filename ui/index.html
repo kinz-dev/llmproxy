@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llmproxy · admin</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1 15 8 8 15 1 8Z' fill='%230F1517'/%3E%3Cpath d='M8 3.5 12.5 8 8 12.5Z' fill='%23E8A33D'/%3E%3Cpath d='M8 3.5 3.5 8 8 12.5Z' fill='%233ECF8E'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M8 1 15 8 8 15 1 8Z" fill="none" stroke="currentColor" stroke-width="1"/>
+        <path d="M8 3.5 12.5 8 8 12.5Z" fill="var(--external)"/>
+        <path d="M8 3.5 3.5 8 8 12.5Z" fill="var(--local)"/>
+      </svg>
+      <h1 class="brand-name">llmproxy <span class="brand-sub">admin</span></h1>
+    </div>
+    <div class="masthead-meta mono">
+      <span class="meta-item"><span class="lamp" id="lamp-proxy" aria-hidden="true"></span><span id="meta-proxy-addr">—</span></span>
+      <span class="meta-item" id="meta-uptime" title="proxy uptime">—</span>
+      <span class="meta-item" id="meta-interceptor">interceptor —</span>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="Admin sections">
+      <a class="tab" id="tab-monitor" role="tab" aria-selected="true" aria-controls="view-monitor" href="#/monitor">Monitor</a>
+      <a class="tab" id="tab-configure" role="tab" aria-selected="false" aria-controls="view-configure" href="#/configure">Configure</a>
+      <a class="tab" id="tab-prompt" role="tab" aria-selected="false" aria-controls="view-prompt" href="#/prompt">System prompt</a>
+    </nav>
+  </div>
+</header>
+
+<main class="content">
+
+<!-- ================================ MONITOR ================================ -->
+<div id="view-monitor" role="tabpanel" aria-labelledby="tab-monitor">
+  <div class="grid-two">
+
+    <section class="panel" aria-labelledby="launch-label">
+      <h2 class="panel-label" id="launch-label">Start an agent</h2>
+      <p class="panel-intro">Run Codex, Claude Code, or Copilot CLI through the proxy so deterministic
+      requests are answered by the local interceptor model and everything else
+      passes through unchanged.</p>
+
+      <fieldset class="choice-row" id="agent-choice">
+        <legend class="choice-legend mono">agent</legend>
+        <label class="choice"><input type="radio" name="agent" value="codex" checked> Codex</label>
+        <label class="choice"><input type="radio" name="agent" value="claude"> Claude Code</label>
+        <label class="choice"><input type="radio" name="agent" value="copilot"> Copilot CLI</label>
+      </fieldset>
+
+      <fieldset class="choice-row" id="style-choice">
+        <legend class="choice-legend mono">method</legend>
+        <label class="choice"><input type="radio" name="style" value="launcher" checked> Launcher <span class="choice-note">child process, existing login</span></label>
+        <label class="choice"><input type="radio" name="style" value="env"> Manual <span class="choice-note">env / profile against this proxy</span></label>
+      </fieldset>
+
+      <div class="command-block">
+        <pre class="command mono" id="launch-command" tabindex="0">loading…</pre>
+        <button class="button copy-button" id="copy-launch" type="button">Copy</button>
+      </div>
+      <p class="hint" id="launch-hint"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="routing-label">
+      <h2 class="panel-label" id="routing-label">Routing</h2>
+
+      <h3 class="sub-label mono">providers</h3>
+      <ul class="provider-list" id="provider-list"></ul>
+
+      <h3 class="sub-label mono">model aliases</h3>
+      <div class="table-scroll">
+        <table class="data-table" id="alias-table">
+          <thead><tr><th>requested model</th><th></th><th>served by</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="hint" id="alias-hint"></p>
+
+      <h3 class="sub-label mono">role rewrites</h3>
+      <p class="rolemap mono" id="rolemap-line">—</p>
+    </section>
+
+  </div>
+
+  <section class="panel" aria-labelledby="traffic-label">
+    <div class="panel-head-row">
+      <h2 class="panel-label" id="traffic-label">Traffic</h2>
+      <button class="button button-quiet" id="reset-stats" type="button">Reset counters</button>
+    </div>
+
+    <div class="flow-wrap">
+      <svg class="flow" id="flow-strip" viewBox="0 0 760 168" role="img"
+           aria-label="Request flow from agent through llmproxy to local and external models">
+        <text class="flow-node-label mono" x="24" y="88">agent</text>
+        <path id="flow-in" class="flow-line neutral drift" d="M 92 84 H 268"/>
+        <text class="flow-count mono neutral" id="flow-in-count" x="180" y="72" text-anchor="middle">0</text>
+        <rect x="272" y="62" width="112" height="44" rx="4" class="flow-hub"/>
+        <text class="flow-node-label mono" x="328" y="88" text-anchor="middle">llmproxy</text>
+        <path id="flow-local" class="flow-line local drift" d="M 388 76 C 470 76 490 40 570 40"/>
+        <path id="flow-ext" class="flow-line external drift" d="M 388 92 C 470 92 490 128 570 128"/>
+        <text class="flow-count mono local" id="flow-local-count" x="584" y="45">0 local</text>
+        <text class="flow-count mono external" id="flow-ext-count" x="584" y="133">0 external</text>
+      </svg>
+    </div>
+
+    <div class="split-band" id="split-band" role="img" aria-label="Share of responses served locally">
+      <div class="split-local" id="split-local" style="width:0%"></div>
+    </div>
+    <p class="split-caption mono" id="split-caption">no responses yet</p>
+
+    <div class="stat-grid">
+      <div class="stat">
+        <span class="stat-value mono" id="stat-requests">0</span>
+        <span class="stat-label mono">requests</span>
+        <span class="stat-sub" id="stat-requests-sub">since start</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value mono" id="stat-remapped">0</span>
+        <span class="stat-label mono">remapped</span>
+        <span class="stat-sub" id="stat-remapped-sub">alias 0 · auto 0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value mono" id="stat-intercepted">0</span>
+        <span class="stat-label mono">intercepted</span>
+        <span class="stat-sub" id="stat-intercepted-sub">pass 0 · fallback 0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value mono is-local" id="stat-local">0</span>
+        <span class="stat-label mono">served locally</span>
+        <span class="stat-sub" id="stat-local-sub">&nbsp;</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value mono is-external" id="stat-external">0</span>
+        <span class="stat-label mono">forwarded external</span>
+        <span class="stat-sub" id="stat-external-sub">&nbsp;</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value mono is-local" id="stat-tokens">≈ 0</span>
+        <span class="stat-label mono">tokens saved</span>
+        <span class="stat-sub" id="stat-tokens-sub">prompt 0 · completion 0</span>
+      </div>
+    </div>
+
+    <h3 class="sub-label mono">response latency <span class="sub-note">p50 → p99, full response duration</span></h3>
+    <div class="latency-rows" id="latency-rows">
+      <div class="latency-row">
+        <span class="latency-name mono is-local">local</span>
+        <div class="latency-track"><div class="latency-bar is-local" id="lat-local-bar"><i class="dot d50"></i><i class="dot d99"></i></div></div>
+        <span class="latency-figures mono" id="lat-local-figures">no samples</span>
+      </div>
+      <div class="latency-row">
+        <span class="latency-name mono is-external">external</span>
+        <div class="latency-track"><div class="latency-bar is-external" id="lat-ext-bar"><i class="dot d50"></i><i class="dot d99"></i></div></div>
+        <span class="latency-figures mono" id="lat-ext-figures">no samples</span>
+      </div>
+    </div>
+
+    <h3 class="sub-label mono">traffic log <span class="sub-note">first 200 characters of each request and response</span></h3>
+    <div class="log-controls">
+      <label class="log-lines mono" for="log-max-lines">max lines
+        <input type="range" id="log-max-lines" min="20" max="500" step="20" value="100">
+        <span id="log-max-value">100</span>
+      </label>
+      <button class="button button-quiet" id="clear-logs" type="button">Clear log</button>
+    </div>
+    <div class="traffic-log mono" id="traffic-log" tabindex="0" aria-label="Live traffic log">
+      <div class="log-empty" id="log-empty">no traffic yet — entries appear as requests flow</div>
+    </div>
+    <p class="hint" id="log-hint">Newest entries append at the bottom; entries expire after 10 minutes.</p>
+  </section>
+</div>
+
+<!-- =============================== CONFIGURE =============================== -->
+<div id="view-configure" role="tabpanel" aria-labelledby="tab-configure" hidden>
+
+  <section class="panel" aria-labelledby="cfg-alias-label">
+    <h2 class="panel-label" id="cfg-alias-label">Model aliases</h2>
+    <p class="panel-intro">Aliases pin a requested model name to a provider and
+    upstream model. Changes apply to the next request; no restart needed.</p>
+    <div class="table-scroll">
+      <table class="data-table edit-table" id="cfg-alias-table">
+        <thead><tr><th>alias</th><th>upstream model</th><th>provider</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <form class="inline-form" id="alias-add-form">
+      <input class="input mono" id="alias-add-name" placeholder="alias e.g. gpt-5.5" aria-label="New alias name" required>
+      <input class="input mono" id="alias-add-model" placeholder="upstream model id" aria-label="Upstream model" required>
+      <select class="input mono" id="alias-add-provider" aria-label="Provider"></select>
+      <button class="button button-primary" type="submit">Add alias</button>
+    </form>
+  </section>
+
+  <section class="panel" aria-labelledby="cfg-int-label">
+    <h2 class="panel-label" id="cfg-int-label">Interceptor</h2>
+    <p class="panel-intro">The local-first triager. It answers deterministic
+    requests from the local model and calls <code class="mono">PASS</code> to
+    hand everything else to normal routing.</p>
+    <form class="field-form" id="interceptor-form">
+      <label class="field field-check">
+        <input type="checkbox" id="int-enabled">
+        <span>Enabled <span class="choice-note">launcher <code class="mono">--intercept</code> enables it per session regardless</span></span>
+      </label>
+      <div class="field-row">
+        <label class="field"><span class="field-name mono">provider</span>
+          <select class="input mono" id="int-provider"></select></label>
+        <label class="field"><span class="field-name mono">model</span>
+          <input class="input mono" id="int-model" placeholder="qwen3:4b"></label>
+      </div>
+      <div class="field-row">
+        <label class="field"><span class="field-name mono">timeout_ms</span>
+          <input class="input mono" type="number" id="int-timeout" min="1" step="100"></label>
+        <label class="field"><span class="field-name mono">temperature</span>
+          <input class="input mono" type="number" id="int-temperature" min="0" max="2" step="0.1"></label>
+        <label class="field"><span class="field-name mono">max_tokens <span class="sub-note">0 = no cap</span></span>
+          <input class="input mono" type="number" id="int-max-tokens" min="0" step="64"></label>
+      </div>
+      <div class="field-row">
+        <label class="field field-check">
+          <input type="checkbox" id="int-fallback">
+          <span>Fall back to external on local errors</span></label>
+        <label class="field field-check">
+          <input type="checkbox" id="int-parallel">
+          <span>Allow parallel tool calls <span class="choice-note">off keeps triage to one call</span></span></label>
+      </div>
+      <label class="field"><span class="field-name mono">instructions <span class="sub-note">leave empty for the built-in policy</span></span>
+        <textarea class="input mono" id="int-instructions" rows="4" placeholder="Built-in deterministic-task routing policy"></textarea></label>
+      <div class="form-actions"><button class="button button-primary" type="submit">Save interceptor</button></div>
+    </form>
+  </section>
+
+  <section class="panel" aria-labelledby="cfg-prov-label">
+    <h2 class="panel-label" id="cfg-prov-label">Providers</h2>
+    <p class="panel-intro">Each provider is an OpenAI-compatible endpoint with
+    its own credentials and connection pool. Saving rebuilds only the changed
+    provider; its model cache reloads in the background.</p>
+    <div id="provider-editors"></div>
+    <form class="inline-form" id="provider-add-form">
+      <input class="input mono" id="provider-add-name" placeholder="new provider name" aria-label="New provider name" required>
+      <input class="input mono" id="provider-add-url" placeholder="http://127.0.0.1:11434/v1" aria-label="Base URL" required>
+      <button class="button button-primary" type="submit">Add provider</button>
+    </form>
+  </section>
+
+  <section class="panel" aria-labelledby="cfg-set-label">
+    <h2 class="panel-label" id="cfg-set-label">Settings</h2>
+    <form class="field-form" id="settings-form">
+      <div class="field-row">
+        <label class="field"><span class="field-name mono">default_provider</span>
+          <select class="input mono" id="set-default-provider"></select></label>
+        <label class="field"><span class="field-name mono">responses.mode</span>
+          <select class="input mono" id="set-responses-mode">
+            <option value="chat_completions">chat_completions</option>
+            <option value="passthrough">passthrough</option>
+          </select></label>
+      </div>
+      <label class="field field-check"><input type="checkbox" id="set-disable-thinking">
+        <span>chat.disable_thinking <span class="choice-note">for Qwen thinking models that return null content</span></span></label>
+      <label class="field field-check"><input type="checkbox" id="set-expose-aliases">
+        <span>models.expose_aliases</span></label>
+      <label class="field field-check"><input type="checkbox" id="set-expose-upstream">
+        <span>models.expose_upstream</span></label>
+
+      <h3 class="sub-label mono">role_map</h3>
+      <div id="rolemap-rows"></div>
+      <div class="inline-form">
+        <input class="input mono" id="rolemap-add-from" placeholder="incoming role e.g. developer" aria-label="Incoming role">
+        <input class="input mono" id="rolemap-add-to" placeholder="rewritten role e.g. system" aria-label="Rewritten role">
+        <button class="button" type="button" id="rolemap-add">Add rewrite</button>
+      </div>
+      <div class="form-actions"><button class="button button-primary" type="submit">Save settings</button></div>
+    </form>
+  </section>
+
+  <section class="panel" aria-labelledby="cfg-raw-label" id="cfg-raw-panel">
+    <h2 class="panel-label" id="cfg-raw-label">Config file</h2>
+    <p class="panel-intro" id="raw-intro">Full TOML, exactly as on disk. Applying
+    validates first, then swaps the running config and writes the file.
+    <span class="warn-note">listen_addr and [admin] changes need a restart.</span></p>
+    <textarea class="input mono raw-editor" id="raw-toml" rows="18" spellcheck="false"></textarea>
+    <div class="form-actions">
+      <button class="button" type="button" id="raw-reload">Reload from disk</button>
+      <button class="button button-primary" type="button" id="raw-apply">Validate &amp; apply</button>
+    </div>
+  </section>
+</div>
+
+<!-- ============================= SYSTEM PROMPT ============================= -->
+<div id="view-prompt" role="tabpanel" aria-labelledby="tab-prompt" hidden>
+
+  <section class="panel" aria-labelledby="sys-label">
+    <h2 class="panel-label" id="sys-label">Routing policy — system prompt</h2>
+    <p class="panel-intro">The interceptor sends this system prompt to the local
+    model with every eligible request. It decides which requests the local model
+    answers itself and which it <code class="mono">PASS</code>es to external
+    routing. Saving writes it back to the config file.</p>
+    <p class="hint mono" id="sys-status">loading…</p>
+    <textarea class="input mono sys-editor" id="sys-editor" rows="12" spellcheck="false"
+      aria-label="Interceptor routing instructions"></textarea>
+    <p class="hint" id="sys-dirty">&nbsp;</p>
+    <div class="form-actions">
+      <button class="button" type="button" id="sys-reset">Reset to built-in</button>
+      <button class="button button-primary" type="button" id="sys-save">Save system prompt</button>
+    </div>
+
+    <h3 class="sub-label mono">revise with the local model</h3>
+    <p class="hint">Describe a change and the local model rewrites the system
+    prompt into the editor above. This assistant is restricted to producing
+    routing-policy text — unrelated requests return the policy unchanged.
+    Nothing persists until you press Save.</p>
+    <div class="inline-form">
+      <textarea class="input mono" id="revise-input" rows="2" spellcheck="false"
+        placeholder="e.g. also answer git status / diff / log requests locally"
+        aria-label="Describe the revision"></textarea>
+      <button class="button" type="button" id="revise-run">Revise</button>
+      <button class="button" type="button" id="revise-undo" hidden>Undo revision</button>
+    </div>
+    <p class="hint" id="revise-running" hidden>asking the local model…</p>
+  </section>
+
+  <section class="panel" aria-labelledby="test-label">
+    <h2 class="panel-label" id="test-label">Route test</h2>
+    <p class="panel-intro">Sends a sample user prompt together with the system
+    prompt above — exactly as it reads right now, saved or not — to the local
+    model, and reports whether the request would stay local or go external.
+    Nothing is forwarded and no stats are recorded.</p>
+    <textarea class="input mono" id="test-prompt" rows="3" spellcheck="false"
+      placeholder="e.g. rename the variable `foo` to `bar` in src/main.rs and run the tests"
+      aria-label="Test user prompt"></textarea>
+    <div class="form-actions">
+      <span class="hint test-running" id="test-running" hidden>testing…</span>
+      <button class="button button-primary" type="button" id="test-run">Test routing</button>
+    </div>
+    <div id="test-results"></div>
+  </section>
+</div>
+
+</main>
+
+<footer class="footer mono">
+  <span id="footer-version">llmproxy</span>
+  <span id="footer-config">no config file</span>
+  <span id="footer-admin"></span>
+</footer>
+
+<div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+/target
+/config.toml
+/nohup.out
+/.codex/
+/.idea/
+/.plan/
+/.remember/
+**/.idea/

@@ -1,5 +1,7 @@
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use axum::Json;
@@ -8,9 +10,10 @@ use axum::response::{IntoResponse, Response};
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::AppState;
+use crate::INTEGRATED_AUTO_MODEL;
 use crate::UpstreamConfig;
 use crate::UpstreamRequestMeta;
 use crate::UpstreamResponseKind;
@@ -19,13 +22,15 @@ use crate::normalize_chat_completion_request;
 use crate::request_id_from_headers;
 use crate::rewrite_request_roles;
 use crate::stats::{
-    RouteClass, log_request_value, log_response_text, log_response_value, proxy_stats,
+    RouteClass, TokenUsage, log_request_value, log_response_text, log_response_value, proxy_stats,
 };
 use crate::text_from_value;
 use crate::upstream_error_response;
 use crate::upstream_json;
+use crate::{ProviderState, proxy_integrated_chat};
 
 const PASS_TOOL_NAME: &str = "PASS";
+const ROUTE_DEFAULT_TOOL_NAME: &str = "ROUTE_DEFAULT";
 const LOCAL_ROUTE_HEADER: &str = "x-llmproxy-route";
 const CODEX_TURN_METADATA_KEY: &str = "x-codex-turn-metadata";
 const CODEX_REQUEST_KIND_KEY: &str = "request_kind";
@@ -44,6 +49,51 @@ Otherwise call PASS with {} — including whenever the task needs research, curr
 
 Never ask clarifying questions, explain your decision, or answer partially. Emit only the PASS call, or exactly the assistant message or single tool call that completes the request."#;
 
+/// Base routing policy used instead of [`DEFAULT_INSTRUCTIONS`] when
+/// integrated mode is on and the operator has not overridden the prompt.
+/// The concrete provider routes and their hints are appended dynamically.
+const DEFAULT_INTEGRATED_INSTRUCTIONS: &str = r#"You are the routing tier for agent requests. Give every request exactly one outcome: answer it locally, or hand it to the provider route that owns its kind of work.
+
+Answer locally only when ALL of these hold:
+- The request is explicit and unambiguous, and everything needed is already in this conversation.
+- The task is deterministic or routine: formatting, extraction, classification, validation, a simple transformation of supplied content, or a direct operational command.
+- It needs at most one tool call, and the tool and its exact arguments are obvious without discovery.
+- One short response completes it, and you are certain it is correct.
+
+Everything else is routed, never answered locally: research, planning, investigation, design, implementation, debugging, comparison, recommendation, judgment, and anything with financial, legal, medical, security, or operational consequences. Call exactly one provider route from the list below, choosing the route whose hint matches the request; a route hinted as the default owns everything no other route clearly claims. Call ROUTE_DEFAULT with {} only when no route fits.
+
+Complex online research, current-information investigation, and source-backed multi-step analysis must use the matching dedicated research route at max or xhigh reasoning effort when one is configured. Never answer that work locally or send it to a weaker general route.
+
+Never ask clarifying questions, explain your decision, or answer partially. Emit only one provider route call, the ROUTE_DEFAULT call, or exactly the assistant message or single tool call that completes the request."#;
+
+/// The intercept-mode policy: the operator override, or the built-in default
+/// when the override is empty or untouched.
+pub(crate) fn intercept_instructions(interceptor: &InterceptorConfig) -> &str {
+    if interceptor.instructions.trim().is_empty() {
+        DEFAULT_INSTRUCTIONS
+    } else {
+        &interceptor.instructions
+    }
+}
+
+/// The integrated-mode policy: its own override, or the built-in integrated
+/// default. Intercept-mode overrides never leak into integrated mode.
+pub(crate) fn integrated_instructions(integrated: &IntegratedConfig) -> &str {
+    if integrated.instructions.trim().is_empty() {
+        DEFAULT_INTEGRATED_INSTRUCTIONS
+    } else {
+        &integrated.instructions
+    }
+}
+
+pub(crate) fn intercept_instructions_are_default(interceptor: &InterceptorConfig) -> bool {
+    intercept_instructions(interceptor) == DEFAULT_INSTRUCTIONS
+}
+
+pub(crate) fn integrated_instructions_are_default(integrated: &IntegratedConfig) -> bool {
+    integrated_instructions(integrated) == DEFAULT_INTEGRATED_INSTRUCTIONS
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub(crate) struct InterceptorConfig {
@@ -60,6 +110,44 @@ pub(crate) struct InterceptorConfig {
     /// routing instead of serving a clipped answer.
     pub(crate) max_tokens: u64,
     pub(crate) parallel_tool_calls: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub(crate) struct IntegratedConfig {
+    pub(crate) enabled: bool,
+    pub(crate) sticky_ttl_secs: u64,
+    pub(crate) sticky_capacity: usize,
+    /// Integrated-mode routing policy override; empty uses the built-in
+    /// integrated default.
+    pub(crate) instructions: String,
+    pub(crate) targets: BTreeMap<String, IntegratedTarget>,
+}
+
+impl Default for IntegratedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sticky_ttl_secs: 1800,
+            sticky_capacity: 1024,
+            instructions: String::new(),
+            targets: BTreeMap::new(),
+        }
+    }
+}
+
+fn integrated_routing_requested(config: &IntegratedConfig, client_model: Option<&str>) -> bool {
+    config.enabled && client_model == Some(INTEGRATED_AUTO_MODEL)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct IntegratedTarget {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    #[serde(default)]
+    pub(crate) hint: String,
+    #[serde(default)]
+    pub(crate) reasoning_effort: Option<crate::ReasoningEffort>,
 }
 
 impl Default for InterceptorConfig {
@@ -86,7 +174,7 @@ pub(crate) enum InterceptorProtocol {
 }
 
 impl InterceptorProtocol {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ChatCompletions => "chat_completions",
             Self::Responses => "responses",
@@ -170,11 +258,12 @@ fn has_compaction_trigger(request: &Value) -> bool {
         })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CompletionDecision {
     Local,
-    Pass,
-    InvalidPass,
+    DefaultRoute,
+    Redirect(String),
+    InvalidControl,
 }
 
 pub(crate) fn validate_config(
@@ -208,6 +297,176 @@ pub(crate) fn validate_config(
     Ok(())
 }
 
+pub(crate) fn validate_integrated_config(
+    config: &IntegratedConfig,
+    interceptor: &InterceptorConfig,
+    providers: &HashMap<String, UpstreamConfig>,
+) -> Result<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+    if config.targets.is_empty() {
+        bail!("integrated mode requires at least one [integrated.targets.*] entry");
+    }
+    if config.sticky_ttl_secs == 0 {
+        bail!("integrated.sticky_ttl_secs must be greater than zero");
+    }
+    if config.sticky_capacity == 0 {
+        bail!("integrated.sticky_capacity must be greater than zero");
+    }
+    for (name, provider) in providers {
+        // Borrowed-OAuth providers carry the local CLI's login instead of a
+        // proxy-owned API key, so they are exempt from the key requirement.
+        let borrows_oauth = provider.auth != crate::ProviderAuth::None;
+        if name != &interceptor.provider
+            && crate::stats::route_class_for_base_url(&provider.base_url) == RouteClass::External
+            && provider.api_key.is_none()
+            && !borrows_oauth
+        {
+            bail!(
+                "integrated external provider {name:?} requires proxy-owned api_key or api_key_env (or auth = \"codex-oauth\"/\"claude-oauth\")"
+            );
+        }
+    }
+    for (name, target) in &config.targets {
+        if !valid_target_name(name) || is_default_route_name(name) {
+            bail!(
+                "integrated target {name:?} must be a non-reserved 1-64 character tool name containing only letters, digits, _, or -"
+            );
+        }
+        let Some(provider) = providers.get(&target.provider) else {
+            bail!(
+                "integrated target {name:?} references unknown provider {:?}",
+                target.provider
+            );
+        };
+        if target.provider == interceptor.provider {
+            bail!("integrated target {name:?} cannot route back to the interceptor provider");
+        }
+        if target.model.trim().is_empty() {
+            bail!("integrated target {name:?} has an empty model");
+        }
+        if target.hint.trim().is_empty() || target.hint.lines().count() != 1 {
+            bail!("integrated target {name:?} hint must be one non-empty line");
+        }
+        if provider.kind == crate::ProviderKind::Copilot && target.reasoning_effort.is_some() {
+            bail!("integrated target {name:?} cannot set reasoning_effort for kind \"copilot\"");
+        }
+        if provider.kind == crate::ProviderKind::Anthropic
+            && matches!(
+                target.reasoning_effort,
+                Some(crate::ReasoningEffort::None | crate::ReasoningEffort::Minimal)
+            )
+        {
+            bail!(
+                "integrated target {name:?} reasoning_effort must be low, medium, high, xhigh, or max for Anthropic"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn valid_target_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+#[derive(Clone)]
+struct StickyRoute {
+    target: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct StickyRoutes {
+    entries: Mutex<(HashMap<u64, StickyRoute>, VecDeque<u64>)>,
+}
+
+impl StickyRoutes {
+    fn lookup(&self, key: u64) -> Option<String> {
+        let now = Instant::now();
+        let mut routes = self.entries.lock().expect("sticky route store poisoned");
+        let (entries, _) = &mut *routes;
+        match entries.get(&key) {
+            Some(route) if route.expires_at > now => Some(route.target.clone()),
+            Some(_) => {
+                entries.remove(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn insert(&self, key: u64, target: String, ttl_secs: u64, capacity: usize) {
+        let mut routes = self.entries.lock().expect("sticky route store poisoned");
+        let (entries, order) = &mut *routes;
+        let now = Instant::now();
+        entries.retain(|_, route| route.expires_at > now);
+        entries.remove(&key);
+        order.retain(|existing| *existing != key);
+        while entries.len() >= capacity {
+            let Some(oldest) = order.pop_front() else {
+                break;
+            };
+            entries.remove(&oldest);
+        }
+        entries.insert(
+            key,
+            StickyRoute {
+                target,
+                expires_at: now + Duration::from_secs(ttl_secs),
+            },
+        );
+        order.push_back(key);
+    }
+
+    fn remove(&self, key: u64) {
+        self.entries
+            .lock()
+            .expect("sticky route store poisoned")
+            .0
+            .remove(&key);
+    }
+}
+
+fn sticky_routes() -> &'static StickyRoutes {
+    static ROUTES: OnceLock<StickyRoutes> = OnceLock::new();
+    ROUTES.get_or_init(StickyRoutes::default)
+}
+
+fn conversation_key(headers: &HeaderMap, chat_request: &Value) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for name in [
+        "session-id",
+        "thread-id",
+        "x-session-id",
+        "x-copilot-session-id",
+        "x-codex-thread-id",
+    ] {
+        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
+            name.hash(&mut hasher);
+            value.hash(&mut hasher);
+            return hasher.finish();
+        }
+    }
+    if let Some(first_user) = chat_request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content"))
+    {
+        text_from_value(first_user).hash(&mut hasher);
+    } else {
+        chat_request.to_string().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 pub(crate) async fn maybe_intercept(
     state: &AppState,
     incoming_headers: &HeaderMap,
@@ -218,7 +477,9 @@ pub(crate) async fn maybe_intercept(
     client_streaming: bool,
 ) -> Option<Response> {
     let config = &state.config.interceptor;
-    if !config.enabled {
+    let integrated =
+        integrated_routing_requested(&state.config.integrated, client_model.as_deref());
+    if !config.enabled && !integrated {
         return None;
     }
 
@@ -236,6 +497,33 @@ pub(crate) async fn maybe_intercept(
     }
     proxy_stats().record_intercept_attempt();
 
+    let conversation_key =
+        integrated.then(|| conversation_key(incoming_headers, &local_chat_request));
+    if let Some(key) = conversation_key
+        && let Some(target) = sticky_routes().lookup(key)
+        && state.config.integrated.targets.contains_key(&target)
+    {
+        info!(
+            request_id,
+            protocol = protocol.as_str(),
+            target,
+            route = "sticky_redirect",
+            "integrated router reused conversation route"
+        );
+        return execute_integrated_redirect(
+            state,
+            &target,
+            local_chat_request,
+            protocol,
+            client_model,
+            client_streaming,
+            Some(key),
+        )
+        .await;
+    }
+
+    let redirect_request = local_chat_request.clone();
+
     let local_request = match build_local_request(
         local_chat_request,
         config,
@@ -246,7 +534,7 @@ pub(crate) async fn maybe_intercept(
     ) {
         Ok(request) => request,
         Err(message) => {
-            warn!(
+            error!(
                 request_id,
                 protocol = protocol.as_str(),
                 error = %message,
@@ -269,8 +557,9 @@ pub(crate) async fn maybe_intercept(
         false,
     );
     let local_headers = HeaderMap::new();
+    let estimated_input_tokens = crate::estimate_tokens(&local_request) as u64;
 
-    log_request_value(RouteClass::Local, &local_request);
+    log_request_value(RouteClass::Local, &provider.name, &local_request);
     let started_at = std::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_millis(config.timeout_ms),
@@ -281,8 +570,9 @@ pub(crate) async fn maybe_intercept(
     let completion = match result {
         Ok(Ok(completion)) => completion,
         Ok(Err(error)) => {
-            log_response_text(RouteClass::Local, format!("error: {error}"));
-            warn!(
+            log_response_text(RouteClass::Local, &provider.name, format!("error: {error}"));
+            crate::stats::error_log().record(&provider.name, "interceptor", error.to_string());
+            error!(
                 request_id = %meta.request_id,
                 protocol = protocol.as_str(),
                 provider = %provider.name,
@@ -301,8 +591,8 @@ pub(crate) async fn maybe_intercept(
         }
         Err(_) => {
             let message = format!("local interceptor timed out after {}ms", config.timeout_ms);
-            log_response_text(RouteClass::Local, message.as_str());
-            warn!(
+            log_response_text(RouteClass::Local, &provider.name, message.as_str());
+            error!(
                 request_id = %meta.request_id,
                 protocol = protocol.as_str(),
                 provider = %provider.name,
@@ -318,11 +608,18 @@ pub(crate) async fn maybe_intercept(
             );
         }
     };
-    log_response_value(RouteClass::Local, &completion);
+    let local_elapsed = started_at.elapsed();
+    let local_usage = TokenUsage::from_response(
+        completion.get("usage"),
+        estimated_input_tokens,
+        crate::estimate_tokens(&completion) as u64,
+    );
+    proxy_stats().record_model_usage(&provider.name, &config.model, local_elapsed, local_usage);
+    log_response_value(RouteClass::Local, &provider.name, &completion);
 
     if first_chat_choice_message(&completion).is_none() {
         let message = "local interceptor returned no assistant message".to_string();
-        warn!(
+        error!(
             request_id = %meta.request_id,
             protocol = protocol.as_str(),
             provider = %provider.name,
@@ -339,7 +636,7 @@ pub(crate) async fn maybe_intercept(
             "local completion hit the interceptor max_tokens cap ({})",
             config.max_tokens
         );
-        warn!(
+        error!(
             request_id = %meta.request_id,
             protocol = protocol.as_str(),
             provider = %provider.name,
@@ -349,22 +646,49 @@ pub(crate) async fn maybe_intercept(
         return fallback_or_error(config, StatusCode::BAD_GATEWAY, &meta.request_id, message);
     }
 
-    match classify_completion(&completion) {
-        CompletionDecision::Pass => {
+    let no_targets = BTreeMap::new();
+    let decision_targets = if integrated {
+        &state.config.integrated.targets
+    } else {
+        &no_targets
+    };
+    match classify_completion_with_targets(&completion, decision_targets) {
+        CompletionDecision::DefaultRoute => {
             info!(
                 request_id = %meta.request_id,
                 protocol = protocol.as_str(),
                 provider = %provider.name,
-                elapsed_ms = started_at.elapsed().as_millis(),
+                elapsed_ms = local_elapsed.as_millis(),
                 route = "external",
                 "local interceptor selected route"
             );
             proxy_stats().record_intercept_pass();
             None
         }
-        CompletionDecision::InvalidPass => {
-            let message = "local interceptor mixed PASS with other output".to_string();
-            warn!(
+        CompletionDecision::Redirect(target) => {
+            info!(
+                request_id = %meta.request_id,
+                protocol = protocol.as_str(),
+                provider = %provider.name,
+                target,
+                elapsed_ms = local_elapsed.as_millis(),
+                route = "redirect",
+                "local interceptor selected integrated route"
+            );
+            execute_integrated_redirect(
+                state,
+                &target,
+                redirect_request,
+                protocol,
+                client_model,
+                client_streaming,
+                conversation_key,
+            )
+            .await
+        }
+        CompletionDecision::InvalidControl => {
+            let message = "local interceptor mixed routing control with other output".to_string();
+            error!(
                 request_id = %meta.request_id,
                 protocol = protocol.as_str(),
                 provider = %provider.name,
@@ -378,11 +702,16 @@ pub(crate) async fn maybe_intercept(
                 request_id = %meta.request_id,
                 protocol = protocol.as_str(),
                 provider = %provider.name,
-                elapsed_ms = started_at.elapsed().as_millis(),
+                elapsed_ms = local_elapsed.as_millis(),
                 route = "local",
                 "local interceptor selected route"
             );
-            proxy_stats().record_intercept_local(started_at.elapsed(), completion.get("usage"));
+            proxy_stats().record_intercept_local(
+                &provider.name,
+                protocol.as_str(),
+                local_elapsed,
+                local_usage,
+            );
             Some(render_local_completion(
                 protocol,
                 completion,
@@ -394,12 +723,77 @@ pub(crate) async fn maybe_intercept(
     }
 }
 
+async fn execute_integrated_redirect(
+    state: &AppState,
+    target_name: &str,
+    chat_request: Value,
+    protocol: InterceptorProtocol,
+    client_model: Option<String>,
+    client_streaming: bool,
+    conversation_key: Option<u64>,
+) -> Option<Response> {
+    let target = state.config.integrated.targets.get(target_name)?;
+    let provider: &ProviderState = state.providers.get(&target.provider)?;
+    info!(
+        target = target_name,
+        provider = target.provider,
+        model = target.model,
+        reasoning_effort = target.reasoning_effort.map(crate::ReasoningEffort::as_str),
+        protocol = protocol.as_str(),
+        "sending integrated route"
+    );
+    let response = proxy_integrated_chat(
+        provider,
+        chat_request,
+        target,
+        protocol,
+        client_model,
+        client_streaming,
+        state.config.as_ref(),
+    )
+    .await;
+    if response.status().is_success() {
+        proxy_stats().record_intercept_redirect(target_name);
+        if let Some(key) = conversation_key {
+            sticky_routes().insert(
+                key,
+                target_name.to_string(),
+                state.config.integrated.sticky_ttl_secs,
+                state.config.integrated.sticky_capacity,
+            );
+        }
+        Some(response)
+    } else {
+        if let Some(key) = conversation_key {
+            sticky_routes().remove(key);
+        }
+        error!(
+            target = target_name,
+            provider = target.provider,
+            model = target.model,
+            reasoning_effort = target.reasoning_effort.map(crate::ReasoningEffort::as_str),
+            status = %response.status(),
+            "integrated redirect failed; preserving the first upstream result"
+        );
+        crate::stats::error_log().record(
+            &target.provider,
+            "integrated redirect",
+            format!("{target_name} failed with HTTP {}", response.status()),
+        );
+        // The request reached a generation endpoint, so a fall-through could
+        // duplicate work or spend. Surface the original failure instead.
+        proxy_stats().record_intercept_error();
+        Some(response)
+    }
+}
+
 fn fallback_or_error(
     config: &InterceptorConfig,
     status: StatusCode,
     request_id: &str,
     message: String,
 ) -> Option<Response> {
+    crate::stats::error_log().record(&config.provider, "interceptor", message.as_str());
     if config.fallback_on_error {
         proxy_stats().record_intercept_fallback();
         None
@@ -437,6 +831,7 @@ pub(super) fn build_local_request(
     role_map: &HashMap<String, String>,
     proxy_config: &crate::Config,
 ) -> std::result::Result<Value, String> {
+    let integrated = integrated_routing_requested(&proxy_config.integrated, client_model);
     rewrite_request_roles(&mut request, role_map);
     let Some(object) = request.as_object_mut() else {
         return Err("local interceptor request is not a JSON object".to_string());
@@ -463,17 +858,63 @@ pub(super) fn build_local_request(
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
         .ok_or_else(|| "local interceptor tools field is not an array".to_string())?;
-    if tools.iter().any(is_pass_tool) {
-        return Err("request already defines a tool named PASS".to_string());
+    if let Some(name) = tools
+        .iter()
+        .filter_map(tool_name)
+        .find(|name| is_default_route_name(name))
+    {
+        return Err(format!("request already defines a tool named {name}"));
     }
-    tools.push(pass_tool());
+    if integrated {
+        for name in proxy_config.integrated.targets.keys() {
+            if tools
+                .iter()
+                .any(|tool| tool_name(tool) == Some(name.as_str()))
+            {
+                return Err(format!("request already defines a tool named {name}"));
+            }
+        }
+    }
+    tools.push(default_route_tool(integrated));
+    if integrated {
+        tools.extend(
+            proxy_config
+                .integrated
+                .targets
+                .iter()
+                .map(|(name, target)| redirect_tool(name, target)),
+        );
+    }
 
-    let dynamic_instructions = format!(
+    let mut dynamic_instructions = format!(
         "{}\n\nCurrent proxy protocol: {}. Original requested model: {}.",
-        config.instructions.trim(),
+        if integrated {
+            integrated_instructions(&proxy_config.integrated)
+        } else {
+            intercept_instructions(config)
+        }
+        .trim(),
         protocol.as_str(),
         client_model.unwrap_or("unspecified"),
     );
+    if integrated {
+        dynamic_instructions.push_str("\n\nIntegrated provider routes:");
+        for (name, target) in &proxy_config.integrated.targets {
+            dynamic_instructions.push_str(&format!(
+                "\nCall {name} when: {}. Destination: {}/{} with {} reasoning effort.",
+                target.hint.trim(),
+                target.provider,
+                target.model,
+                target
+                    .reasoning_effort
+                    .map(crate::ReasoningEffort::as_str)
+                    .unwrap_or("provider-default"),
+            ));
+        }
+        dynamic_instructions.push_str(
+            "\nCall exactly one provider route, or ROUTE_DEFAULT with {} when no route fits.",
+        );
+    }
     let messages = object
         .entry("messages".to_string())
         .or_insert_with(|| Value::Array(Vec::new()))
@@ -488,12 +929,23 @@ pub(super) fn build_local_request(
     Ok(request)
 }
 
-fn pass_tool() -> Value {
+fn default_route_tool(integrated: bool) -> Value {
+    let (name, description) = if integrated {
+        (
+            ROUTE_DEFAULT_TOOL_NAME,
+            "Continue this complete original request through normal model alias and default-provider routing. Call this function alone only when no configured provider route fits.",
+        )
+    } else {
+        (
+            PASS_TOOL_NAME,
+            "Route this complete original request to the external model. Call this function alone when the task should not be handled by the local model.",
+        )
+    };
     json!({
         "type": "function",
         "function": {
-            "name": PASS_TOOL_NAME,
-            "description": "Route this complete original request to the external model. Call this function alone when the task should not be handled by the local model.",
+            "name": name,
+            "description": description,
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -504,39 +956,84 @@ fn pass_tool() -> Value {
     })
 }
 
-pub(super) fn is_pass_tool(tool: &Value) -> bool {
+fn redirect_tool(name: &str, target: &IntegratedTarget) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": format!(
+                "Route the complete original request to provider {:?} model {:?} with {} reasoning effort: {}",
+                target.provider,
+                target.model,
+                target
+                    .reasoning_effort
+                    .map(crate::ReasoningEffort::as_str)
+                    .unwrap_or("provider-default"),
+                target.hint.trim()
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn tool_name(tool: &Value) -> Option<&str> {
     tool.get("function")
         .and_then(|function| function.get("name"))
         .or_else(|| tool.get("name"))
         .and_then(Value::as_str)
-        == Some(PASS_TOOL_NAME)
 }
 
+#[cfg(test)]
+pub(super) fn is_pass_tool(tool: &Value) -> bool {
+    tool_name(tool) == Some(PASS_TOOL_NAME)
+}
+
+fn is_default_route_name(name: &str) -> bool {
+    name == PASS_TOOL_NAME || name == ROUTE_DEFAULT_TOOL_NAME
+}
+
+#[cfg(test)]
 pub(super) fn classify_completion(completion: &Value) -> CompletionDecision {
+    classify_completion_with_targets(completion, &BTreeMap::new())
+}
+
+fn classify_completion_with_targets(
+    completion: &Value,
+    targets: &BTreeMap<String, IntegratedTarget>,
+) -> CompletionDecision {
     let Some(choices) = completion.get("choices").and_then(Value::as_array) else {
         return CompletionDecision::Local;
     };
-    let contains_pass = choices.iter().any(|choice| {
+    let contains_control = choices.iter().any(|choice| {
         let Some(message) = choice.get("message") else {
             return false;
         };
         message
             .get("tool_calls")
             .and_then(Value::as_array)
-            .is_some_and(|calls| calls.iter().any(is_pass_tool_call))
-            || message
-                .get("content")
-                .is_some_and(|content| text_from_value(content).trim() == PASS_TOOL_NAME)
+            .is_some_and(|calls| {
+                calls
+                    .iter()
+                    .any(|call| control_decision(tool_name(call), targets).is_some())
+            })
+            || message.get("content").is_some_and(|content| {
+                control_decision(Some(text_from_value(content).trim()), targets).is_some()
+            })
     });
-    if !contains_pass {
+    if !contains_control {
         return CompletionDecision::Local;
     }
     if choices.len() != 1 {
-        return CompletionDecision::InvalidPass;
+        return CompletionDecision::InvalidControl;
     }
 
     let Some(message) = choices[0].get("message") else {
-        return CompletionDecision::InvalidPass;
+        return CompletionDecision::InvalidControl;
     };
     let content = message
         .get("content")
@@ -544,17 +1041,54 @@ pub(super) fn classify_completion(completion: &Value) -> CompletionDecision {
         .unwrap_or_default();
     let tool_calls = message.get("tool_calls").and_then(Value::as_array);
     match tool_calls {
-        Some(calls)
-            if calls.len() == 1 && is_pass_tool_call(&calls[0]) && content.trim().is_empty() =>
-        {
-            CompletionDecision::Pass
+        Some(calls) if calls.len() == 1 && content.trim().is_empty() => {
+            control_tool_call_decision(&calls[0], targets)
+                .unwrap_or(CompletionDecision::InvalidControl)
         }
-        None if content.trim() == PASS_TOOL_NAME => CompletionDecision::Pass,
-        Some(calls) if calls.is_empty() && content.trim() == PASS_TOOL_NAME => {
-            CompletionDecision::Pass
-        }
-        _ => CompletionDecision::InvalidPass,
+        None => control_decision(Some(content.trim()), targets)
+            .unwrap_or(CompletionDecision::InvalidControl),
+        Some(calls) if calls.is_empty() => control_decision(Some(content.trim()), targets)
+            .unwrap_or(CompletionDecision::InvalidControl),
+        _ => CompletionDecision::InvalidControl,
     }
+}
+
+fn control_tool_call_decision(
+    call: &Value,
+    targets: &BTreeMap<String, IntegratedTarget>,
+) -> Option<CompletionDecision> {
+    has_zero_tool_arguments(call)
+        .then(|| control_decision(tool_name(call), targets))
+        .flatten()
+}
+
+fn has_zero_tool_arguments(call: &Value) -> bool {
+    let arguments = call
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .or_else(|| call.get("arguments"));
+    match arguments {
+        None | Some(Value::Null) => true,
+        Some(Value::Object(arguments)) => arguments.is_empty(),
+        Some(Value::String(arguments)) if arguments.trim().is_empty() => true,
+        Some(Value::String(arguments)) => serde_json::from_str::<Value>(arguments)
+            .is_ok_and(|arguments| arguments.as_object().is_some_and(serde_json::Map::is_empty)),
+        _ => false,
+    }
+}
+
+fn control_decision(
+    name: Option<&str>,
+    targets: &BTreeMap<String, IntegratedTarget>,
+) -> Option<CompletionDecision> {
+    let name = name?.trim();
+    if is_default_route_name(name) {
+        return Some(CompletionDecision::DefaultRoute);
+    }
+    let canonical = name.replace('-', "_").to_ascii_uppercase();
+    targets
+        .contains_key(&canonical)
+        .then_some(CompletionDecision::Redirect(canonical))
 }
 
 /// True when any choice stopped for length: the completion is clipped and
@@ -570,31 +1104,69 @@ pub(super) fn completion_truncated(completion: &Value) -> bool {
         })
 }
 
-fn is_pass_tool_call(call: &Value) -> bool {
-    call.get("function")
-        .and_then(|function| function.get("name"))
-        .or_else(|| call.get("name"))
-        .and_then(Value::as_str)
-        == Some(PASS_TOOL_NAME)
+/// Which routing policy a route test or revision exercises. Intercept tests
+/// force integrated off; integrated tests force it on with the configured
+/// targets, so routes can be exercised even while the saved config keeps
+/// integrated mode disabled (launchers enable it per session).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteTestMode {
+    Intercept,
+    Integrated,
+}
+
+impl RouteTestMode {
+    pub(crate) fn parse(mode: Option<&str>) -> Result<Self, String> {
+        match mode.map(str::trim).filter(|mode| !mode.is_empty()) {
+            None | Some("intercept") => Ok(Self::Intercept),
+            Some("integrated") => Ok(Self::Integrated),
+            Some(other) => Err(format!(
+                "unknown mode {other:?}; expected \"intercept\" or \"integrated\""
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Intercept => "intercept",
+            Self::Integrated => "integrated",
+        }
+    }
 }
 
 /// Run one user prompt through the interceptor's routing decision and report
 /// where it would go, without forwarding anywhere or touching stats/logs.
 /// `instructions_override` tests unsaved editor text; empty means the
-/// built-in default policy. Used by the admin system-prompt tab.
+/// built-in default policy for the tested mode. Used by the admin
+/// system-prompt tab.
 pub(crate) async fn test_route(
     state: &AppState,
     prompt: &str,
     instructions_override: Option<&str>,
+    mode: RouteTestMode,
 ) -> Value {
-    let mut config = state.config.interceptor.clone();
-    if let Some(text) = instructions_override {
-        config.instructions = if text.trim().is_empty() {
-            DEFAULT_INSTRUCTIONS.to_string()
-        } else {
-            text.to_string()
-        };
+    let mut proxy_config = (*state.config).clone();
+    match mode {
+        RouteTestMode::Intercept => {
+            proxy_config.integrated.enabled = false;
+            if let Some(text) = instructions_override {
+                proxy_config.interceptor.instructions = text.to_string();
+            }
+        }
+        RouteTestMode::Integrated => {
+            if proxy_config.integrated.targets.is_empty() {
+                return json!({
+                    "decision": "error",
+                    "mode": mode.as_str(),
+                    "detail": "integrated mode has no provider targets; add [integrated.targets.*] in Configure first",
+                });
+            }
+            proxy_config.integrated.enabled = true;
+            if let Some(text) = instructions_override {
+                proxy_config.integrated.instructions = text.to_string();
+            }
+        }
     }
+    let config = proxy_config.interceptor.clone();
     let fallback_note = if config.fallback_on_error {
         "live traffic would fall back to external routing on this failure"
     } else {
@@ -621,12 +1193,14 @@ pub(crate) async fn test_route(
         chat_request,
         &config,
         InterceptorProtocol::ChatCompletions,
-        None,
-        &state.config.role_map,
-        state.config.as_ref(),
+        (mode == RouteTestMode::Integrated).then_some(INTEGRATED_AUTO_MODEL),
+        &proxy_config.role_map,
+        &proxy_config,
     ) {
         Ok(request) => request,
-        Err(message) => return json!({ "decision": "error", "detail": message }),
+        Err(message) => {
+            return json!({ "decision": "error", "mode": mode.as_str(), "detail": message });
+        }
     };
 
     let meta = UpstreamRequestMeta::new(
@@ -656,6 +1230,13 @@ pub(crate) async fn test_route(
             });
         }
         Err(_) => {
+            error!(
+                request_id = %meta.request_id,
+                provider = %provider.name,
+                mode = mode.as_str(),
+                timeout_ms = config.timeout_ms,
+                "routing test timed out"
+            );
             return json!({
                 "decision": "error",
                 "detail": format!("local model timed out after {}ms", config.timeout_ms),
@@ -712,31 +1293,74 @@ pub(crate) async fn test_route(
         "empty assistant message".to_string()
     };
 
-    let (decision, note) = match classify_completion(&completion) {
-        CompletionDecision::Local => ("local", "the local model would answer this request"),
-        CompletionDecision::Pass => (
-            "external",
-            "PASS — this request would forward to external routing",
+    let targets = match mode {
+        RouteTestMode::Intercept => &BTreeMap::new(),
+        RouteTestMode::Integrated => &proxy_config.integrated.targets,
+    };
+    let (decision, target, note) = match classify_completion_with_targets(&completion, targets) {
+        CompletionDecision::Local => (
+            "local",
+            None,
+            "the local model would answer this request itself".to_string(),
         ),
-        CompletionDecision::InvalidPass => (
+        CompletionDecision::DefaultRoute => match mode {
+            RouteTestMode::Intercept => (
+                "external",
+                None,
+                format!("{PASS_TOOL_NAME} — forwards untouched to normal external routing"),
+            ),
+            RouteTestMode::Integrated => (
+                "default_route",
+                None,
+                format!(
+                    "{ROUTE_DEFAULT_TOOL_NAME} — continues through model aliases to the default provider"
+                ),
+            ),
+        },
+        CompletionDecision::Redirect(target_name) => {
+            let route = proxy_config.integrated.targets.get(&target_name);
+            let note = route.map_or_else(
+                || format!("redirect to {target_name}"),
+                |route| {
+                    format!(
+                        "redirect to {target_name} ({}/{} at {} reasoning)",
+                        route.provider,
+                        route.model,
+                        route
+                            .reasoning_effort
+                            .map(crate::ReasoningEffort::as_str)
+                            .unwrap_or("provider-default"),
+                    )
+                },
+            );
+            ("redirect", Some(target_name), note)
+        }
+        CompletionDecision::InvalidControl => (
             "invalid",
-            "the local model mixed PASS with other output; live traffic follows fallback_on_error",
+            None,
+            "the local model mixed routing control with other output; live traffic follows fallback_on_error".to_string(),
         ),
+    };
+    let used_default_instructions = match mode {
+        RouteTestMode::Intercept => intercept_instructions_are_default(&proxy_config.interceptor),
+        RouteTestMode::Integrated => integrated_instructions_are_default(&proxy_config.integrated),
     };
     json!({
         "decision": decision,
+        "mode": mode.as_str(),
+        "target": target,
         "note": note,
         "detail": detail,
         "elapsed_ms": elapsed_ms,
         "provider": provider.name,
         "model": config.model,
-        "used_default_instructions": config.instructions == DEFAULT_INSTRUCTIONS,
+        "used_default_instructions": used_default_instructions,
     })
 }
 
 /// The meta-prompt for the admin tab's policy reviser. It confines the local
 /// model to one job: emitting a complete replacement routing policy.
-const REVISER_INSTRUCTIONS: &str = r#"You maintain the routing policy ("system prompt") of llmproxy's local-first interceptor. That policy tells a small local model when to answer an agent request itself and when to call the PASS function so the request forwards to a larger external model.
+const REVISER_INSTRUCTIONS: &str = r#"You maintain the routing policy ("system prompt") of llmproxy's local-first interceptor. That policy tells a small local model when to answer an agent request itself and when to route it onward. Intercept mode uses PASS for fall-through. Integrated mode uses ROUTE_DEFAULT for normal routing and configured route functions for explicit provider/model routes.
 
 The user supplies the current policy and a requested change. Reply with ONLY the complete revised policy text, ready to be used verbatim as the new system prompt. No preamble, no explanation, no code fences, no surrounding quotes.
 
@@ -744,7 +1368,12 @@ You only edit this routing policy. If the request is unrelated to editing the po
 
 /// Ask the interceptor's local model to rewrite the routing instructions.
 /// Returns the revised text for the admin editor; nothing is persisted here.
-pub(crate) async fn revise_instructions(state: &AppState, current: &str, request: &str) -> Value {
+pub(crate) async fn revise_instructions(
+    state: &AppState,
+    current: &str,
+    request: &str,
+    mode: RouteTestMode,
+) -> Value {
     let config = state.config.interceptor.clone();
     if config.provider.trim().is_empty() || config.model.trim().is_empty() {
         return json!({
@@ -760,7 +1389,10 @@ pub(crate) async fn revise_instructions(state: &AppState, current: &str, request
     };
 
     let current_text = if current.trim().is_empty() {
-        DEFAULT_INSTRUCTIONS
+        match mode {
+            RouteTestMode::Intercept => DEFAULT_INSTRUCTIONS,
+            RouteTestMode::Integrated => DEFAULT_INTEGRATED_INSTRUCTIONS,
+        }
     } else {
         current
     };
@@ -807,6 +1439,12 @@ pub(crate) async fn revise_instructions(state: &AppState, current: &str, request
             });
         }
         Err(_) => {
+            error!(
+                request_id = %meta.request_id,
+                provider = %provider.name,
+                timeout_ms,
+                "routing policy revision timed out"
+            );
             return json!({
                 "error": format!("local model timed out after {timeout_ms}ms"),
                 "elapsed_ms": elapsed_ms,

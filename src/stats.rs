@@ -3,7 +3,7 @@
 //! One global [`ProxyStats`] instance collects counters, latency sample
 //! windows, and approximate token savings. Everything resets on restart.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::response::Response;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use tracing::{error, trace};
 
 use crate::is_event_stream_content_type;
 
@@ -36,39 +37,151 @@ impl RouteClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemapKind {
     Alias,
+    Namespace,
     Auto,
 }
 
 const LATENCY_WINDOW_CAP: usize = 2048;
+const PROVIDER_LATENCY_CAP: usize = 512;
+
+fn nearest_rank_percentiles(mut sorted: Vec<u32>) -> (Option<u32>, Option<u32>, usize) {
+    if sorted.is_empty() {
+        return (None, None, 0);
+    }
+    sorted.sort_unstable();
+    let rank = |q: f64| {
+        let index = ((q * sorted.len() as f64).ceil() as usize).max(1) - 1;
+        sorted[index.min(sorted.len() - 1)]
+    };
+    (Some(rank(0.50)), Some(rank(0.99)), sorted.len())
+}
+
+#[derive(Default)]
+struct LatencySamples<const CAP: usize> {
+    values: VecDeque<u32>,
+}
+
+impl<const CAP: usize> LatencySamples<CAP> {
+    fn record(&mut self, elapsed: Duration) {
+        let ms = elapsed.as_millis().min(u128::from(u32::MAX)) as u32;
+        if self.values.len() >= CAP {
+            self.values.pop_front();
+        }
+        self.values.push_back(ms);
+    }
+
+    fn percentiles(&self) -> (Option<u32>, Option<u32>, usize) {
+        nearest_rank_percentiles(self.values.iter().copied().collect())
+    }
+
+    fn clear(&mut self) {
+        self.values.clear();
+    }
+}
 
 #[derive(Default)]
 struct LatencyWindow {
-    samples: Mutex<VecDeque<u32>>,
+    samples: Mutex<LatencySamples<LATENCY_WINDOW_CAP>>,
 }
 
 impl LatencyWindow {
     fn record(&self, elapsed: Duration) {
-        let ms = elapsed.as_millis().min(u128::from(u32::MAX)) as u32;
-        let mut samples = self.samples.lock().expect("latency window poisoned");
-        if samples.len() == LATENCY_WINDOW_CAP {
-            samples.pop_front();
-        }
-        samples.push_back(ms);
+        self.samples
+            .lock()
+            .expect("latency window poisoned")
+            .record(elapsed);
     }
 
-    /// Nearest-rank p50/p99 over the sample window, with the sample count.
     fn percentiles(&self) -> (Option<u32>, Option<u32>, usize) {
-        let samples = self.samples.lock().expect("latency window poisoned");
-        if samples.is_empty() {
-            return (None, None, 0);
+        self.samples
+            .lock()
+            .expect("latency window poisoned")
+            .percentiles()
+    }
+
+    fn clear(&self) {
+        self.samples
+            .lock()
+            .expect("latency window poisoned")
+            .clear();
+    }
+}
+
+#[derive(Default)]
+struct ProviderCalls {
+    count: u64,
+    latency: LatencySamples<PROVIDER_LATENCY_CAP>,
+}
+
+impl ProviderCalls {
+    fn record(&mut self, elapsed: Duration) {
+        self.count += 1;
+        self.latency.record(elapsed);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokenUsage {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) estimated: bool,
+}
+
+impl TokenUsage {
+    pub(crate) fn from_response(
+        usage: Option<&Value>,
+        estimated_input_tokens: u64,
+        estimated_output_tokens: u64,
+    ) -> Self {
+        let (input, output) = usage.map(usage_token_fields).unwrap_or_default();
+        Self::from_fields(
+            input,
+            output,
+            estimated_input_tokens,
+            estimated_output_tokens,
+        )
+    }
+
+    fn from_fields(
+        input: Option<u64>,
+        output: Option<u64>,
+        estimated_input_tokens: u64,
+        estimated_output_tokens: u64,
+    ) -> Self {
+        Self {
+            input_tokens: input.unwrap_or(estimated_input_tokens),
+            output_tokens: output.unwrap_or(estimated_output_tokens),
+            estimated: input.is_none() || output.is_none(),
         }
-        let mut sorted = samples.iter().copied().collect::<Vec<_>>();
-        sorted.sort_unstable();
-        let rank = |q: f64| {
-            let index = ((q * sorted.len() as f64).ceil() as usize).max(1) - 1;
-            sorted[index.min(sorted.len() - 1)]
-        };
-        (Some(rank(0.50)), Some(rank(0.99)), sorted.len())
+    }
+}
+
+#[derive(Default)]
+struct ModelUsage {
+    requests: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_time_ms: u64,
+    estimated_requests: u64,
+}
+
+#[derive(Default)]
+struct RoutingDestination {
+    requests: u64,
+    errors: u64,
+}
+
+impl ModelUsage {
+    fn record(&mut self, elapsed: Duration, usage: TokenUsage) {
+        self.requests = self.requests.saturating_add(1);
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.total_time_ms = self
+            .total_time_ms
+            .saturating_add(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
+        if usage.estimated {
+            self.estimated_requests = self.estimated_requests.saturating_add(1);
+        }
     }
 }
 
@@ -77,11 +190,13 @@ pub(crate) struct ProxyStats {
     started_at: OnceLock<Instant>,
     requests_total: AtomicU64,
     remap_alias: AtomicU64,
+    remap_namespace: AtomicU64,
     remap_auto: AtomicU64,
     intercept_attempts: AtomicU64,
     intercept_bypass: AtomicU64,
     intercept_local: AtomicU64,
     intercept_pass: AtomicU64,
+    intercept_redirect: AtomicU64,
     intercept_fallback: AtomicU64,
     intercept_errors: AtomicU64,
     served_local: AtomicU64,
@@ -91,6 +206,11 @@ pub(crate) struct ProxyStats {
     tokens_saved_estimated: AtomicU64,
     latency_local: LatencyWindow,
     latency_external: LatencyWindow,
+    redirects_by_target: Mutex<HashMap<String, u64>>,
+    served_by_provider: Mutex<HashMap<String, ProviderCalls>>,
+    model_usage: Mutex<HashMap<(String, String), ModelUsage>>,
+    routing_matrix: Mutex<HashMap<(String, String), u64>>,
+    routing_destinations: Mutex<HashMap<(String, String, String), RoutingDestination>>,
 }
 
 pub(crate) fn proxy_stats() -> &'static ProxyStats {
@@ -111,6 +231,7 @@ impl ProxyStats {
     pub(crate) fn record_remap(&self, kind: RemapKind) {
         match kind {
             RemapKind::Alias => self.remap_alias.fetch_add(1, Ordering::Relaxed),
+            RemapKind::Namespace => self.remap_namespace.fetch_add(1, Ordering::Relaxed),
             RemapKind::Auto => self.remap_auto.fetch_add(1, Ordering::Relaxed),
         };
     }
@@ -125,17 +246,29 @@ impl ProxyStats {
 
     /// The interceptor answered locally: counts as a local serve and records
     /// the local completion latency plus exact usage when present.
-    pub(crate) fn record_intercept_local(&self, elapsed: Duration, usage: Option<&Value>) {
+    pub(crate) fn record_intercept_local(
+        &self,
+        provider: &str,
+        frontend: &str,
+        elapsed: Duration,
+        usage: TokenUsage,
+    ) {
         self.intercept_local.fetch_add(1, Ordering::Relaxed);
-        self.served_local.fetch_add(1, Ordering::Relaxed);
-        self.latency_local.record(elapsed);
-        if let Some((prompt, completion)) = usage.and_then(usage_tokens) {
-            self.record_tokens_saved(prompt, completion, false);
-        }
+        self.record_served(RouteClass::Local, provider, frontend, elapsed);
+        self.record_tokens_saved(usage.input_tokens, usage.output_tokens, usage.estimated);
     }
 
     pub(crate) fn record_intercept_pass(&self) {
         self.intercept_pass.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_intercept_redirect(&self, target: &str) {
+        self.intercept_redirect.fetch_add(1, Ordering::Relaxed);
+        let mut redirects = self
+            .redirects_by_target
+            .lock()
+            .expect("redirect stats poisoned");
+        *redirects.entry(target.to_string()).or_default() += 1;
     }
 
     pub(crate) fn record_intercept_fallback(&self) {
@@ -146,7 +279,7 @@ impl ProxyStats {
         self.intercept_errors.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_served(&self, class: RouteClass, elapsed: Duration) {
+    fn record_served(&self, class: RouteClass, provider: &str, frontend: &str, elapsed: Duration) {
         match class {
             RouteClass::Local => {
                 self.served_local.fetch_add(1, Ordering::Relaxed);
@@ -157,6 +290,72 @@ impl ProxyStats {
                 self.latency_external.record(elapsed);
             }
         }
+        self.served_by_provider
+            .lock()
+            .expect("provider stats poisoned")
+            .entry(provider.to_string())
+            .or_default()
+            .record(elapsed);
+        *self
+            .routing_matrix
+            .lock()
+            .expect("routing matrix stats poisoned")
+            .entry((frontend.to_string(), provider.to_string()))
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_model_usage(
+        &self,
+        provider: &str,
+        model: &str,
+        elapsed: Duration,
+        usage: TokenUsage,
+    ) {
+        self.model_usage
+            .lock()
+            .expect("model usage stats poisoned")
+            .entry((provider.to_string(), model.to_string()))
+            .or_default()
+            .record(elapsed, usage);
+    }
+
+    fn record_routing_destination(
+        &self,
+        frontend: &str,
+        provider: &str,
+        model: &str,
+        failed: bool,
+    ) {
+        let mut destinations = self
+            .routing_destinations
+            .lock()
+            .expect("routing destination stats poisoned");
+        let destination = destinations
+            .entry((
+                frontend.to_string(),
+                provider.to_string(),
+                model.to_string(),
+            ))
+            .or_default();
+        destination.requests = destination.requests.saturating_add(1);
+        if failed {
+            destination.errors = destination.errors.saturating_add(1);
+        }
+    }
+
+    fn record_routing_error(&self, frontend: &str, provider: &str, model: &str) {
+        let mut destinations = self
+            .routing_destinations
+            .lock()
+            .expect("routing destination stats poisoned");
+        let destination = destinations
+            .entry((
+                frontend.to_string(),
+                provider.to_string(),
+                model.to_string(),
+            ))
+            .or_default();
+        destination.errors = destination.errors.saturating_add(1);
     }
 
     fn record_tokens_saved(&self, prompt: u64, completion: u64, estimated: bool) {
@@ -174,11 +373,13 @@ impl ProxyStats {
         for counter in [
             &self.requests_total,
             &self.remap_alias,
+            &self.remap_namespace,
             &self.remap_auto,
             &self.intercept_attempts,
             &self.intercept_bypass,
             &self.intercept_local,
             &self.intercept_pass,
+            &self.intercept_redirect,
             &self.intercept_fallback,
             &self.intercept_errors,
             &self.served_local,
@@ -190,12 +391,28 @@ impl ProxyStats {
             counter.store(0, Ordering::Relaxed);
         }
         for window in [&self.latency_local, &self.latency_external] {
-            window
-                .samples
-                .lock()
-                .expect("latency window poisoned")
-                .clear();
+            window.clear();
         }
+        self.redirects_by_target
+            .lock()
+            .expect("redirect stats poisoned")
+            .clear();
+        self.served_by_provider
+            .lock()
+            .expect("provider stats poisoned")
+            .clear();
+        self.model_usage
+            .lock()
+            .expect("model usage stats poisoned")
+            .clear();
+        self.routing_matrix
+            .lock()
+            .expect("routing matrix stats poisoned")
+            .clear();
+        self.routing_destinations
+            .lock()
+            .expect("routing destination stats poisoned")
+            .clear();
     }
 
     /// Stable snake_case keys: the admin UI treats this shape as a contract.
@@ -207,30 +424,124 @@ impl ProxyStats {
         };
         let saved_prompt = load(&self.tokens_saved_prompt);
         let saved_completion = load(&self.tokens_saved_completion);
+        let redirects = self
+            .redirects_by_target
+            .lock()
+            .expect("redirect stats poisoned")
+            .iter()
+            .map(|(target, count)| (target.clone(), json!(count)))
+            .collect::<serde_json::Map<_, _>>();
+        let providers = self
+            .served_by_provider
+            .lock()
+            .expect("provider stats poisoned")
+            .iter()
+            .map(|(provider, calls)| {
+                let (p50, p99, samples) = calls.latency.percentiles();
+                (
+                    provider.clone(),
+                    json!({
+                        "count": calls.count,
+                        "p50_ms": p50,
+                        "p99_ms": p99,
+                        "samples": samples,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let mut model_usage = self
+            .model_usage
+            .lock()
+            .expect("model usage stats poisoned")
+            .iter()
+            .map(|((provider, model), usage)| {
+                json!({
+                    "provider": provider,
+                    "model": model,
+                    "requests": usage.requests,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.input_tokens.saturating_add(usage.output_tokens),
+                    "total_time_ms": usage.total_time_ms,
+                    "estimated_requests": usage.estimated_requests,
+                })
+            })
+            .collect::<Vec<_>>();
+        model_usage.sort_by(|left, right| {
+            left["provider"]
+                .as_str()
+                .cmp(&right["provider"].as_str())
+                .then_with(|| left["model"].as_str().cmp(&right["model"].as_str()))
+        });
+        let mut matrix = serde_json::Map::new();
+        for ((frontend, provider), count) in self
+            .routing_matrix
+            .lock()
+            .expect("routing matrix stats poisoned")
+            .iter()
+        {
+            matrix
+                .entry(frontend.clone())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .expect("routing matrix rows are objects")
+                .insert(provider.clone(), json!(count));
+        }
+        let mut destinations = self
+            .routing_destinations
+            .lock()
+            .expect("routing destination stats poisoned")
+            .iter()
+            .map(|((frontend, provider, model), destination)| {
+                json!({
+                    "frontend": frontend,
+                    "provider": provider,
+                    "model": model,
+                    "requests": destination.requests,
+                    "errors": destination.errors,
+                })
+            })
+            .collect::<Vec<_>>();
+        destinations.sort_by(|left, right| {
+            left["frontend"]
+                .as_str()
+                .cmp(&right["frontend"].as_str())
+                .then_with(|| left["provider"].as_str().cmp(&right["provider"].as_str()))
+                .then_with(|| left["model"].as_str().cmp(&right["model"].as_str()))
+        });
         json!({
             "uptime_secs": self.started_at.get().map(Instant::elapsed).unwrap_or_default().as_secs(),
             "requests": {
                 "total": load(&self.requests_total),
                 "remap_alias": load(&self.remap_alias),
+                "remap_namespace": load(&self.remap_namespace),
                 "remap_auto": load(&self.remap_auto),
-                "remapped": load(&self.remap_alias) + load(&self.remap_auto),
+                "remapped": load(&self.remap_alias)
+                    + load(&self.remap_namespace)
+                    + load(&self.remap_auto),
             },
             "intercept": {
                 "attempts": load(&self.intercept_attempts),
                 "bypass": load(&self.intercept_bypass),
                 "local": load(&self.intercept_local),
                 "pass": load(&self.intercept_pass),
+                "redirect": load(&self.intercept_redirect),
                 "fallback": load(&self.intercept_fallback),
                 "errors": load(&self.intercept_errors),
+                "redirects": redirects,
             },
             "served": {
                 "local": load(&self.served_local),
                 "external": load(&self.served_external),
+                "providers": providers,
+                "matrix": matrix,
+                "destinations": destinations,
             },
             "latency": {
                 "local": latency(&self.latency_local),
                 "external": latency(&self.latency_external),
             },
+            "model_usage": model_usage,
             "tokens_saved": {
                 "prompt": saved_prompt,
                 "completion": saved_completion,
@@ -302,13 +613,75 @@ fn base_url_is_local(base_url: &str) -> bool {
         || !host.contains('.') // bare intranet hostname
 }
 
-/// Wrap a successful proxied response so that, when its body finishes
-/// streaming, the request is counted with its full duration. Local-class
-/// bodies are additionally sniffed for `usage` to tally saved tokens.
-pub(crate) fn track_response(class: RouteClass, started: Instant, response: Response) -> Response {
-    if !response.status().is_success() {
-        log_response_text(class, format!("HTTP {}", response.status()));
-        return response;
+pub(crate) struct ResponseTracking<'a> {
+    class: RouteClass,
+    provider: &'a str,
+    model: &'a str,
+    frontend: &'a str,
+    request_started: Instant,
+    model_started: Instant,
+    estimated_input_tokens: u64,
+    estimate_output_tokens: bool,
+}
+
+impl<'a> ResponseTracking<'a> {
+    pub(crate) fn new(
+        class: RouteClass,
+        provider: &'a str,
+        model: &'a str,
+        frontend: &'a str,
+        request_started: Instant,
+        model_started: Instant,
+        estimated_input_tokens: u64,
+    ) -> Self {
+        Self {
+            class,
+            provider,
+            model,
+            frontend,
+            request_started,
+            model_started,
+            estimated_input_tokens,
+            estimate_output_tokens: true,
+        }
+    }
+
+    pub(crate) fn without_output_estimation(mut self) -> Self {
+        self.estimate_output_tokens = false;
+        self
+    }
+}
+
+/// Wrap a proxied response so every response chunk is traceable and completed
+/// successful calls update usage statistics after the full body has streamed.
+pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response) -> Response {
+    let ResponseTracking {
+        class,
+        provider,
+        model,
+        frontend,
+        request_started,
+        model_started,
+        estimated_input_tokens,
+        estimate_output_tokens,
+    } = tracking;
+    let provider = provider.to_string();
+    let model = model.to_string();
+    let frontend = frontend.to_string();
+    let status = response.status();
+    let success = status.is_success();
+    proxy_stats().record_routing_destination(&frontend, &provider, &model, !success);
+    if !success {
+        error!(
+            route_class = class.as_str(),
+            provider,
+            model,
+            frontend,
+            status = status.as_u16(),
+            "proxied response returned an error status"
+        );
+        log_response_text(class, &provider, format!("HTTP {status}"));
+        error_log().record(&provider, "upstream response", format!("HTTP {status}"));
     }
     let (parts, body) = response.into_parts();
     let is_sse = parts
@@ -316,31 +689,88 @@ pub(crate) fn track_response(class: RouteClass, started: Instant, response: Resp
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(is_event_stream_content_type);
-    let mut sniffer = (class == RouteClass::Local).then(|| UsageSniffer::new(is_sse));
+    let mut sniffer = UsageSniffer::new(is_sse);
 
     let mut upstream = body.into_data_stream();
     let tracked = async_stream::stream! {
         let mut logged_first_chunk = false;
+        let mut completed = true;
+        let mut chunk_index = 0_u64;
         while let Some(chunk) = upstream.next().await {
-            if let Ok(bytes) = &chunk {
-                if let Some(sniffer) = sniffer.as_mut() {
-                    sniffer.feed(bytes);
-                }
-                if !logged_first_chunk && !bytes.is_empty() {
-                    logged_first_chunk = true;
-                    if traffic_log().enabled() {
-                        let head = &bytes[..bytes.len().min(TRAFFIC_PREVIEW_CHARS * 2)];
-                        log_response_text(class, String::from_utf8_lossy(head).into_owned());
+            match &chunk {
+                Ok(bytes) => {
+                    chunk_index = chunk_index.saturating_add(1);
+                    trace!(
+                        route_class = class.as_str(),
+                        provider,
+                        model,
+                        frontend,
+                        status = status.as_u16(),
+                        chunk_index,
+                        body_bytes = bytes.len(),
+                        body = %String::from_utf8_lossy(bytes),
+                        "proxied response body"
+                    );
+                    if !success {
+                        error!(
+                            route_class = class.as_str(),
+                            provider,
+                            model,
+                            frontend,
+                            status = status.as_u16(),
+                            chunk_index,
+                            body = %String::from_utf8_lossy(bytes),
+                            "error response body"
+                        );
+                    } else {
+                        sniffer.feed(bytes);
                     }
+                    if !logged_first_chunk && !bytes.is_empty() {
+                        logged_first_chunk = true;
+                        if traffic_log().enabled() {
+                            let head = &bytes[..bytes.len().min(TRAFFIC_PREVIEW_CHARS * 2)];
+                            traffic_log().record(
+                                class,
+                                &provider,
+                                LogDirection::Response,
+                                flatten_preview(String::from_utf8_lossy(head).into_owned()),
+                            );
+                        }
+                    }
+                }
+                Err(stream_error) => {
+                    completed = false;
+                    if success {
+                        proxy_stats().record_routing_error(&frontend, &provider, &model);
+                    }
+                    error!(
+                        route_class = class.as_str(),
+                        provider,
+                        model,
+                        frontend,
+                        status = status.as_u16(),
+                        error = %stream_error,
+                        "proxied response body stream failed"
+                    );
+                    error_log().record(
+                        &provider,
+                        "response stream",
+                        stream_error.to_string(),
+                    );
                 }
             }
             yield chunk;
         }
-        proxy_stats().record_served(class, started.elapsed());
-        if let Some(sniffer) = sniffer.take() {
-            let (prompt, completion, estimated) = sniffer.finish();
-            if prompt > 0 || completion > 0 {
-                proxy_stats().record_tokens_saved(prompt, completion, estimated);
+        if success && completed {
+            let usage = sniffer.finish(estimated_input_tokens, estimate_output_tokens);
+            proxy_stats().record_served(class, &provider, &frontend, request_started.elapsed());
+            proxy_stats().record_model_usage(&provider, &model, model_started.elapsed(), usage);
+            if class == RouteClass::Local {
+                proxy_stats().record_tokens_saved(
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.estimated,
+                );
             }
         }
     };
@@ -381,34 +811,46 @@ impl UsageSniffer {
         self.tail.extend_from_slice(chunk);
     }
 
-    /// (prompt, completion, estimated)
-    fn finish(self) -> (u64, u64, bool) {
-        if let Some((prompt, completion)) = extract_last_usage(&self.tail) {
-            return (prompt, completion, false);
-        }
-        // No visible usage: assume ~4 bytes/token of payload, discounted for
-        // SSE event framing. Prompt tokens are unknown and left at zero.
+    fn finish(self, estimated_input_tokens: u64, estimate_output_tokens: bool) -> TokenUsage {
         let divisor = if self.is_sse { 6 } else { 4 };
-        (0, self.total_bytes / divisor, true)
+        let estimated_output_tokens = if estimate_output_tokens {
+            self.total_bytes / divisor
+        } else {
+            0
+        };
+        let (input, output) = extract_last_usage(&self.tail).unwrap_or_default();
+        TokenUsage::from_fields(
+            input,
+            output,
+            estimated_input_tokens,
+            estimated_output_tokens,
+        )
     }
 }
 
 /// Scan backwards for the last `"usage"` key whose value is an object with
 /// token counts. Streams emit `"usage":null` chunks, so earlier matches are
 /// tried until one parses.
-fn extract_last_usage(haystack: &[u8]) -> Option<(u64, u64)> {
+fn extract_last_usage(haystack: &[u8]) -> Option<(Option<u64>, Option<u64>)> {
     const KEY: &[u8] = b"\"usage\"";
     let mut end = haystack.len();
+    let mut input = None;
+    let mut output = None;
     for _ in 0..16 {
-        let start = rfind(&haystack[..end], KEY)?;
-        if let Some(usage) = parse_usage_value(&haystack[start + KEY.len()..])
-            && let Some(tokens) = usage_tokens(&usage)
-        {
-            return Some(tokens);
+        let Some(start) = rfind(&haystack[..end], KEY) else {
+            break;
+        };
+        if let Some(usage) = parse_usage_value(&haystack[start + KEY.len()..]) {
+            let (candidate_input, candidate_output) = usage_token_fields(&usage);
+            input = input.or(candidate_input);
+            output = output.or(candidate_output);
+            if input.is_some() && output.is_some() {
+                break;
+            }
         }
         end = start;
     }
-    None
+    (input.is_some() || output.is_some()).then_some((input, output))
 }
 
 fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -457,21 +899,27 @@ fn parse_usage_value(bytes: &[u8]) -> Option<Value> {
 }
 
 /// (prompt, completion) from OpenAI- or Anthropic-style usage objects.
+#[cfg(test)]
 fn usage_tokens(usage: &Value) -> Option<(u64, u64)> {
+    let (input, output) = usage_token_fields(usage);
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    Some((input.unwrap_or(0), output.unwrap_or(0)))
+}
+
+fn usage_token_fields(usage: &Value) -> (Option<u64>, Option<u64>) {
     let field = |names: [&str; 2]| {
         names
             .iter()
             .find_map(|name| usage.get(name).and_then(Value::as_u64))
     };
-    let prompt = field(["prompt_tokens", "input_tokens"]);
-    let completion = field(["completion_tokens", "output_tokens"]);
-    if prompt.is_none() && completion.is_none() {
-        return None;
-    }
-    Some((prompt.unwrap_or(0), completion.unwrap_or(0)))
+    (
+        field(["prompt_tokens", "input_tokens"]),
+        field(["completion_tokens", "output_tokens"]),
+    )
 }
 
-// ---------------------------------------------------------------------------
 // Traffic log: a bounded, expiring feed of request/response previews for the
 // admin Monitor tab. Recording is a no-op unless the admin interface enabled
 // it at startup, so the proxy hot path pays nothing when admin is off.
@@ -495,20 +943,142 @@ impl LogDirection {
     }
 }
 
-struct TrafficLogEntry {
+struct LogMetadata {
     id: u64,
     epoch_ms: u64,
     recorded_at: Instant,
+}
+
+impl LogMetadata {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            epoch_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or_default(),
+            recorded_at: Instant::now(),
+        }
+    }
+}
+
+trait LogEntry {
+    fn metadata(&self) -> &LogMetadata;
+    fn to_json(&self) -> Value;
+}
+
+struct LogBuffer<T> {
+    enabled: AtomicBool,
+    state: Mutex<LogState<T>>,
+}
+
+struct LogState<T> {
+    next_id: u64,
+    entries: VecDeque<T>,
+}
+
+impl<T> Default for LogBuffer<T> {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            state: Mutex::new(LogState {
+                next_id: 0,
+                entries: VecDeque::new(),
+            }),
+        }
+    }
+}
+
+impl<T: LogEntry> LogBuffer<T> {
+    fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    fn record(&self, capacity: usize, ttl: Duration, build: impl FnOnce(LogMetadata) -> T) {
+        if !self.enabled() || capacity == 0 {
+            return;
+        }
+        let mut state = self.state.lock().expect("log buffer poisoned");
+        Self::prune(&mut state.entries, ttl);
+        while state.entries.len() >= capacity {
+            state.entries.pop_front();
+        }
+        state.next_id += 1;
+        let metadata = LogMetadata::new(state.next_id);
+        state.entries.push_back(build(metadata));
+    }
+
+    fn clear(&self) {
+        self.state
+            .lock()
+            .expect("log buffer poisoned")
+            .entries
+            .clear();
+    }
+
+    fn snapshot_after(&self, after: u64, ttl: Duration) -> Value {
+        let mut state = self.state.lock().expect("log buffer poisoned");
+        Self::prune(&mut state.entries, ttl);
+        let latest_id = state
+            .entries
+            .back()
+            .map(|entry| entry.metadata().id)
+            .unwrap_or(after);
+        let items = state
+            .entries
+            .iter()
+            .filter(|entry| entry.metadata().id > after)
+            .map(LogEntry::to_json)
+            .collect::<Vec<_>>();
+        json!({
+            "entries": items,
+            "latest_id": latest_id,
+            "ttl_secs": ttl.as_secs(),
+        })
+    }
+
+    fn prune(entries: &mut VecDeque<T>, ttl: Duration) {
+        while entries
+            .front()
+            .is_some_and(|entry| entry.metadata().recorded_at.elapsed() >= ttl)
+        {
+            entries.pop_front();
+        }
+    }
+}
+
+struct TrafficLogEntry {
+    metadata: LogMetadata,
     class: RouteClass,
+    provider: String,
     direction: LogDirection,
     preview: String,
 }
 
+impl LogEntry for TrafficLogEntry {
+    fn metadata(&self) -> &LogMetadata {
+        &self.metadata
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.metadata.id,
+            "ts_ms": self.metadata.epoch_ms,
+            "class": self.class.as_str(),
+            "provider": self.provider,
+            "dir": self.direction.as_str(),
+            "text": self.preview,
+        })
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct TrafficLog {
-    enabled: AtomicBool,
-    next_id: AtomicU64,
-    entries: Mutex<VecDeque<TrafficLogEntry>>,
+    buffer: LogBuffer<TrafficLogEntry>,
 }
 
 pub(crate) fn traffic_log() -> &'static TrafficLog {
@@ -517,99 +1087,177 @@ pub(crate) fn traffic_log() -> &'static TrafficLog {
 }
 
 impl TrafficLog {
-    /// Called once at startup when the admin interface is enabled.
     pub(crate) fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
+        self.buffer.set_enabled(enabled);
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
+        self.buffer.enabled()
     }
 
-    pub(crate) fn record(&self, class: RouteClass, direction: LogDirection, preview: String) {
-        if !self.enabled() {
+    pub(crate) fn record(
+        &self,
+        class: RouteClass,
+        provider: &str,
+        direction: LogDirection,
+        preview: String,
+    ) {
+        if !self.buffer.enabled() {
             return;
         }
-        let entry = TrafficLogEntry {
-            id: self.next_id.fetch_add(1, Ordering::Relaxed) + 1,
-            epoch_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_millis() as u64)
-                .unwrap_or_default(),
-            recorded_at: Instant::now(),
-            class,
-            direction,
-            preview,
-        };
-        let mut entries = self.entries.lock().expect("traffic log poisoned");
-        Self::prune(&mut entries, TRAFFIC_LOG_TTL);
-        if entries.len() == TRAFFIC_LOG_CAP {
-            entries.pop_front();
-        }
-        entries.push_back(entry);
-    }
-
-    fn prune(entries: &mut VecDeque<TrafficLogEntry>, ttl: Duration) {
-        while entries
-            .front()
-            .is_some_and(|entry| entry.recorded_at.elapsed() >= ttl)
-        {
-            entries.pop_front();
-        }
+        let provider = provider.to_string();
+        self.buffer
+            .record(TRAFFIC_LOG_CAP, TRAFFIC_LOG_TTL, move |metadata| {
+                TrafficLogEntry {
+                    metadata,
+                    class,
+                    provider,
+                    direction,
+                    preview,
+                }
+            });
     }
 
     pub(crate) fn clear(&self) {
-        self.entries.lock().expect("traffic log poisoned").clear();
+        self.buffer.clear();
     }
 
-    /// Entries newer than `after` (an id from a previous call), oldest first.
     pub(crate) fn snapshot_after(&self, after: u64) -> Value {
-        let mut entries = self.entries.lock().expect("traffic log poisoned");
-        Self::prune(&mut entries, TRAFFIC_LOG_TTL);
-        let latest_id = entries.back().map(|entry| entry.id).unwrap_or(after);
-        let items = entries
-            .iter()
-            .filter(|entry| entry.id > after)
-            .map(|entry| {
-                json!({
-                    "id": entry.id,
-                    "ts_ms": entry.epoch_ms,
-                    "class": entry.class.as_str(),
-                    "dir": entry.direction.as_str(),
-                    "text": entry.preview,
-                })
-            })
-            .collect::<Vec<_>>();
+        self.buffer.snapshot_after(after, TRAFFIC_LOG_TTL)
+    }
+}
+
+// Error log: a bounded, expiring feed of upstream and interceptor failures
+// for the admin Monitor tab. Errors are rarer than traffic, so entries live
+// longer and the preview budget is bigger.
+
+const ERROR_LOG_CAP: usize = 256;
+const ERROR_LOG_TTL: Duration = Duration::from_secs(60 * 60);
+const ERROR_PREVIEW_CHARS: usize = 300;
+
+struct ErrorLogEntry {
+    metadata: LogMetadata,
+    provider: String,
+    context: String,
+    message: String,
+}
+
+impl LogEntry for ErrorLogEntry {
+    fn metadata(&self) -> &LogMetadata {
+        &self.metadata
+    }
+
+    fn to_json(&self) -> Value {
         json!({
-            "entries": items,
-            "latest_id": latest_id,
-            "ttl_secs": TRAFFIC_LOG_TTL.as_secs(),
+            "id": self.metadata.id,
+            "ts_ms": self.metadata.epoch_ms,
+            "provider": self.provider,
+            "context": self.context,
+            "text": self.message,
         })
     }
 }
 
-/// Log the JSON body of an outgoing request (bounded preview).
-pub(crate) fn log_request_value(class: RouteClass, body: &Value) {
-    if !traffic_log().enabled() {
-        return;
-    }
-    traffic_log().record(class, LogDirection::Request, json_preview(body));
+#[derive(Default)]
+pub(crate) struct ErrorLog {
+    buffer: LogBuffer<ErrorLogEntry>,
 }
 
-/// Log a buffered JSON response (bounded preview).
-pub(crate) fn log_response_value(class: RouteClass, body: &Value) {
+pub(crate) fn error_log() -> &'static ErrorLog {
+    static LOG: OnceLock<ErrorLog> = OnceLock::new();
+    LOG.get_or_init(ErrorLog::default)
+}
+
+impl ErrorLog {
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        self.buffer.set_enabled(enabled);
+    }
+
+    pub(crate) fn record(&self, provider: &str, context: &str, message: impl Into<String>) {
+        if !self.buffer.enabled() {
+            return;
+        }
+        let mut message = message
+            .into()
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(ERROR_PREVIEW_CHARS + 1)
+            .collect::<String>();
+        if message.chars().count() > ERROR_PREVIEW_CHARS {
+            message.pop();
+            message.push('…');
+        }
+        let provider = provider.to_string();
+        let context = context.to_string();
+        self.buffer
+            .record(ERROR_LOG_CAP, ERROR_LOG_TTL, move |metadata| {
+                ErrorLogEntry {
+                    metadata,
+                    provider,
+                    context,
+                    message,
+                }
+            });
+    }
+
+    pub(crate) fn clear(&self) {
+        self.buffer.clear();
+    }
+
+    pub(crate) fn snapshot_after(&self, after: u64) -> Value {
+        self.buffer.snapshot_after(after, ERROR_LOG_TTL)
+    }
+}
+
+/// Trace the full JSON body and retain a bounded preview for the admin UI.
+pub(crate) fn log_request_value(class: RouteClass, provider: &str, body: &Value) {
+    trace!(
+        route_class = class.as_str(),
+        provider,
+        direction = "request",
+        body = %body,
+        "LLM request body"
+    );
     if !traffic_log().enabled() {
         return;
     }
-    traffic_log().record(class, LogDirection::Response, json_preview(body));
+    traffic_log().record(class, provider, LogDirection::Request, json_preview(body));
+}
+
+/// Trace a full buffered JSON response and retain a bounded admin preview.
+pub(crate) fn log_response_value(class: RouteClass, provider: &str, body: &Value) {
+    trace!(
+        route_class = class.as_str(),
+        provider,
+        direction = "response",
+        body = %body,
+        "LLM response body"
+    );
+    if !traffic_log().enabled() {
+        return;
+    }
+    traffic_log().record(class, provider, LogDirection::Response, json_preview(body));
 }
 
 /// Log a response that is only known as text (errors, status lines).
-pub(crate) fn log_response_text(class: RouteClass, text: impl Into<String>) {
+pub(crate) fn log_response_text(class: RouteClass, provider: &str, text: impl Into<String>) {
+    let text = text.into();
+    trace!(
+        route_class = class.as_str(),
+        provider,
+        direction = "response",
+        body = %text,
+        "LLM response body"
+    );
     if !traffic_log().enabled() {
         return;
     }
-    traffic_log().record(class, LogDirection::Response, flatten_preview(text.into()));
+    traffic_log().record(
+        class,
+        provider,
+        LogDirection::Response,
+        flatten_preview(text),
+    );
 }
 
 /// Serialize a JSON value into a bounded single-line preview without

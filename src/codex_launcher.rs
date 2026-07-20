@@ -9,11 +9,46 @@ use tokio::process::{Child, Command};
 use tracing::info;
 
 use super::Cli;
-use crate::agent_launcher::{LauncherKind, LauncherSession, no_proxy_value};
+use crate::agent_launcher::{
+    LauncherKind, LauncherMode, LauncherSession, configure_proxy_process, contains_arg, home_dir,
+    non_empty_env_value, prepend_args, require_loopback, with_integrated_auto_model,
+};
 
 const CODEX_PROXY_PROVIDER: &str = "llmproxy_intercept";
 const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1";
 const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const EXPLICIT_ARGS: &[&str] = &[
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "plugin",
+    "mcp-server",
+    "app-server",
+    "remote-control",
+    "completion",
+    "update",
+    "doctor",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "resume",
+    "archive",
+    "delete",
+    "unarchive",
+    "fork",
+    "cloud",
+    "exec-server",
+    "features",
+    "help",
+    "-h",
+    "--help",
+    "-V",
+    "--version",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexAuthRoute {
@@ -36,49 +71,58 @@ pub(super) struct CodexLaunch {
     codex_bin: PathBuf,
     codex_args: Vec<OsString>,
     upstream_base_url: String,
+    mode: LauncherMode,
 }
 
 impl CodexLaunch {
-    pub(super) async fn discover(cli: &Cli) -> Result<Self> {
+    pub(super) async fn discover(cli: &Cli, mode: LauncherMode) -> Result<Self> {
         let codex_bin = cli
             .codex_bin
             .clone()
             .or_else(|| env::var_os("LLMPROXY_CODEX_BIN").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("codex"));
-        let codex_args = codex_launch_args(&cli.agent_args);
-        let auth_route = detect_auth_route(&codex_bin, &codex_args).await?;
-        let configured_base_url = configured_openai_base_url(&cli.agent_args)?;
-        let upstream_base_url = cli
-            .upstream
-            .clone()
-            .or(configured_base_url)
-            .unwrap_or_else(|| auth_route.default_base_url().to_string())
-            .trim_end_matches('/')
-            .to_string();
-        if upstream_base_url.is_empty() {
-            bail!("Codex upstream base URL cannot be empty");
-        }
+        let codex_args = with_integrated_auto_model(&codex_launch_args(&cli.agent_args), mode);
+        let upstream_base_url = if mode == LauncherMode::Intercept {
+            let auth_route = detect_auth_route(&codex_bin, &codex_args).await?;
+            let configured_base_url = configured_openai_base_url(&cli.agent_args)?;
+            let upstream_base_url = cli
+                .upstream
+                .clone()
+                .or(configured_base_url)
+                .unwrap_or_else(|| auth_route.default_base_url().to_string())
+                .trim_end_matches('/')
+                .to_string();
+            if upstream_base_url.is_empty() {
+                bail!("Codex upstream base URL cannot be empty");
+            }
+            upstream_base_url
+        } else {
+            String::new()
+        };
 
         Ok(Self {
             codex_bin,
             codex_args,
             upstream_base_url,
+            mode,
         })
     }
 
     pub(super) fn spawn(&self, proxy_addr: SocketAddr) -> Result<Child> {
-        if !proxy_addr.ip().is_loopback() {
-            bail!("--intercept --codex requires a loopback listen address, got {proxy_addr}");
-        }
+        require_loopback("Codex", proxy_addr)?;
         let proxy_root_url = format!("http://{proxy_addr}/v1");
-        if same_base_url(&proxy_root_url, &self.upstream_base_url) {
+        if self.mode == LauncherMode::Intercept
+            && same_base_url(&proxy_root_url, &self.upstream_base_url)
+        {
             bail!("Codex upstream resolves back to this proxy");
         }
-        let session = self.launcher_session()?;
-        let token = session.encode()?;
+        let token =
+            LauncherSession::for_launcher(LauncherKind::Codex, self.mode, &self.upstream_base_url)?
+                .encode()?;
         let proxy_base_url = format!("http://{proxy_addr}/_launcher/{token}/v1");
 
-        let provider_override = codex_provider_override(&proxy_base_url);
+        let provider_override =
+            codex_provider_override(&proxy_base_url, self.mode == LauncherMode::Intercept);
         let mut command = Command::new(&self.codex_bin);
         command
             .arg("-c")
@@ -92,15 +136,14 @@ impl CodexLaunch {
             .arg("features.enable_request_compression=false")
             .args(&self.codex_args)
             .env("LLMPROXY_CODEX_ACTIVE", "1")
-            .env("LLMPROXY_CODEX_PROXY_URL", &proxy_base_url)
-            .env("NO_PROXY", no_proxy_value("NO_PROXY"))
-            .env("no_proxy", no_proxy_value("no_proxy"))
-            .kill_on_drop(true);
+            .env("LLMPROXY_CODEX_PROXY_URL", &proxy_base_url);
+        configure_proxy_process(&mut command);
 
         info!(
             executable = %self.codex_bin.display(),
             proxy = %proxy_base_url,
-            "launching Codex through local interceptor"
+            mode = ?self.mode,
+            "launching Codex through llmproxy"
         );
         command.spawn().with_context(|| {
             format!(
@@ -109,14 +152,12 @@ impl CodexLaunch {
             )
         })
     }
-
-    fn launcher_session(&self) -> Result<LauncherSession> {
-        LauncherSession::new(LauncherKind::Codex, self.upstream_base_url.clone())
-    }
 }
 
 async fn detect_auth_route(codex_bin: &Path, codex_args: &[OsString]) -> Result<CodexAuthRoute> {
-    if let Some(route) = environment_auth_route(codex_args, non_empty_env) {
+    if let Some(route) =
+        environment_auth_route(codex_args, |name| non_empty_env_value(name).is_some())
+    {
         return Ok(route);
     }
 
@@ -229,10 +270,7 @@ fn codex_home_path() -> Option<PathBuf> {
     if let Some(codex_home) = env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(codex_home));
     }
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .filter(|value| !value.is_empty())
-        .map(|home| PathBuf::from(home).join(".codex"))
+    home_dir().map(|home| home.join(".codex"))
 }
 
 fn selected_profile(args: &[OsString]) -> Option<String> {
@@ -253,50 +291,10 @@ fn selected_profile(args: &[OsString]) -> Option<String> {
 }
 
 fn codex_launch_args(args: &[OsString]) -> Vec<OsString> {
-    if args.iter().any(|arg| {
-        matches!(
-            arg.to_str(),
-            Some(
-                "exec"
-                    | "e"
-                    | "review"
-                    | "login"
-                    | "logout"
-                    | "mcp"
-                    | "plugin"
-                    | "mcp-server"
-                    | "app-server"
-                    | "remote-control"
-                    | "completion"
-                    | "update"
-                    | "doctor"
-                    | "sandbox"
-                    | "debug"
-                    | "apply"
-                    | "a"
-                    | "resume"
-                    | "archive"
-                    | "delete"
-                    | "unarchive"
-                    | "fork"
-                    | "cloud"
-                    | "exec-server"
-                    | "features"
-                    | "help"
-                    | "-h"
-                    | "--help"
-                    | "-V"
-                    | "--version"
-            )
-        )
-    }) {
+    if contains_arg(args, EXPLICIT_ARGS, &[]) {
         return args.to_vec();
     }
-
-    [OsString::from("resume"), OsString::from("--last")]
-        .into_iter()
-        .chain(args.iter().cloned())
-        .collect()
+    prepend_args(args, &["resume", "--last"])
 }
 
 fn codex_enables_api_key_env(args: &[OsString]) -> bool {
@@ -318,14 +316,10 @@ fn environment_auth_route(
     }
 }
 
-fn non_empty_env(name: &str) -> bool {
-    env::var(name).is_ok_and(|value| !value.trim().is_empty())
-}
-
-fn codex_provider_override(proxy_base_url: &str) -> String {
+fn codex_provider_override(proxy_base_url: &str, requires_openai_auth: bool) -> String {
     format!(
-        "model_providers.{CODEX_PROXY_PROVIDER}={{ name = \"OpenAI\", base_url = {}, wire_api = \"responses\", requires_openai_auth = true, supports_websockets = false }}",
-        toml_string(proxy_base_url)
+        "model_providers.{CODEX_PROXY_PROVIDER}={{ name = \"OpenAI\", base_url = {}, wire_api = \"responses\", requires_openai_auth = {requires_openai_auth}, supports_websockets = false }}",
+        toml_string(proxy_base_url),
     )
 }
 

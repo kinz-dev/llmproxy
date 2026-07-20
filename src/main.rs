@@ -18,39 +18,56 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Request, State},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
         header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
     },
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use bytes::Bytes;
 use clap::Parser;
 use futures_util::StreamExt;
-use reqwest::{Client, Method};
+use reqwest::{Client, Method, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::{net::TcpListener, sync::Mutex as AsyncMutex, time::sleep};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 mod admin;
 mod agent_launcher;
+mod backend_adapters;
 mod claude_launcher;
 mod codex_launcher;
 mod copilot_launcher;
 mod interceptor;
+mod logging;
+mod oauth;
 mod stats;
 
-use agent_launcher::{AgentLaunch, LauncherKind, LauncherSession, probe_existing_llmproxy};
-use interceptor::{InterceptionPolicy, InterceptorConfig, InterceptorProtocol, maybe_intercept};
-use stats::{RemapKind, log_request_value, proxy_stats, route_class_for_base_url, track_response};
+use agent_launcher::{
+    AgentLaunch, LauncherKind, LauncherMode, LauncherSession, probe_existing_llmproxy,
+};
+use backend_adapters::{
+    AnthropicStreamTranslator, anthropic_to_chat_response, chat_to_anthropic_request,
+    chat_to_codex_responses_request, codex_sse_to_chat_completion, is_claude_model,
+    sanitize_copilot_chat_request, sanitize_cross_provider_chat_request,
+};
+use interceptor::{
+    IntegratedConfig, InterceptionPolicy, InterceptorConfig, InterceptorProtocol, maybe_intercept,
+};
+use stats::{
+    RemapKind, ResponseTracking, log_request_value, proxy_stats, route_class_for_base_url,
+    track_response,
+};
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+pub(crate) const INTEGRATED_AUTO_MODEL: &str = "Auto";
 
 type ResponseResult<T> = std::result::Result<T, Box<Response>>;
 
@@ -58,10 +75,12 @@ type ResponseResult<T> = std::result::Result<T, Box<Response>>;
 #[command(
     version,
     about = "Small OpenAI-compatible v1 proxy for vLLM-style servers",
-    group(clap::ArgGroup::new("agent_launcher").args(["claude", "codex", "copilot"]).multiple(false))
+    group(clap::ArgGroup::new("agent_launcher").args(["claude", "codex", "copilot"]).multiple(false)),
+    group(clap::ArgGroup::new("proxy_mode").args(["proxy", "intercept", "integrated"]).multiple(false))
 )]
 struct Cli {
-    /// Path to a TOML config file.
+    /// Path to a TOML config file. Defaults to LLMPROXY_CONFIG, ./config.toml,
+    /// then ~/.llmproxy/config.toml.
     #[arg(short, long)]
     config: Option<PathBuf>,
 
@@ -77,6 +96,14 @@ struct Cli {
     #[arg(long)]
     intercept: bool,
 
+    /// Route an agent directly to the configured default provider without interception.
+    #[arg(long, requires = "agent_launcher")]
+    proxy: bool,
+
+    /// Enable integrated cross-provider triage for requests using model Auto.
+    #[arg(long)]
+    integrated: bool,
+
     /// Stop the managed llmproxy instance for this listen address and exit.
     #[arg(long)]
     shutdown: bool,
@@ -85,16 +112,16 @@ struct Cli {
     #[arg(long, conflicts_with = "shutdown")]
     restart: bool,
 
-    /// Launch Codex through this proxy using Codex's existing OpenAI login.
-    #[arg(long, requires = "intercept")]
+    /// Launch Codex through this proxy using the selected routing mode.
+    #[arg(long)]
     codex: bool,
 
-    /// Launch Claude Code through this proxy using Claude's existing Anthropic login.
-    #[arg(long, requires = "intercept")]
+    /// Launch Claude Code through this proxy using the selected routing mode.
+    #[arg(long)]
     claude: bool,
 
-    /// Launch GitHub Copilot CLI through this proxy using Copilot's existing GitHub login.
-    #[arg(long, requires = "intercept")]
+    /// Launch GitHub Copilot CLI through this proxy using the selected routing mode.
+    #[arg(long)]
     copilot: bool,
 
     /// Codex executable to launch. Defaults to LLMPROXY_CODEX_BIN or codex.
@@ -122,16 +149,46 @@ impl Cli {
     fn has_agent_launcher(&self) -> bool {
         self.codex || self.claude || self.copilot
     }
+
+    fn launcher_mode(&self) -> Option<LauncherMode> {
+        if !self.has_agent_launcher() {
+            return None;
+        }
+        if self.proxy {
+            Some(LauncherMode::Proxy)
+        } else if self.integrated {
+            Some(LauncherMode::Integrated)
+        } else if self.intercept {
+            Some(LauncherMode::Intercept)
+        } else {
+            Some(LauncherMode::Integrated)
+        }
+    }
+}
+
+fn validate_cli(cli: &Cli) -> Result<()> {
+    if matches!(
+        cli.launcher_mode(),
+        Some(LauncherMode::Proxy | LauncherMode::Integrated)
+    ) && cli.upstream.is_some()
+    {
+        bail!(
+            "--upstream is only supported by native --intercept launchers; configure the default provider for --proxy or --integrated"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 struct Config {
     listen_addr: String,
+    max_logging_retention_days: u64,
     default_provider: String,
     upstream: UpstreamConfig,
     providers: HashMap<String, UpstreamConfig>,
     interceptor: InterceptorConfig,
+    integrated: IntegratedConfig,
     model_aliases: HashMap<String, ModelAlias>,
     role_map: HashMap<String, String>,
     chat: ChatConfig,
@@ -149,10 +206,12 @@ impl Default for Config {
         Self {
             listen_addr: env::var("LLMPROXY_LISTEN_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:8080".to_string()),
+            max_logging_retention_days: 7,
             default_provider: "default".to_string(),
             upstream: UpstreamConfig::default(),
             providers: HashMap::new(),
             interceptor: InterceptorConfig::default(),
+            integrated: IntegratedConfig::default(),
             model_aliases: HashMap::new(),
             role_map: HashMap::new(),
             chat: ChatConfig::default(),
@@ -206,10 +265,15 @@ impl ModelAlias {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 struct UpstreamConfig {
+    kind: ProviderKind,
     base_url: String,
     api_key: Option<String>,
     api_key_env: Option<String>,
+    /// Borrowed subscription OAuth: attach the local CLI's login token instead
+    /// of a static API key. `none` (default) keeps API-key/passthrough auth.
+    auth: ProviderAuth,
     headers: HashMap<String, String>,
+    reasoning_effort: Option<ReasoningEffort>,
     timeout_secs: u64,
     connect_timeout_secs: u64,
     pool_max_idle_per_host: usize,
@@ -219,17 +283,123 @@ struct UpstreamConfig {
 impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
+            kind: ProviderKind::OpenAiCompatible,
             base_url: env::var("OPENAI_BASE_URL")
                 .or_else(|_| env::var("VLLM_BASE_URL"))
                 .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".to_string()),
             api_key: None,
             api_key_env: None,
+            auth: ProviderAuth::None,
             headers: HashMap::new(),
+            reasoning_effort: None,
             timeout_secs: 600,
             connect_timeout_secs: 10,
             pool_max_idle_per_host: 64,
             pool_idle_timeout_secs: 90,
         }
+    }
+}
+
+/// How a provider authenticates outbound requests.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum ProviderAuth {
+    /// Static API key or caller-forwarded credentials (the existing behavior).
+    #[default]
+    None,
+    /// Borrow `~/.codex/auth.json` and talk to the ChatGPT Codex backend.
+    CodexOauth,
+    /// Borrow `~/.claude/.credentials.json` and talk to Claude as Claude Code.
+    ClaudeOauth,
+}
+
+impl ProviderAuth {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CodexOauth => "codex-oauth",
+            Self::ClaudeOauth => "claude-oauth",
+        }
+    }
+
+    fn oauth_provider(self) -> Option<oauth::OAuthProvider> {
+        match self {
+            Self::None => None,
+            Self::CodexOauth => Some(oauth::OAuthProvider::Codex),
+            Self::ClaudeOauth => Some(oauth::OAuthProvider::Claude),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum ProviderKind {
+    #[default]
+    #[serde(rename = "openai-compatible", alias = "open-ai-compatible")]
+    OpenAiCompatible,
+    #[serde(rename = "openai", alias = "open-ai")]
+    OpenAi,
+    Anthropic,
+    Copilot,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            "max" => Ok(Self::Max),
+            _ => Err(format!(
+                "reasoning_effort must be one of none, minimal, low, medium, high, xhigh, or max; got {value:?}"
+            )),
+        }
+    }
+}
+
+impl ProviderKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "openai-compatible",
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Copilot => "copilot",
+        }
+    }
+
+    fn can_inherit_openai_api_key(self) -> bool {
+        matches!(self, Self::OpenAiCompatible | Self::OpenAi)
     }
 }
 
@@ -299,6 +469,8 @@ struct AppState {
     config: Arc<Config>,
     providers: Arc<HashMap<String, ProviderState>>,
     launcher_kind: Option<LauncherKind>,
+    launcher_mode: Option<LauncherMode>,
+    forward_caller_credentials: bool,
 }
 
 const LAUNCHER_EXTERNAL_PROVIDER: &str = "__launcher_external";
@@ -356,6 +528,10 @@ struct RuntimeInfo {
     pid: u32,
     proxy_url: String,
     admin_url: Option<String>,
+    #[serde(default)]
+    integrated: bool,
+    #[serde(default)]
+    log_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -368,6 +544,7 @@ struct UpstreamModels {
 #[derive(Debug, Clone, Copy)]
 enum ModelMappingSource {
     Alias,
+    Namespace,
     Auto,
 }
 
@@ -482,6 +659,21 @@ impl UpstreamFailure {
         }
     }
 
+    /// A borrowed-OAuth token could not be resolved (missing file, refresh
+    /// failure). Treated as a request-setup error, never retried.
+    fn oauth(meta: &UpstreamRequestMeta, error: impl Into<String>) -> Self {
+        Self {
+            provider: meta.provider.clone(),
+            request_id: meta.request_id.clone(),
+            method: meta.method.clone(),
+            path: meta.path.clone(),
+            response_kind: meta.response_kind,
+            kind: UpstreamErrorKind::Request,
+            message: format!("borrowed OAuth login unavailable: {}", error.into()),
+            upstream_status: None,
+        }
+    }
+
     fn status_with_body(meta: &UpstreamRequestMeta, status: StatusCode, bytes: &[u8]) -> Self {
         let detail = upstream_error_detail(bytes).unwrap_or_else(|| body_prefix(bytes));
         let message = if detail.is_empty() {
@@ -559,6 +751,7 @@ impl ModelMappingSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::Alias => "alias",
+            Self::Namespace => "namespace",
             Self::Auto => "auto",
         }
     }
@@ -729,20 +922,20 @@ fn parse_upstream_json(bytes: &[u8]) -> std::result::Result<Value, String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "llmproxy=info,tower_http=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
-    proxy_stats().touch_start();
+    validate_cli(&cli)?;
     if cli.foreground && cli.has_agent_launcher() {
         bail!("--foreground cannot be combined with --codex, --claude, or --copilot");
     }
 
     let (config, config_path) = load_config(&cli, cli.intercept && !cli.has_agent_launcher())?;
+    let logging_guard = logging::init(
+        cli.foreground,
+        agent_launcher::home_dir().as_deref(),
+        config.max_logging_retention_days,
+    )?;
+    log_loaded_config(&config, config_path.as_deref());
+    proxy_stats().touch_start();
     let addr: SocketAddr = config
         .listen_addr
         .parse()
@@ -753,9 +946,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let agent_launch = AgentLaunch::discover(&cli).await?;
-    if agent_launch.is_some() {
-        validate_launcher_runtime(&config)?;
+    let launcher_mode = cli.launcher_mode();
+    let agent_launch = match launcher_mode {
+        Some(mode) => AgentLaunch::discover(&cli, mode).await?,
+        None => None,
+    };
+    if let Some(mode) = launcher_mode {
+        validate_launcher_runtime(&config, mode)?;
     }
 
     if cli.restart {
@@ -763,7 +960,13 @@ async fn main() -> Result<()> {
     }
 
     if cli.foreground {
-        run_server(config, config_path, None).await?;
+        run_server(
+            config,
+            config_path,
+            None,
+            logging_guard.file_name().map(ToOwned::to_owned),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -781,6 +984,7 @@ async fn run_server(
     config: Config,
     config_path: Option<PathBuf>,
     launcher_name: Option<&'static str>,
+    log_file: Option<String>,
 ) -> Result<()> {
     let config = Arc::new(config);
     let mut providers = HashMap::new();
@@ -791,6 +995,8 @@ async fn run_server(
         config: config.clone(),
         providers: Arc::new(providers),
         launcher_kind: None,
+        launcher_mode: None,
+        forward_caller_credentials: !config.integrated.enabled,
     };
     let shared = SharedState::new(state.clone());
 
@@ -799,7 +1005,7 @@ async fn run_server(
             tokio::spawn(async move {
                 let _refresh_guard = provider.model_refresh.lock().await;
                 if let Err(error) = refresh_upstream_models(&provider, &HeaderMap::new()).await {
-                    warn!(
+                    error!(
                         error = %error,
                         provider = %provider.name,
                         upstream = %provider.config.base_url,
@@ -833,6 +1039,7 @@ async fn run_server(
 
     let admin_addr = if config.admin.enable {
         stats::traffic_log().set_enabled(true);
+        stats::error_log().set_enabled(true);
         let admin_context = Arc::new(admin::AdminContext::new(
             config_path,
             launcher_name,
@@ -843,7 +1050,8 @@ async fn run_server(
     } else {
         None
     };
-    let runtime_info = RuntimeInfo::new(bound_addr, admin_addr);
+    let runtime_info =
+        RuntimeInfo::new(bound_addr, admin_addr, config.integrated.enabled, log_file);
     let _runtime_info_file = RuntimeInfoGuard::create(bound_addr, &runtime_info)?;
     println!("{}", startup_banner(&runtime_info, "running"));
 
@@ -913,6 +1121,99 @@ fn build_app(shared: SharedState) -> Router {
     Router::new()
         .merge(api)
         .nest("/_launcher/{launcher_token}", launcher_api)
+        .fallback(route_not_found)
+        .layer(middleware::from_fn(trace_http_request))
+}
+
+async fn route_not_found(request: Request) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "message": format!("no llmproxy endpoint matches {method} {path}"),
+                "type": "route_not_found"
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn trace_http_request(mut request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let request_id = request_id_from_headers(request.headers());
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        request
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), value);
+    }
+    let started = Instant::now();
+    trace!(request_id, method = %method, path, "client request started");
+    let mut response = next.run(request).await;
+    if !response.headers().contains_key("x-request-id")
+        && let Ok(value) = HeaderValue::from_str(&request_id)
+    {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), value);
+    }
+    let status = response.status();
+    if status.is_success() {
+        trace!(
+            method = %method,
+            request_id,
+            path,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "client response completed"
+        );
+    } else {
+        error!(
+            method = %method,
+            request_id,
+            path,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "client request returned an error response"
+        );
+    }
+    if status.is_success() {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let mut body_stream = body.into_data_stream();
+    let error_body = async_stream::stream! {
+        let mut chunk_index = 0_u64;
+        while let Some(chunk) = body_stream.next().await {
+            match &chunk {
+                Ok(bytes) => {
+                    chunk_index = chunk_index.saturating_add(1);
+                    error!(
+                        method = %method,
+                        request_id,
+                        path,
+                        status = status.as_u16(),
+                        chunk_index,
+                        body = %String::from_utf8_lossy(bytes),
+                        "client error response body"
+                    );
+                }
+                Err(body_error) => error!(
+                    method = %method,
+                    request_id,
+                    path,
+                    status = status.as_u16(),
+                    error = %body_error,
+                    "client error response stream failed"
+                ),
+            }
+            yield chunk;
+        }
+    };
+    Response::from_parts(parts, Body::from_stream(error_body))
 }
 
 fn build_provider_state(name: String, upstream: UpstreamConfig) -> Result<ProviderState> {
@@ -967,7 +1268,8 @@ async fn ensure_daemon_running(
 }
 
 fn print_daemon_banner(addr: SocketAddr, status: &str) -> Result<()> {
-    let info = read_runtime_info(addr)?.unwrap_or_else(|| RuntimeInfo::new(addr, None));
+    let info =
+        read_runtime_info(addr)?.unwrap_or_else(|| RuntimeInfo::new(addr, None, false, None));
     println!("{}", startup_banner(&info, status));
     Ok(())
 }
@@ -984,8 +1286,13 @@ fn startup_banner(info: &RuntimeInfo, status: &str) -> String {
         .admin_url
         .as_deref()
         .unwrap_or("disabled (set [admin] enable = true)");
+    let log = info
+        .log_file
+        .as_deref()
+        .map(|name| format!("~/.llmproxy/{name}"))
+        .unwrap_or_else(|| "disabled".to_string());
     format!(
-        "{LLMPROXY_BANNER}\n\nStatus : {status}\nProxy  : {}\nAdmin  : {admin}",
+        "{LLMPROXY_BANNER}\n\nStatus : {status}\nProxy  : {}\nAdmin  : {admin}\nLog    : {log}",
         info.proxy_url
     )
 }
@@ -1015,6 +1322,9 @@ fn spawn_daemon_process(
         }
         if cli.intercept {
             command.arg("--intercept");
+        }
+        if cli.integrated {
+            command.arg("--integrated");
         }
     }
 
@@ -1199,13 +1509,34 @@ impl Drop for PidFileGuard {
 }
 
 impl RuntimeInfo {
-    fn new(proxy_addr: SocketAddr, admin_addr: Option<SocketAddr>) -> Self {
+    fn new(
+        proxy_addr: SocketAddr,
+        admin_addr: Option<SocketAddr>,
+        integrated: bool,
+        log_file: Option<String>,
+    ) -> Self {
         Self {
             pid: std::process::id(),
             proxy_url: format!("http://{proxy_addr}/"),
             admin_url: admin_addr.map(|addr| format!("http://{addr}/")),
+            integrated,
+            log_file,
         }
     }
+}
+
+fn update_runtime_integrated(addr: SocketAddr, integrated: bool) -> Result<()> {
+    let Some(mut info) = read_runtime_info(addr)? else {
+        return Ok(());
+    };
+    if info.pid != std::process::id() || info.integrated == integrated {
+        return Ok(());
+    }
+    info.integrated = integrated;
+    let path = daemon_info_path(addr);
+    let raw = serde_json::to_vec(&info).context("failed to encode runtime metadata")?;
+    fs::write(&path, raw)
+        .with_context(|| format!("failed to update runtime metadata {}", path.display()))
 }
 
 impl RuntimeInfoGuard {
@@ -1258,21 +1589,41 @@ async fn shutdown_signal() {
     }
 }
 
+fn resolve_config_path(
+    explicit: Option<PathBuf>,
+    configured: Option<PathBuf>,
+    home: Option<&FsPath>,
+    exists: &impl Fn(&FsPath) -> bool,
+) -> Option<PathBuf> {
+    explicit.or(configured).or_else(|| {
+        let local = PathBuf::from("config.toml");
+        if exists(&local) {
+            return Some(local);
+        }
+        home.map(|home| home.join(".llmproxy").join("config.toml"))
+            .filter(|path| exists(path))
+    })
+}
+
+fn discovered_config_path(cli: &Cli) -> Option<PathBuf> {
+    let configured = env::var_os("LLMPROXY_CONFIG")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let home = agent_launcher::home_dir();
+    resolve_config_path(
+        cli.config.clone(),
+        configured,
+        home.as_deref(),
+        &FsPath::exists,
+    )
+}
+
 fn load_config(cli: &Cli, force_intercept: bool) -> Result<(Config, Option<PathBuf>)> {
-    let config_path = cli
-        .config
-        .clone()
-        .or_else(|| env::var_os("LLMPROXY_CONFIG").map(PathBuf::from))
-        .or_else(|| {
-            ["config.toml", "llmproxy.toml"]
-                .into_iter()
-                .map(PathBuf::from)
-                .find(|path| path.exists())
-        });
-    let (mut config, config_source) = if let Some(path) = &config_path {
-        (read_config(path)?, path.display().to_string())
+    let config_path = discovered_config_path(cli);
+    let mut config = if let Some(path) = &config_path {
+        read_config(path)?
     } else {
-        (Config::default(), "environment/defaults".to_string())
+        Config::default()
     };
 
     if let Some(listen) = &cli.listen {
@@ -1280,6 +1631,9 @@ fn load_config(cli: &Cli, force_intercept: bool) -> Result<(Config, Option<PathB
     }
     if force_intercept {
         config.interceptor.enabled = true;
+    }
+    if cli.integrated && !cli.has_agent_launcher() {
+        config.integrated.enabled = true;
     }
     if let Some(upstream) = &cli.upstream {
         if let Some(provider) = config.providers.get_mut(&config.default_provider) {
@@ -1291,36 +1645,43 @@ fn load_config(cli: &Cli, force_intercept: bool) -> Result<(Config, Option<PathB
     finalize_config_keys(&mut config);
     validate_config(&config)?;
 
+    Ok((config, config_path))
+}
+
+fn log_loaded_config(config: &Config, config_path: Option<&FsPath>) {
     info!(
-        config_source = %config_source,
+        config_source = %config_path.map_or_else(
+            || "environment/defaults".to_string(),
+            |path| path.display().to_string(),
+        ),
         default_provider = %config.default_provider,
-        providers = effective_provider_configs(&config)?.len(),
+        providers = effective_provider_configs(config).map_or(0, |providers| providers.len()),
         interceptor_enabled = config.interceptor.enabled,
+        integrated_enabled = config.integrated.enabled,
         model_aliases = config.model_aliases.len(),
         role_mappings = config.role_map.len(),
+        max_logging_retention_days = config.max_logging_retention_days,
         disable_thinking = config.chat.disable_thinking,
         expose_aliases = config.models.expose_aliases,
         auto_model_mapping = config.model_routing == ModelRoutingMode::Remap,
         admin_enabled = config.admin.enable,
         "loaded config"
     );
-
-    Ok((config, config_path))
 }
 
-fn validate_launcher_runtime(config: &Config) -> Result<()> {
+fn validate_launcher_runtime(config: &Config, mode: LauncherMode) -> Result<()> {
+    if mode == LauncherMode::Proxy {
+        effective_provider_configs(config)?;
+        return Ok(());
+    }
     let providers = effective_provider_configs(config)?;
-    if config.interceptor.provider.trim().is_empty() {
-        bail!("launchers require interceptor.provider to be configured");
-    }
-    if !providers.contains_key(&config.interceptor.provider) {
-        bail!(
-            "launcher interceptor provider {:?} is not configured",
-            config.interceptor.provider
-        );
-    }
-    if config.interceptor.model.trim().is_empty() {
-        bail!("launchers require interceptor.model to be configured");
+    let mut interceptor_config = config.interceptor.clone();
+    interceptor_config.enabled = true;
+    interceptor::validate_config(&interceptor_config, &providers)?;
+    if mode == LauncherMode::Integrated {
+        let mut integrated = config.integrated.clone();
+        integrated.enabled = true;
+        interceptor::validate_integrated_config(&integrated, &interceptor_config, &providers)?;
     }
     Ok(())
 }
@@ -1341,11 +1702,17 @@ fn finalize_config_keys_with_env(config: &mut Config, env_value: &impl Fn(&str) 
         provider.base_url = provider.base_url.trim_end_matches('/').to_string();
         let uses_client_auth = config.model_routing == ModelRoutingMode::Passthrough;
         let is_interceptor_provider = name == &config.interceptor.provider;
-        provider.api_key = resolve_api_key_with_env(
-            provider,
-            !is_interceptor_provider && !uses_client_auth,
-            env_value,
-        );
+        // Borrowed-OAuth providers never carry a static key; their token comes
+        // from the local CLI's on-disk login at request time.
+        provider.api_key = if provider.auth != ProviderAuth::None {
+            None
+        } else {
+            resolve_api_key_with_env(
+                provider,
+                !is_interceptor_provider && !uses_client_auth,
+                env_value,
+            )
+        };
     }
 }
 
@@ -1373,7 +1740,7 @@ fn resolve_api_key_with_env(
                 .filter(|key| !key.is_empty())
         })
         .or_else(|| {
-            inherit_openai_api_key
+            (inherit_openai_api_key && upstream.kind.can_inherit_openai_api_key())
                 .then(|| env_value("OPENAI_API_KEY"))
                 .flatten()
         })
@@ -1421,6 +1788,32 @@ fn request_state(shared: &SharedState, launcher_token: Option<&str>) -> Response
     state
         .with_launcher_session(&session)
         .map_err(|error| Box::new(launcher_error_response(error.to_string())))
+}
+
+fn trace_client_request(frontend: &str, launcher_token: Option<&str>, body: &Value) {
+    trace!(
+        frontend,
+        launcher_session = launcher_token.is_some(),
+        body = %body,
+        "client request body"
+    );
+}
+
+fn provider_request_headers(
+    state: &AppState,
+    incoming: &HeaderMap,
+    provider: &ProviderState,
+) -> HeaderMap {
+    if !state.forward_caller_credentials || provider.name != state.config.default_provider {
+        return HeaderMap::new();
+    }
+    if state.config.model_routing == ModelRoutingMode::Passthrough
+        || route_class_for_base_url(&provider.config.base_url) == stats::RouteClass::External
+    {
+        incoming.clone()
+    } else {
+        HeaderMap::new()
+    }
 }
 
 async fn models(State(shared): State<SharedState>, headers: HeaderMap) -> Response {
@@ -1515,17 +1908,21 @@ async fn models_impl(
         Err(response) => return *response,
     };
     if state.config.model_routing == ModelRoutingMode::Passthrough {
-        return match proxy_get(state.default_provider(), &headers, "models").await {
+        let provider = state.default_provider();
+        let provider_headers = provider_request_headers(&state, &headers, provider);
+        return match proxy_get(provider, &provider_headers, "models").await {
             Ok(models) => Json(models).into_response(),
             Err(error_response) => error_response,
         };
     }
+    Json(aggregated_models_json(&state, &headers).await).into_response()
+}
+
+/// The remap-mode `/v1/models` payload: every reachable provider's models
+/// (raw + namespaced), plus alias and integrated-target entries.
+async fn aggregated_models_json(state: &AppState, headers: &HeaderMap) -> Value {
     if !state.config.models.expose_upstream {
-        return Json(rewrite_models_response(
-            json!({ "object": "list", "data": [] }),
-            &state.config,
-        ))
-        .into_response();
+        return rewrite_models_response(json!({ "object": "list", "data": [] }), &state.config);
     }
 
     let mut provider_names = state.providers.keys().cloned().collect::<Vec<_>>();
@@ -1536,6 +1933,7 @@ async fn models_impl(
             .providers
             .get(&provider_name)
             .expect("provider name came from map");
+        let provider_headers = provider_request_headers(state, headers, provider);
         let upstream = if let Some(cached) = provider
             .model_cache
             .cached_upstream_models_response(models_cache_ttl(&state.config))
@@ -1543,29 +1941,46 @@ async fn models_impl(
             debug!(provider = %provider.name, "serving upstream models from cache");
             cached
         } else {
-            match proxy_get(provider, &headers, "models").await {
+            match fetch_upstream_models(provider, &provider_headers).await {
                 Ok(upstream) => {
                     cache_upstream_models(provider, upstream.clone(), "models_endpoint");
                     upstream
                 }
-                Err(_) => {
-                    warn!(
+                Err(error) => {
+                    error!(
                         provider = %provider.name,
                         upstream = %provider.config.base_url,
+                        error = %error,
                         "omitting unavailable provider from aggregated model list"
                     );
                     continue;
                 }
             }
         };
-        append_provider_models(&mut data, upstream, &provider.name);
+        append_provider_models(
+            &mut data,
+            upstream,
+            &provider.name,
+            provider.name == state.config.default_provider,
+        );
     }
 
-    Json(rewrite_models_response(
-        json!({ "object": "list", "data": data }),
-        &state.config,
-    ))
-    .into_response()
+    rewrite_models_response(json!({ "object": "list", "data": data }), &state.config)
+}
+
+/// The model catalog for the admin Models tab: exactly what a client of this
+/// proxy sees from `GET /v1/models`, using proxy-owned credentials.
+pub(crate) async fn models_catalog_json(state: &AppState) -> Value {
+    let headers = HeaderMap::new();
+    if state.config.model_routing == ModelRoutingMode::Passthrough {
+        let provider = state.default_provider();
+        let provider_headers = provider_request_headers(state, &headers, provider);
+        return match proxy_get(provider, &provider_headers, "models").await {
+            Ok(models) => models,
+            Err(_) => json!({ "object": "list", "data": [] }),
+        };
+    }
+    aggregated_models_json(state, &headers).await
 }
 
 async fn model_by_id(
@@ -1595,16 +2010,15 @@ async fn model_by_id_impl(
         Err(response) => return *response,
     };
     if state.config.model_routing == ModelRoutingMode::Passthrough {
-        return match proxy_get(
-            state.default_provider(),
-            &headers,
-            &format!("models/{model}"),
-        )
-        .await
-        {
+        let provider = state.default_provider();
+        let provider_headers = provider_request_headers(&state, &headers, provider);
+        return match proxy_get(provider, &provider_headers, &format!("models/{model}")).await {
             Ok(model) => Json(model).into_response(),
             Err(error_response) => error_response,
         };
+    }
+    if model == INTEGRATED_AUTO_MODEL && !state.config.integrated.targets.is_empty() {
+        return Json(integrated_auto_model()).into_response();
     }
     if let Some(route) = state.config.model_aliases.get(&model) {
         let provider_name = route.provider(&state.config.default_provider);
@@ -1624,9 +2038,22 @@ async fn model_by_id_impl(
         ))
         .into_response();
     }
+    if let Some((provider_name, target)) = namespaced_model_target(&state.config, &model) {
+        let Some(provider) = state.providers.get(provider_name) else {
+            return unknown_provider_response(provider_name);
+        };
+        provider.model_cache.log_first_seen_model(
+            provider_name,
+            &model,
+            target,
+            ModelMappingSource::Namespace,
+        );
+        return Json(model_object(&model, Some(target), Some(provider_name))).into_response();
+    }
 
     let provider = state.default_provider();
-    match ensure_default_upstream_model(provider, &headers).await {
+    let provider_headers = provider_request_headers(&state, &headers, provider);
+    match ensure_default_upstream_model(provider, &provider_headers).await {
         Ok(target) => {
             provider.model_cache.log_first_seen_model(
                 &provider.name,
@@ -1667,16 +2094,32 @@ async fn completions_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
+    trace_client_request("completions", launcher_token, &body);
     proxy_stats().record_request();
     let started = Instant::now();
     let provider = match rewrite_proxy_request_value(&state, &headers, &mut body).await {
         Ok(provider) => provider,
         Err(error_response) => return *error_response,
     };
+    let provider_headers = provider_request_headers(&state, &headers, &provider);
     let class = route_class_for_base_url(&provider.config.base_url);
-    log_request_value(class, &body);
-    let response = proxy_json(&provider, &headers, "completions", &body).await;
-    track_response(class, started, response)
+    let model = request_model(&body).to_string();
+    let estimated_input_tokens = estimate_tokens(&body) as u64;
+    log_request_value(class, &provider.name, &body);
+    let model_started = Instant::now();
+    let response = proxy_json(&provider, &provider_headers, "completions", &body).await;
+    track_response(
+        ResponseTracking::new(
+            class,
+            &provider.name,
+            &model,
+            "completions",
+            started,
+            model_started,
+            estimated_input_tokens,
+        ),
+        response,
+    )
 }
 
 async fn embeddings(
@@ -1706,11 +2149,33 @@ async fn embeddings_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
+    trace_client_request("embeddings", launcher_token, &body);
+    proxy_stats().record_request();
+    let started = Instant::now();
     let provider = match rewrite_proxy_request_value(&state, &headers, &mut body).await {
         Ok(provider) => provider,
         Err(error_response) => return *error_response,
     };
-    proxy_json(&provider, &headers, "embeddings", &body).await
+    let provider_headers = provider_request_headers(&state, &headers, &provider);
+    let class = route_class_for_base_url(&provider.config.base_url);
+    let model = request_model(&body).to_string();
+    let estimated_input_tokens = estimate_tokens(&body) as u64;
+    log_request_value(class, &provider.name, &body);
+    let model_started = Instant::now();
+    let response = proxy_json(&provider, &provider_headers, "embeddings", &body).await;
+    track_response(
+        ResponseTracking::new(
+            class,
+            &provider.name,
+            &model,
+            "embeddings",
+            started,
+            model_started,
+            estimated_input_tokens,
+        )
+        .without_output_estimation(),
+        response,
+    )
 }
 
 async fn chat_completions(
@@ -1740,9 +2205,10 @@ async fn chat_completions_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
+    trace_client_request("chat_completions", launcher_token, &body);
     proxy_stats().record_request();
     let started = Instant::now();
-    if state.config.interceptor.enabled
+    if (state.config.interceptor.enabled || state.config.integrated.enabled)
         && let Some(response) = maybe_intercept(
             &state,
             &headers,
@@ -1764,13 +2230,34 @@ async fn chat_completions_impl(
         Ok(provider) => provider,
         Err(error_response) => return *error_response,
     };
+    let provider_headers = provider_request_headers(&state, &headers, &provider);
     if state.launcher_kind != Some(LauncherKind::Copilot) {
         normalize_chat_completion_request(&mut body, &state.config);
     }
     let class = route_class_for_base_url(&provider.config.base_url);
-    log_request_value(class, &body);
-    let response = proxy_json(&provider, &headers, "chat/completions", &body).await;
-    track_response(class, started, response)
+    let model = request_model(&body).to_string();
+    let estimated_input_tokens = estimate_tokens(&body) as u64;
+    log_request_value(class, &provider.name, &body);
+    let model_started = Instant::now();
+    let response = if state.launcher_kind == Some(LauncherKind::Copilot)
+        && state.config.model_routing == ModelRoutingMode::Passthrough
+    {
+        proxy_json(&provider, &provider_headers, "chat/completions", &body).await
+    } else {
+        proxy_chat(&provider, &provider_headers, &body).await
+    };
+    track_response(
+        ResponseTracking::new(
+            class,
+            &provider.name,
+            &model,
+            "chat_completions",
+            started,
+            model_started,
+            estimated_input_tokens,
+        ),
+        response,
+    )
 }
 
 async fn responses(
@@ -1800,6 +2287,7 @@ async fn responses_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
+    trace_client_request("responses", launcher_token, &body);
     proxy_stats().record_request();
     let started = Instant::now();
     let client_model = body
@@ -1807,7 +2295,7 @@ async fn responses_impl(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
-    if state.config.interceptor.enabled {
+    if state.config.interceptor.enabled || state.config.integrated.enabled {
         let policy = InterceptionPolicy::for_responses(&headers, &body);
         let local_chat_request = responses_to_chat_request(&body);
         if let Some(response) = maybe_intercept(
@@ -1830,31 +2318,56 @@ async fn responses_impl(
         Ok(provider) => provider,
         Err(error_response) => return *error_response,
     };
+    let passthrough = state.config.responses.mode == ResponsesMode::Passthrough
+        && matches!(
+            provider.config.kind,
+            ProviderKind::OpenAiCompatible | ProviderKind::OpenAi | ProviderKind::Copilot
+        );
+    if passthrough {
+        apply_provider_reasoning_effort(&provider, ReasoningWire::Responses, &mut rewritten);
+    }
+    let provider_headers = provider_request_headers(&state, &headers, &provider);
     let class = route_class_for_base_url(&provider.config.base_url);
-    log_request_value(class, &rewritten);
+    let model = request_model(&rewritten).to_string();
+    let estimated_input_tokens = estimate_tokens(&rewritten) as u64;
+    log_request_value(class, &provider.name, &rewritten);
 
-    let response = match state.config.responses.mode {
-        ResponsesMode::Passthrough => {
-            proxy_json(&provider, &headers, "responses", &rewritten).await
-        }
-        ResponsesMode::ChatCompletions => {
-            let mut chat_request = responses_to_chat_request(&rewritten);
-            normalize_chat_completion_request(&mut chat_request, &state.config);
-            if chat_request
-                .get("stream")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                ensure_chat_stream_include_usage(&mut chat_request);
-                proxy_responses_stream_via_chat(&provider, &headers, &chat_request, client_model)
-                    .await
-            } else {
-                proxy_responses_once_via_chat(&provider, &headers, &chat_request, client_model)
-                    .await
-            }
+    let model_started = Instant::now();
+    let response = if passthrough {
+        proxy_json(&provider, &provider_headers, "responses", &rewritten).await
+    } else {
+        let mut chat_request = responses_to_chat_request(&rewritten);
+        normalize_chat_completion_request(&mut chat_request, &state.config);
+        if chat_request
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            ensure_chat_stream_include_usage(&mut chat_request);
+            proxy_responses_stream_via_chat(
+                &provider,
+                &provider_headers,
+                &chat_request,
+                client_model,
+            )
+            .await
+        } else {
+            proxy_responses_once_via_chat(&provider, &provider_headers, &chat_request, client_model)
+                .await
         }
     };
-    track_response(class, started, response)
+    track_response(
+        ResponseTracking::new(
+            class,
+            &provider.name,
+            &model,
+            "responses",
+            started,
+            model_started,
+            estimated_input_tokens,
+        ),
+        response,
+    )
 }
 
 async fn anthropic_messages(
@@ -1884,6 +2397,7 @@ async fn anthropic_messages_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
+    trace_client_request("anthropic_messages", launcher_token, &body);
     proxy_stats().record_request();
     let started = Instant::now();
     let client_model = body
@@ -1891,7 +2405,7 @@ async fn anthropic_messages_impl(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
-    if state.config.interceptor.enabled {
+    if state.config.interceptor.enabled || state.config.integrated.enabled {
         let local_chat_request = anthropic_message_to_chat_request(&body);
         if let Some(response) = maybe_intercept(
             &state,
@@ -1913,31 +2427,71 @@ async fn anthropic_messages_impl(
         Ok(provider) => provider,
         Err(error_response) => return *error_response,
     };
+    let native_anthropic = provider.config.kind == ProviderKind::Anthropic
+        || (provider.config.kind == ProviderKind::Copilot
+            && is_claude_model(rewritten.get("model").and_then(Value::as_str)));
+    let passthrough = state.config.anthropic_mode == AnthropicMode::Passthrough || native_anthropic;
+    if passthrough {
+        apply_provider_reasoning_effort(
+            &provider,
+            ReasoningWire::AnthropicMessages,
+            &mut rewritten,
+        );
+    }
+    let provider_headers = provider_request_headers(&state, &headers, &provider);
     let class = route_class_for_base_url(&provider.config.base_url);
-    log_request_value(class, &rewritten);
-    if state.config.anthropic_mode == AnthropicMode::Passthrough {
-        let upstream_path = if state.launcher_kind == Some(LauncherKind::Copilot) {
+    let model = request_model(&rewritten).to_string();
+    let estimated_input_tokens = estimate_tokens(&rewritten) as u64;
+    log_request_value(class, &provider.name, &rewritten);
+    if passthrough {
+        let upstream_path = if provider.config.kind == ProviderKind::Copilot {
             "v1/messages"
         } else {
             "messages"
         };
-        let response = proxy_json(&provider, &headers, upstream_path, &rewritten).await;
-        return track_response(class, started, response);
+        let model_started = Instant::now();
+        let response = proxy_json(&provider, &provider_headers, upstream_path, &rewritten).await;
+        return track_response(
+            ResponseTracking::new(
+                class,
+                &provider.name,
+                &model,
+                "anthropic_messages",
+                started,
+                model_started,
+                estimated_input_tokens,
+            ),
+            response,
+        );
     }
     let mut chat_request = anthropic_message_to_chat_request(&rewritten);
     normalize_chat_completion_request(&mut chat_request, &state.config);
 
+    let model_started = Instant::now();
     let response = if chat_request
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
         ensure_chat_stream_include_usage(&mut chat_request);
-        proxy_anthropic_stream_via_chat(&provider, &headers, &chat_request, client_model).await
+        proxy_anthropic_stream_via_chat(&provider, &provider_headers, &chat_request, client_model)
+            .await
     } else {
-        proxy_anthropic_once_via_chat(&provider, &headers, &chat_request, client_model).await
+        proxy_anthropic_once_via_chat(&provider, &provider_headers, &chat_request, client_model)
+            .await
     };
-    track_response(class, started, response)
+    track_response(
+        ResponseTracking::new(
+            class,
+            &provider.name,
+            &model,
+            "anthropic_messages",
+            started,
+            model_started,
+            estimated_input_tokens,
+        ),
+        response,
+    )
 }
 
 async fn anthropic_count_tokens(Json(body): Json<Value>) -> Response {
@@ -2041,17 +2595,41 @@ async fn codex_json_endpoint_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
-    if state.config.model_routing != ModelRoutingMode::Passthrough {
+    if state.config.model_routing != ModelRoutingMode::Passthrough
+        && state.launcher_mode != Some(LauncherMode::Proxy)
+    {
         return StatusCode::NOT_FOUND.into_response();
     }
-    proxy_json(state.default_provider(), headers, upstream_path, body).await
+    if state.launcher_mode == Some(LauncherMode::Proxy) {
+        let mut rewritten = body.clone();
+        let provider = match rewrite_proxy_request_value(&state, headers, &mut rewritten).await {
+            Ok(provider) => provider,
+            Err(response) => return *response,
+        };
+        let provider_headers = provider_request_headers(&state, headers, &provider);
+        proxy_json(&provider, &provider_headers, upstream_path, &rewritten).await
+    } else {
+        let provider = state.default_provider();
+        let provider_headers = provider_request_headers(&state, headers, provider);
+        proxy_json(provider, &provider_headers, upstream_path, body).await
+    }
 }
 
 async fn refresh_upstream_models(
     provider: &ProviderState,
     incoming_headers: &HeaderMap,
 ) -> Result<Vec<String>> {
-    let meta = UpstreamRequestMeta::new(
+    let body = fetch_upstream_models(provider, incoming_headers)
+        .await
+        .with_context(|| "failed to refresh upstream /models")?;
+    Ok(cache_upstream_models(provider, body, "refresh"))
+}
+
+async fn fetch_upstream_models(
+    provider: &ProviderState,
+    incoming_headers: &HeaderMap,
+) -> std::result::Result<Value, UpstreamFailure> {
+    let first_meta = UpstreamRequestMeta::new(
         &provider.name,
         incoming_headers,
         Method::GET,
@@ -2059,10 +2637,83 @@ async fn refresh_upstream_models(
         UpstreamResponseKind::Json,
         true,
     );
-    let body = upstream_json(provider, incoming_headers, &meta, None)
-        .await
-        .with_context(|| "failed to refresh upstream /models")?;
-    Ok(cache_upstream_models(provider, body, "refresh"))
+    let mut combined = upstream_json(provider, incoming_headers, &first_meta, None).await?;
+    if provider.config.kind != ProviderKind::Anthropic {
+        return Ok(combined);
+    }
+
+    const MAX_MODEL_PAGES: usize = 100;
+    let mut seen_cursors = HashSet::new();
+    for _ in 1..MAX_MODEL_PAGES {
+        if combined.get("has_more").and_then(Value::as_bool) != Some(true) {
+            return Ok(combined);
+        }
+        let Some(cursor) = combined
+            .get("last_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return Err(UpstreamFailure::decode(
+                &first_meta,
+                StatusCode::OK,
+                "Anthropic models response has_more=true without last_id",
+            ));
+        };
+        if !seen_cursors.insert(cursor.clone()) {
+            return Err(UpstreamFailure::decode(
+                &first_meta,
+                StatusCode::OK,
+                "Anthropic models pagination repeated a cursor",
+            ));
+        }
+
+        let page_path = anthropic_models_page_path(&cursor);
+        let page_meta = UpstreamRequestMeta::new(
+            &provider.name,
+            incoming_headers,
+            Method::GET,
+            &page_path,
+            UpstreamResponseKind::Json,
+            true,
+        );
+        let page = upstream_json(provider, incoming_headers, &page_meta, None).await?;
+        merge_model_page(&mut combined, page)
+            .map_err(|message| UpstreamFailure::decode(&page_meta, StatusCode::OK, message))?;
+    }
+
+    Err(UpstreamFailure::decode(
+        &first_meta,
+        StatusCode::OK,
+        format!("Anthropic models pagination exceeded {MAX_MODEL_PAGES} pages"),
+    ))
+}
+
+fn anthropic_models_page_path(cursor: &str) -> String {
+    let mut url = Url::parse("http://localhost/models").expect("static models URL is valid");
+    url.query_pairs_mut().append_pair("after_id", cursor);
+    format!("models?{}", url.query().unwrap_or_default())
+}
+
+fn merge_model_page(combined: &mut Value, page: Value) -> std::result::Result<(), &'static str> {
+    let page_data = page
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or("Anthropic models page is missing a data array")?
+        .clone();
+    let combined_object = combined
+        .as_object_mut()
+        .ok_or("Anthropic models response is not an object")?;
+    combined_object
+        .get_mut("data")
+        .and_then(Value::as_array_mut)
+        .ok_or("Anthropic models response is missing a data array")?
+        .extend(page_data);
+    for key in ["first_id", "last_id", "has_more"] {
+        if let Some(value) = page.get(key) {
+            combined_object.insert(key.to_string(), value.clone());
+        }
+    }
+    Ok(())
 }
 
 fn cache_upstream_models(provider: &ProviderState, upstream: Value, source: &str) -> Vec<String> {
@@ -2148,11 +2799,16 @@ async fn rewrite_proxy_request_value(
         .get("model")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let default_model = if request_needs_default_model(value, &state.config) {
-        Some(ensure_default_upstream_model(&provider, incoming_headers).await?)
-    } else {
-        None
-    };
+    let provider_headers = provider_request_headers(state, incoming_headers, &provider);
+    let preserve_explicit_model = requested_model
+        .as_deref()
+        .is_some_and(|model| preserve_integrated_model(&state.config, model));
+    let default_model =
+        if !preserve_explicit_model && request_needs_default_model(value, &state.config) {
+            Some(ensure_default_upstream_model(&provider, &provider_headers).await?)
+        } else {
+            None
+        };
 
     rewrite_request_value(value, &state.config, &provider, default_model.as_deref());
     if let Some(requested) = requested_model
@@ -2160,12 +2816,21 @@ async fn rewrite_proxy_request_value(
     {
         let kind = if state.config.model_aliases.contains_key(requested.as_str()) {
             RemapKind::Alias
+        } else if namespaced_model_target(&state.config, &requested).is_some() {
+            RemapKind::Namespace
         } else {
             RemapKind::Auto
         };
         proxy_stats().record_remap(kind);
     }
     Ok(provider)
+}
+
+fn preserve_integrated_model(config: &Config, model: &str) -> bool {
+    config.integrated.enabled
+        && model != INTEGRATED_AUTO_MODEL
+        && !config.model_aliases.contains_key(model)
+        && namespaced_model_target(config, model).is_none()
 }
 
 fn route_request(state: &AppState, value: &Value) -> ResponseResult<ProviderState> {
@@ -2200,10 +2865,12 @@ fn route_request(state: &AppState, value: &Value) -> ResponseResult<ProviderStat
 fn collect_routed_providers(value: &Value, config: &Config, providers: &mut HashSet<String>) {
     match value {
         Value::Object(map) => {
-            if let Some(model) = map.get("model").and_then(Value::as_str)
-                && let Some(route) = config.model_aliases.get(model)
-            {
-                providers.insert(route.provider(&config.default_provider).to_string());
+            if let Some(model) = map.get("model").and_then(Value::as_str) {
+                if let Some(route) = config.model_aliases.get(model) {
+                    providers.insert(route.provider(&config.default_provider).to_string());
+                } else if let Some((provider, _)) = namespaced_model_target(config, model) {
+                    providers.insert(provider.to_string());
+                }
             }
             for child in map.values() {
                 collect_routed_providers(child, config, providers);
@@ -2216,6 +2883,15 @@ fn collect_routed_providers(value: &Value, config: &Config, providers: &mut Hash
         }
         _ => {}
     }
+}
+
+fn namespaced_model_target<'a>(config: &Config, model: &'a str) -> Option<(&'a str, &'a str)> {
+    let (provider, target) = model.split_once('/')?;
+    if provider.is_empty() || target.is_empty() {
+        return None;
+    }
+    (provider == config.default_provider || config.providers.contains_key(provider))
+        .then_some((provider, target))
 }
 
 fn unknown_provider_response(provider: &str) -> Response {
@@ -2281,15 +2957,30 @@ async fn send_upstream_once(
         idempotent = meta.idempotent,
         "sending upstream request"
     );
+    if let Some(body) = body {
+        trace!(
+            provider = %meta.provider,
+            request_id = %meta.request_id,
+            method = %meta.method,
+            upstream_path = %meta.path,
+            response_kind = meta.response_kind.as_str(),
+            body = %body,
+            "upstream request body"
+        );
+    }
+
+    let mut header_map = upstream_headers(&provider.config, incoming_headers, &meta.request_id);
+    if let Some(oauth_provider) = provider.config.auth.oauth_provider() {
+        match oauth::access_token(oauth_provider).await {
+            Ok(token) => apply_oauth_headers(&mut header_map, &token, &meta.request_id),
+            Err(error) => return Err(UpstreamFailure::oauth(meta, error.to_string())),
+        }
+    }
 
     let mut request = provider
         .client
         .request(meta.method.clone(), provider.upstream_url(&meta.path))
-        .headers(upstream_headers(
-            &provider.config,
-            incoming_headers,
-            &meta.request_id,
-        ));
+        .headers(header_map);
     if let Some(body) = body {
         request = request.json(body);
     }
@@ -2332,7 +3023,7 @@ async fn upstream_json(
             Ok(value) => return Ok(value),
             Err(error) if meta.idempotent && attempt <= MAX_RETRIES && error.is_retryable() => {
                 let delay = retry_delay(attempt);
-                warn!(
+                error!(
                     provider = %error.provider,
                     request_id = %error.request_id,
                     method = %error.method,
@@ -2374,7 +3065,7 @@ async fn upstream_json_once(
             .bytes()
             .await
             .map_err(|error| UpstreamFailure::from_reqwest(meta, error))?;
-        warn!(
+        error!(
             provider = %meta.provider,
             request_id = %meta.request_id,
             method = %meta.method,
@@ -2384,6 +3075,7 @@ async fn upstream_json_once(
             content_type = content_type.as_deref().unwrap_or(""),
             body_bytes = bytes.len(),
             body_prefix = %body_prefix(&bytes),
+            body = %String::from_utf8_lossy(&bytes),
             "upstream returned non-success status"
         );
         return Err(UpstreamFailure::status_with_body(meta, status, &bytes));
@@ -2393,11 +3085,22 @@ async fn upstream_json_once(
         .bytes()
         .await
         .map_err(|error| UpstreamFailure::from_reqwest(meta, error))?;
+    trace!(
+        provider = %meta.provider,
+        request_id = %meta.request_id,
+        method = %meta.method,
+        upstream_path = %meta.path,
+        upstream_status = status.as_u16(),
+        content_type = content_type.as_deref().unwrap_or(""),
+        body_bytes = bytes.len(),
+        body = %String::from_utf8_lossy(&bytes),
+        "upstream response body"
+    );
     match parse_upstream_json(&bytes) {
         Ok(body) => Ok(body),
         Err(error) => {
             let prefix = body_prefix(&bytes);
-            warn!(
+            error!(
                 provider = %meta.provider,
                 request_id = %meta.request_id,
                 method = %meta.method,
@@ -2407,6 +3110,7 @@ async fn upstream_json_once(
                 content_type = content_type.as_deref().unwrap_or(""),
                 body_bytes = bytes.len(),
                 body_prefix = %prefix,
+                body = %String::from_utf8_lossy(&bytes),
                 error = %error,
                 "failed to decode upstream JSON response"
             );
@@ -2423,7 +3127,7 @@ fn retry_delay(attempt: usize) -> Duration {
 }
 
 fn log_upstream_failure(error: &UpstreamFailure, phase: &str) {
-    warn!(
+    error!(
         provider = %error.provider,
         request_id = %error.request_id,
         method = %error.method,
@@ -2438,7 +3142,7 @@ fn log_upstream_failure(error: &UpstreamFailure, phase: &str) {
 }
 
 fn log_upstream_status(meta: &UpstreamRequestMeta, status: StatusCode, phase: &str) {
-    warn!(
+    error!(
         provider = %meta.provider,
         request_id = %meta.request_id,
         method = %meta.method,
@@ -2468,6 +3172,307 @@ async fn proxy_get(
         .map_err(|error| upstream_error_response(&error))
 }
 
+struct PreparedChatRequest {
+    path: &'static str,
+    body: Value,
+    anthropic_wire: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ReasoningWire {
+    ChatCompletions,
+    Responses,
+    AnthropicMessages,
+}
+
+fn apply_provider_reasoning_effort(
+    provider: &ProviderState,
+    wire: ReasoningWire,
+    body: &mut Value,
+) {
+    let Some(effort) = provider.config.reasoning_effort else {
+        return;
+    };
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let effort = Value::String(effort.as_str().to_string());
+    match wire {
+        ReasoningWire::ChatCompletions => {
+            object.insert("reasoning_effort".to_string(), effort);
+        }
+        ReasoningWire::Responses => {
+            let reasoning = object
+                .entry("reasoning")
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !reasoning.is_object() {
+                *reasoning = Value::Object(Map::new());
+            }
+            reasoning
+                .as_object_mut()
+                .expect("reasoning was normalized to an object")
+                .insert("effort".to_string(), effort);
+        }
+        ReasoningWire::AnthropicMessages => {
+            let output_config = object
+                .entry("output_config")
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !output_config.is_object() {
+                *output_config = Value::Object(Map::new());
+            }
+            output_config
+                .as_object_mut()
+                .expect("output_config was normalized to an object")
+                .insert("effort".to_string(), effort);
+        }
+    }
+}
+
+fn prepare_provider_chat_request(
+    provider: &ProviderState,
+    chat_request: &Value,
+) -> PreparedChatRequest {
+    let mut chat_request = chat_request.clone();
+    if provider.config.kind == ProviderKind::Copilot {
+        sanitize_copilot_chat_request(&mut chat_request);
+    }
+    let anthropic_wire = provider.config.kind == ProviderKind::Anthropic
+        || (provider.config.kind == ProviderKind::Copilot
+            && is_claude_model(chat_request.get("model").and_then(Value::as_str)));
+    if anthropic_wire {
+        let mut body = chat_to_anthropic_request(&chat_request);
+        apply_provider_reasoning_effort(provider, ReasoningWire::AnthropicMessages, &mut body);
+        if provider.config.auth == ProviderAuth::ClaudeOauth {
+            backend_adapters::ensure_claude_code_identity(&mut body);
+        }
+        PreparedChatRequest {
+            path: if provider.config.kind == ProviderKind::Copilot {
+                "v1/messages"
+            } else {
+                "messages"
+            },
+            body,
+            anthropic_wire: true,
+        }
+    } else {
+        apply_provider_reasoning_effort(
+            provider,
+            ReasoningWire::ChatCompletions,
+            &mut chat_request,
+        );
+        PreparedChatRequest {
+            path: "chat/completions",
+            body: chat_request,
+            anthropic_wire: false,
+        }
+    }
+}
+
+async fn upstream_chat_json(
+    provider: &ProviderState,
+    incoming_headers: &HeaderMap,
+    chat_request: &Value,
+) -> std::result::Result<Value, UpstreamFailure> {
+    if provider.config.auth == ProviderAuth::CodexOauth {
+        return codex_chat_completion(provider, incoming_headers, chat_request).await;
+    }
+    let prepared = prepare_provider_chat_request(provider, chat_request);
+    let meta = UpstreamRequestMeta::new(
+        &provider.name,
+        incoming_headers,
+        Method::POST,
+        prepared.path,
+        UpstreamResponseKind::Json,
+        false,
+    );
+    let response = upstream_json(provider, incoming_headers, &meta, Some(&prepared.body)).await?;
+    if prepared.anthropic_wire {
+        Ok(anthropic_to_chat_response(
+            response,
+            chat_request.get("model").and_then(Value::as_str),
+            unix_timestamp(),
+        ))
+    } else {
+        Ok(response)
+    }
+}
+
+async fn upstream_chat_stream(
+    provider: &ProviderState,
+    incoming_headers: &HeaderMap,
+    chat_request: &Value,
+) -> std::result::Result<(reqwest::Response, UpstreamRequestMeta), UpstreamFailure> {
+    if provider.config.auth == ProviderAuth::CodexOauth {
+        // The Codex backend is stream-only; fold its Responses stream into one
+        // chat completion, then re-emit it as a chat SSE stream so the existing
+        // client-protocol converters relay it unchanged.
+        let meta = UpstreamRequestMeta::new(
+            &provider.name,
+            incoming_headers,
+            Method::POST,
+            "responses",
+            UpstreamResponseKind::Stream,
+            false,
+        );
+        let completion = codex_chat_completion(provider, incoming_headers, chat_request).await?;
+        return Ok((chat_completion_as_chat_stream(&completion), meta));
+    }
+    let prepared = prepare_provider_chat_request(provider, chat_request);
+    let meta = UpstreamRequestMeta::new(
+        &provider.name,
+        incoming_headers,
+        Method::POST,
+        prepared.path,
+        UpstreamResponseKind::Stream,
+        false,
+    );
+    let response =
+        send_upstream_once(provider, incoming_headers, &meta, Some(&prepared.body)).await?;
+    let response = if response.status().is_success() && prepared.anthropic_wire {
+        anthropic_response_as_chat(
+            response,
+            chat_request
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            Some(meta.clone()),
+        )
+    } else {
+        response
+    };
+    Ok((response, meta))
+}
+
+/// Send an internal chat request to the Codex Responses backend and fold the
+/// stream-only reply into a single Chat Completions object.
+async fn codex_chat_completion(
+    provider: &ProviderState,
+    incoming_headers: &HeaderMap,
+    chat_request: &Value,
+) -> std::result::Result<Value, UpstreamFailure> {
+    let mut responses_request = chat_to_codex_responses_request(chat_request);
+    apply_provider_reasoning_effort(provider, ReasoningWire::Responses, &mut responses_request);
+    let meta = UpstreamRequestMeta::new(
+        &provider.name,
+        incoming_headers,
+        Method::POST,
+        "responses",
+        UpstreamResponseKind::Stream,
+        false,
+    );
+    let response =
+        send_upstream_once(provider, incoming_headers, &meta, Some(&responses_request)).await?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| UpstreamFailure::from_reqwest(&meta, error))?;
+    if !status.is_success() {
+        return Err(UpstreamFailure::status_with_body(&meta, status, &bytes));
+    }
+    let model = chat_request
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("codex");
+    Ok(codex_sse_to_chat_completion(
+        &String::from_utf8_lossy(&bytes),
+        model,
+    ))
+}
+
+/// Wrap a Chat Completions object as a minimal chat-completions SSE stream
+/// (one content chunk, tool-call chunks, then `[DONE]`) inside a synthetic
+/// `reqwest::Response`, so streaming clients receive it through the normal path.
+fn chat_completion_as_chat_stream(completion: &Value) -> reqwest::Response {
+    let model = completion
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("codex");
+    let id = completion
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("chatcmpl-codex");
+    let message = first_chat_choice_message(completion);
+    let content = message
+        .and_then(|message| message.get("content"))
+        .map(text_from_value)
+        .unwrap_or_default();
+    let tool_calls = message
+        .and_then(|message| message.get("tool_calls"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let finish_reason = completion
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("stop");
+    let usage = completion.get("usage").cloned();
+
+    let base = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": model,
+    });
+    let mut body = String::new();
+    let mut push = |delta: Value, finish: Option<&str>| {
+        let mut chunk = base.clone();
+        chunk["choices"] = json!([{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish,
+        }]);
+        body.push_str("data: ");
+        body.push_str(&chunk.to_string());
+        body.push_str("\n\n");
+    };
+    push(json!({ "role": "assistant", "content": content }), None);
+    if let Some(tool_calls) = tool_calls.as_array() {
+        push(json!({ "tool_calls": tool_calls }), None);
+    }
+    // Final chunk carries the finish reason and (as an extra chunk) usage.
+    push(json!({}), Some(finish_reason));
+    if let Some(usage) = usage {
+        let mut chunk = base.clone();
+        chunk["choices"] = json!([]);
+        chunk["usage"] = usage;
+        body.push_str("data: ");
+        body.push_str(&chunk.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+
+    let http_response = axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(reqwest::Body::from(body))
+        .expect("synthetic chat stream response is valid");
+    reqwest::Response::from(http_response)
+}
+
+async fn proxy_chat(
+    provider: &ProviderState,
+    incoming_headers: &HeaderMap,
+    chat_request: &Value,
+) -> Response {
+    if !request_is_streaming(chat_request) {
+        return match upstream_chat_json(provider, incoming_headers, chat_request).await {
+            Ok(response) => Json(response).into_response(),
+            Err(error) => upstream_error_response(&error),
+        };
+    }
+
+    match upstream_chat_stream(provider, incoming_headers, chat_request).await {
+        Ok((response, meta)) => relay_response(&meta, response).await,
+        Err(error) => {
+            log_upstream_failure(&error, "send");
+            upstream_error_response(&error)
+        }
+    }
+}
+
 async fn proxy_json(
     provider: &ProviderState,
     incoming_headers: &HeaderMap,
@@ -2488,12 +3493,7 @@ async fn proxy_json(
         false,
     );
     match send_upstream_once(provider, incoming_headers, &meta, Some(body)).await {
-        Ok(response) => {
-            if !response.status().is_success() {
-                log_upstream_status(&meta, response.status(), "relay");
-            }
-            relay_response(&meta, response).await
-        }
+        Ok(response) => relay_response(&meta, response).await,
         Err(error) => {
             log_upstream_failure(&error, "send");
             upstream_error_response(&error)
@@ -2518,12 +3518,7 @@ async fn proxy_relay(
         idempotent,
     );
     match send_upstream_once(provider, incoming_headers, &meta, body).await {
-        Ok(response) => {
-            if !response.status().is_success() {
-                log_upstream_status(&meta, response.status(), "relay");
-            }
-            relay_response(&meta, response).await
-        }
+        Ok(response) => relay_response(&meta, response).await,
         Err(error) => {
             log_upstream_failure(&error, "send");
             upstream_error_response(&error)
@@ -2538,21 +3533,20 @@ fn request_is_streaming(value: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn request_model(value: &Value) -> &str {
+    value
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+}
+
 async fn proxy_responses_once_via_chat(
     provider: &ProviderState,
     incoming_headers: &HeaderMap,
     chat_request: &Value,
     client_model: Option<String>,
 ) -> Response {
-    let meta = UpstreamRequestMeta::new(
-        &provider.name,
-        incoming_headers,
-        Method::POST,
-        "chat/completions",
-        UpstreamResponseKind::Json,
-        false,
-    );
-    match upstream_json(provider, incoming_headers, &meta, Some(chat_request)).await {
+    match upstream_chat_json(provider, incoming_headers, chat_request).await {
         Ok(upstream_body) => {
             Json(chat_completion_to_response(upstream_body, client_model)).into_response()
         }
@@ -2566,19 +3560,11 @@ async fn proxy_responses_stream_via_chat(
     chat_request: &Value,
     client_model: Option<String>,
 ) -> Response {
-    let meta = UpstreamRequestMeta::new(
-        &provider.name,
-        incoming_headers,
-        Method::POST,
-        "chat/completions",
-        UpstreamResponseKind::Stream,
-        false,
-    );
-    match send_upstream_once(provider, incoming_headers, &meta, Some(chat_request)).await {
-        Ok(response) if response.status().is_success() => {
+    match upstream_chat_stream(provider, incoming_headers, chat_request).await {
+        Ok((response, meta)) if response.status().is_success() => {
             stream_chat_as_responses(response, client_model, Some(meta)).into_response()
         }
-        Ok(response) => relay_response(&meta, response).await,
+        Ok((response, meta)) => relay_response(&meta, response).await,
         Err(error) => {
             log_upstream_failure(&error, "send");
             upstream_error_response(&error)
@@ -2592,15 +3578,7 @@ async fn proxy_anthropic_once_via_chat(
     chat_request: &Value,
     client_model: Option<String>,
 ) -> Response {
-    let meta = UpstreamRequestMeta::new(
-        &provider.name,
-        incoming_headers,
-        Method::POST,
-        "chat/completions",
-        UpstreamResponseKind::Json,
-        false,
-    );
-    match upstream_json(provider, incoming_headers, &meta, Some(chat_request)).await {
+    match upstream_chat_json(provider, incoming_headers, chat_request).await {
         Ok(upstream_body) => Json(chat_completion_to_anthropic_message(
             upstream_body,
             client_model,
@@ -2616,24 +3594,82 @@ async fn proxy_anthropic_stream_via_chat(
     chat_request: &Value,
     client_model: Option<String>,
 ) -> Response {
-    let meta = UpstreamRequestMeta::new(
-        &provider.name,
-        incoming_headers,
-        Method::POST,
-        "chat/completions",
-        UpstreamResponseKind::Stream,
-        false,
-    );
-    match send_upstream_once(provider, incoming_headers, &meta, Some(chat_request)).await {
-        Ok(response) if response.status().is_success() => {
+    match upstream_chat_stream(provider, incoming_headers, chat_request).await {
+        Ok((response, meta)) if response.status().is_success() => {
             stream_chat_as_anthropic(response, client_model, Some(meta)).into_response()
         }
-        Ok(response) => relay_response(&meta, response).await,
+        Ok((response, meta)) => relay_response(&meta, response).await,
         Err(error) => {
             log_upstream_failure(&error, "send");
             upstream_error_response(&error)
         }
     }
+}
+
+pub(crate) async fn proxy_integrated_chat(
+    provider: &ProviderState,
+    mut chat_request: Value,
+    target: &interceptor::IntegratedTarget,
+    protocol: InterceptorProtocol,
+    client_model: Option<String>,
+    client_streaming: bool,
+    config: &Config,
+) -> Response {
+    let provider_override = target.reasoning_effort.map(|effort| {
+        let mut provider_config = (*provider.config).clone();
+        provider_config.reasoning_effort = Some(effort);
+        ProviderState {
+            config: Arc::new(provider_config),
+            ..provider.clone()
+        }
+    });
+    let provider = provider_override.as_ref().unwrap_or(provider);
+    let target_model = target.model.as_str();
+    let Some(object) = chat_request.as_object_mut() else {
+        return launcher_error_response("integrated redirect request is not a JSON object");
+    };
+    object.insert("model".to_string(), Value::String(target_model.to_string()));
+    object.insert("stream".to_string(), Value::Bool(client_streaming));
+    sanitize_cross_provider_chat_request(&mut chat_request);
+    normalize_chat_completion_request(&mut chat_request, config);
+
+    // Cross-provider redirects intentionally have no caller headers. Provider
+    // credentials and identity headers come only from its configured state.
+    let headers = HeaderMap::new();
+    let class = route_class_for_base_url(&provider.config.base_url);
+    let started = Instant::now();
+    let estimated_input_tokens = estimate_tokens(&chat_request) as u64;
+    log_request_value(class, &provider.name, &chat_request);
+    let model_started = Instant::now();
+    let response = match protocol {
+        InterceptorProtocol::ChatCompletions => proxy_chat(provider, &headers, &chat_request).await,
+        InterceptorProtocol::Responses if client_streaming => {
+            ensure_chat_stream_include_usage(&mut chat_request);
+            proxy_responses_stream_via_chat(provider, &headers, &chat_request, client_model).await
+        }
+        InterceptorProtocol::Responses => {
+            proxy_responses_once_via_chat(provider, &headers, &chat_request, client_model).await
+        }
+        InterceptorProtocol::AnthropicMessages if client_streaming => {
+            ensure_chat_stream_include_usage(&mut chat_request);
+            proxy_anthropic_stream_via_chat(provider, &headers, &chat_request, client_model).await
+        }
+        InterceptorProtocol::AnthropicMessages => {
+            proxy_anthropic_once_via_chat(provider, &headers, &chat_request, client_model).await
+        }
+    };
+    track_response(
+        ResponseTracking::new(
+            class,
+            &provider.name,
+            target_model,
+            protocol.as_str(),
+            started,
+            model_started,
+            estimated_input_tokens,
+        ),
+        response,
+    )
 }
 
 impl AppState {
@@ -2644,13 +3680,56 @@ impl AppState {
     }
 
     fn with_launcher_session(&self, session: &LauncherSession) -> Result<Self> {
-        validate_launcher_runtime(&self.config)?;
+        validate_launcher_runtime(&self.config, session.mode())?;
 
+        match session.mode() {
+            LauncherMode::Proxy => self.with_local_proxy_session(session),
+            LauncherMode::Intercept => self.with_native_interceptor_session(session),
+            LauncherMode::Integrated => self.with_integrated_session(session),
+        }
+    }
+
+    fn with_local_proxy_session(&self, session: &LauncherSession) -> Result<Self> {
+        let mut config = (*self.config).clone();
+        config.providers.clear();
+        config.model_aliases.clear();
+        config.model_routing = ModelRoutingMode::Remap;
+        config.interceptor.enabled = false;
+        config.integrated.enabled = false;
+        config.responses.mode = ResponsesMode::ChatCompletions;
+        config.anthropic_mode = AnthropicMode::ChatCompletions;
+
+        let default_provider = self.default_provider().clone();
+        let providers = HashMap::from([(config.default_provider.clone(), default_provider)]);
+        Ok(Self {
+            config: Arc::new(config),
+            providers: Arc::new(providers),
+            launcher_kind: None,
+            launcher_mode: Some(session.mode()),
+            forward_caller_credentials: false,
+        })
+    }
+
+    fn with_integrated_session(&self, session: &LauncherSession) -> Result<Self> {
+        let mut config = (*self.config).clone();
+        config.interceptor.enabled = false;
+        config.integrated.enabled = true;
+        Ok(Self {
+            config: Arc::new(config),
+            providers: self.providers.clone(),
+            launcher_kind: None,
+            launcher_mode: Some(session.mode()),
+            forward_caller_credentials: false,
+        })
+    }
+
+    fn with_native_interceptor_session(&self, session: &LauncherSession) -> Result<Self> {
         let mut config = (*self.config).clone();
         config.default_provider = LAUNCHER_EXTERNAL_PROVIDER.to_string();
         config.model_aliases.clear();
         config.model_routing = ModelRoutingMode::Passthrough;
         config.interceptor.enabled = true;
+        config.integrated.enabled = false;
         match session.kind() {
             LauncherKind::Codex => {
                 config.responses.mode = ResponsesMode::Passthrough;
@@ -2673,6 +3752,12 @@ impl AppState {
         external_config.api_key = None;
         external_config.api_key_env = None;
         external_config.headers.clear();
+        external_config.reasoning_effort = None;
+        external_config.kind = match session.kind() {
+            LauncherKind::Codex => ProviderKind::OpenAi,
+            LauncherKind::Claude => ProviderKind::Anthropic,
+            LauncherKind::Copilot => ProviderKind::Copilot,
+        };
 
         let mut providers = self.providers.as_ref().clone();
         providers.insert(
@@ -2690,6 +3775,8 @@ impl AppState {
             config: Arc::new(config),
             providers: Arc::new(providers),
             launcher_kind: Some(session.kind()),
+            launcher_mode: Some(session.mode()),
+            forward_caller_credentials: true,
         })
     }
 }
@@ -2711,18 +3798,43 @@ fn upstream_headers(
 ) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
+    // Borrowed-OAuth providers own their credentials; the bearer token is
+    // attached later (asynchronously) in send_upstream_once. Here we only make
+    // sure caller credentials are not forwarded and set the static beta header.
+    let oauth_mode = config.auth != ProviderAuth::None;
+    let uses_proxy_credentials = config.api_key.is_some() || oauth_mode;
     if let Some(api_key) = &config.api_key {
-        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {api_key}")) {
-            headers.insert(AUTHORIZATION, value);
+        if let Ok(value) = HeaderValue::from_str(api_key) {
+            match config.kind {
+                ProviderKind::Anthropic => {
+                    headers.insert(HeaderName::from_static("x-api-key"), value);
+                }
+                _ => {
+                    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {api_key}")) {
+                        headers.insert(AUTHORIZATION, value);
+                    }
+                }
+            }
         }
-    } else if let Some(value) = incoming_headers.get(AUTHORIZATION) {
+    } else if !oauth_mode && let Some(value) = incoming_headers.get(AUTHORIZATION) {
         headers.insert(AUTHORIZATION, value.clone());
     }
 
-    for (name, value) in incoming_headers {
-        if name != AUTHORIZATION && should_forward_incoming_header(name) {
-            headers.insert(name.clone(), value.clone());
+    if !uses_proxy_credentials {
+        for (name, value) in incoming_headers {
+            if name != AUTHORIZATION && should_forward_incoming_header(name) {
+                headers.insert(name.clone(), value.clone());
+            }
         }
+    }
+
+    if config.auth == ProviderAuth::ClaudeOauth {
+        // Anthropic accepts subscription OAuth only when the request presents
+        // as Claude Code: the oauth beta flag plus the Claude Code beta.
+        headers.insert(
+            HeaderName::from_static("anthropic-beta"),
+            HeaderValue::from_static("oauth-2025-04-20,claude-code-20250219"),
+        );
     }
 
     for (name, value) in &config.headers {
@@ -2734,11 +3846,52 @@ fn upstream_headers(
         }
     }
 
+    if matches!(config.kind, ProviderKind::Anthropic | ProviderKind::Copilot) {
+        headers
+            .entry(HeaderName::from_static("anthropic-version"))
+            .or_insert(HeaderValue::from_static("2023-06-01"));
+    }
+    if config.kind == ProviderKind::Copilot {
+        for (name, value) in [
+            ("copilot-integration-id", "vscode-chat"),
+            ("editor-version", "vscode/1.107.1"),
+            ("editor-plugin-version", "copilot-chat/0.26.7"),
+            ("openai-intent", "conversation-panel"),
+            ("x-github-api-version", "2022-11-28"),
+        ] {
+            headers
+                .entry(HeaderName::from_static(name))
+                .or_insert(HeaderValue::from_static(value));
+        }
+    }
+
     if let Ok(value) = HeaderValue::from_str(request_id) {
         headers.insert(HeaderName::from_static("x-request-id"), value);
     }
 
     headers
+}
+
+/// Attach a borrowed-OAuth access token and its identity headers. The bearer
+/// token replaces any static credential; Codex additionally needs the account
+/// binding and CLI originator so the ChatGPT backend accepts the request.
+fn apply_oauth_headers(headers: &mut HeaderMap, token: &oauth::OAuthToken, request_id: &str) {
+    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", token.access_token)) {
+        headers.insert(AUTHORIZATION, value);
+    }
+    headers.remove(HeaderName::from_static("x-api-key"));
+    if let Some(account_id) = &token.account_id {
+        if let Ok(value) = HeaderValue::from_str(account_id) {
+            headers.insert(HeaderName::from_static("chatgpt-account-id"), value);
+        }
+        headers.insert(
+            HeaderName::from_static("originator"),
+            HeaderValue::from_static("codex_cli_rs"),
+        );
+        if let Ok(value) = HeaderValue::from_str(request_id) {
+            headers.insert(HeaderName::from_static("session_id"), value);
+        }
+    }
 }
 
 fn should_forward_incoming_header(name: &HeaderName) -> bool {
@@ -2767,21 +3920,32 @@ fn should_forward_incoming_header(name: &HeaderName) -> bool {
             | "x-interaction-id"
             | "x-interaction-type"
             | "x-parent-agent-id"
-    ) || name.starts_with("anthropic-")
-        || name.starts_with("copilot-")
-        || name.starts_with("openai-")
-        || name.starts_with("x-anthropic-")
-        || name.starts_with("x-codex-")
-        || name.starts_with("x-copilot-")
-        || name.starts_with("x-github-")
-        || name.starts_with("x-oai-")
-        || name.starts_with("x-openai-")
-        || name.starts_with("x-responsesapi-")
+    ) || is_provider_metadata_header(name)
         || name.starts_with("x-stainless-")
+}
+
+fn is_provider_metadata_header(name: &str) -> bool {
+    [
+        "anthropic-",
+        "copilot-",
+        "openai-",
+        "x-anthropic-",
+        "x-codex-",
+        "x-copilot-",
+        "x-github-",
+        "x-oai-",
+        "x-openai-",
+        "x-responsesapi-",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 async fn relay_response(meta: &UpstreamRequestMeta, response: reqwest::Response) -> Response {
     let status = response.status();
+    if !status.is_success() {
+        log_upstream_status(meta, status, "relay_headers");
+    }
     let response_headers = response.headers().clone();
     let content_type = response_headers.get(CONTENT_TYPE).cloned();
     let is_sse = content_type
@@ -2789,8 +3953,35 @@ async fn relay_response(meta: &UpstreamRequestMeta, response: reqwest::Response)
         .and_then(|value| value.to_str().ok())
         .is_some_and(is_event_stream_content_type);
     let stream_meta = meta.clone();
+    let mut chunk_index = 0_u64;
     let stream = response.bytes_stream().map(move |chunk| match chunk {
-        Ok(chunk) => Ok(chunk),
+        Ok(chunk) => {
+            chunk_index = chunk_index.saturating_add(1);
+            trace!(
+                provider = %stream_meta.provider,
+                request_id = %stream_meta.request_id,
+                method = %stream_meta.method,
+                upstream_path = %stream_meta.path,
+                upstream_status = status.as_u16(),
+                chunk_index,
+                body_bytes = chunk.len(),
+                body = %String::from_utf8_lossy(&chunk),
+                "relayed upstream response body"
+            );
+            if !status.is_success() {
+                error!(
+                    provider = %stream_meta.provider,
+                    request_id = %stream_meta.request_id,
+                    method = %stream_meta.method,
+                    upstream_path = %stream_meta.path,
+                    upstream_status = status.as_u16(),
+                    chunk_index,
+                    body = %String::from_utf8_lossy(&chunk),
+                    "relayed upstream error response body"
+                );
+            }
+            Ok(chunk)
+        }
         Err(error) => {
             let message = error.to_string();
             let failure = UpstreamFailure::from_reqwest(&stream_meta, error);
@@ -2837,21 +4028,20 @@ fn should_forward_response_header(name: &HeaderName) -> bool {
             | "www-authenticate"
             | "x-reasoning-included"
             | "x-should-retry"
-    ) || name.starts_with("anthropic-")
-        || name.starts_with("copilot-")
-        || name.starts_with("openai-")
-        || name.starts_with("x-anthropic-")
-        || name.starts_with("x-codex-")
-        || name.starts_with("x-copilot-")
-        || name.starts_with("x-github-")
-        || name.starts_with("x-oai-")
-        || name.starts_with("x-openai-")
+    ) || is_provider_metadata_header(name)
         || name.starts_with("x-ratelimit-")
         || name.starts_with("x-request-")
-        || name.starts_with("x-responsesapi-")
 }
 
 fn upstream_error_response(error: &UpstreamFailure) -> Response {
+    stats::error_log().record(
+        &error.provider,
+        &error.path,
+        match error.upstream_status {
+            Some(status) => format!("{} — HTTP {status}", error.message),
+            None => error.message.clone(),
+        },
+    );
     let status = match error.kind {
         UpstreamErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
         UpstreamErrorKind::Status => error
@@ -2901,6 +4091,7 @@ fn request_needs_default_model(value: &Value, config: &Config) -> bool {
         Value::Object(map) => {
             if let Some(Value::String(model)) = map.get("model")
                 && !config.model_aliases.contains_key(model.as_str())
+                && namespaced_model_target(config, model).is_none()
             {
                 return true;
             }
@@ -2929,6 +4120,14 @@ fn rewrite_request_value(
                     .model_aliases
                     .get(requested.as_str())
                     .map(|route| (route.model(), ModelMappingSource::Alias))
+                    .or_else(|| {
+                        namespaced_model_target(config, &requested).and_then(
+                            |(route_provider, target)| {
+                                (route_provider == provider.name)
+                                    .then_some((target, ModelMappingSource::Namespace))
+                            },
+                        )
+                    })
                     .or_else(|| {
                         default_upstream_model.map(|target| (target, ModelMappingSource::Auto))
                     });
@@ -3061,7 +4260,12 @@ fn normalize_chat_request_thinking(request: &mut Value, config: &Config) {
     }
 }
 
-fn append_provider_models(data: &mut Vec<Value>, upstream: Value, provider: &str) {
+fn append_provider_models(
+    data: &mut Vec<Value>,
+    upstream: Value,
+    provider: &str,
+    include_raw: bool,
+) {
     let models = upstream
         .get("data")
         .and_then(Value::as_array)
@@ -3070,19 +4274,41 @@ fn append_provider_models(data: &mut Vec<Value>, upstream: Value, provider: &str
         return;
     };
     for model in models {
-        let mut model = model.clone();
-        if let Some(object) = model.as_object_mut() {
+        let Some(id) = model.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if include_raw {
+            let mut raw_model = model.clone();
+            if let Some(object) = raw_model.as_object_mut() {
+                object.insert(
+                    "proxy_provider".to_string(),
+                    Value::String(provider.to_string()),
+                );
+            }
+            data.push(raw_model);
+        }
+
+        let mut namespaced = model.clone();
+        if let Some(object) = namespaced.as_object_mut() {
+            object.insert("id".to_string(), Value::String(format!("{provider}/{id}")));
+            object.insert("proxy_target".to_string(), Value::String(id.to_string()));
             object.insert(
                 "proxy_provider".to_string(),
                 Value::String(provider.to_string()),
             );
+            object.insert(
+                "proxy_route".to_string(),
+                Value::String("namespaced".to_string()),
+            );
         }
-        data.push(model);
+        data.push(namespaced);
     }
 }
 
 fn rewrite_models_response(mut upstream: Value, config: &Config) -> Value {
-    if !config.models.expose_aliases || config.model_aliases.is_empty() {
+    let expose_aliases = config.models.expose_aliases && !config.model_aliases.is_empty();
+    let expose_integrated = !config.integrated.targets.is_empty();
+    if !expose_aliases && !expose_integrated {
         return upstream;
     }
 
@@ -3105,6 +4331,23 @@ fn rewrite_models_response(mut upstream: Value, config: &Config) -> Value {
         })
         .collect();
 
+    if expose_aliases {
+        append_alias_models(&mut data, config, &existing_ids);
+    }
+    if expose_integrated {
+        append_integrated_models(&mut data, config);
+    }
+
+    if !upstream.is_object() {
+        upstream = json!({ "object": "list" });
+    }
+    let object = upstream.as_object_mut().expect("upstream is object");
+    object.insert("object".to_string(), Value::String("list".to_string()));
+    object.insert("data".to_string(), Value::Array(data));
+    upstream
+}
+
+fn append_alias_models(data: &mut Vec<Value>, config: &Config, existing_ids: &HashSet<String>) {
     for (alias, route) in &config.model_aliases {
         if existing_ids.contains(alias) {
             continue;
@@ -3139,14 +4382,65 @@ fn rewrite_models_response(mut upstream: Value, config: &Config) -> Value {
         }
         data.push(alias_model);
     }
+}
 
-    if !upstream.is_object() {
-        upstream = json!({ "object": "list" });
+/// Advertise the integrated routing sentinel and ensure every configured
+/// target remains selectable through its explicit `provider/model` id.
+fn append_integrated_models(data: &mut Vec<Value>, config: &Config) {
+    let mut listed = data
+        .iter()
+        .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect::<HashSet<_>>();
+    if let Some(model) = data
+        .iter_mut()
+        .find(|model| model.get("id").and_then(Value::as_str) == Some(INTEGRATED_AUTO_MODEL))
+    {
+        if let Some(object) = model.as_object_mut() {
+            object.insert(
+                "proxy_route".to_string(),
+                Value::String("integrated".to_string()),
+            );
+            object.insert(
+                "proxy_target".to_string(),
+                Value::String("dynamic provider/model routing".to_string()),
+            );
+        }
+    } else {
+        data.push(integrated_auto_model());
     }
-    let object = upstream.as_object_mut().expect("upstream is object");
-    object.insert("object".to_string(), Value::String("list".to_string()));
-    object.insert("data".to_string(), Value::Array(data));
-    upstream
+
+    for target in config.integrated.targets.values() {
+        if target.provider != config.default_provider
+            && !config.providers.contains_key(&target.provider)
+        {
+            continue;
+        }
+        let namespaced = format!("{}/{}", target.provider, target.model);
+        if listed.insert(namespaced.clone()) {
+            data.push(json!({
+                "id": namespaced,
+                "object": "model",
+                "created": 0,
+                "owned_by": "llmproxy",
+                "proxy_provider": target.provider,
+                "proxy_target": target.model,
+                "proxy_route": "namespaced",
+            }));
+        }
+    }
+}
+
+fn integrated_auto_model() -> Value {
+    json!({
+        "id": INTEGRATED_AUTO_MODEL,
+        "object": "model",
+        "type": "model",
+        "display_name": INTEGRATED_AUTO_MODEL,
+        "created": 0,
+        "owned_by": "llmproxy",
+        "proxy_route": "integrated",
+        "proxy_target": "dynamic provider/model routing",
+    })
 }
 
 fn model_object(model: &str, proxy_target: Option<&str>, provider: Option<&str>) -> Value {
@@ -3220,9 +4514,7 @@ fn anthropic_message_to_chat_request(anthropic_request: &Value) -> Value {
 
     if let Some(Value::Array(source_messages)) = source.get("messages") {
         for message in source_messages {
-            if let Some(converted) = anthropic_message_item_to_chat(message) {
-                messages.push(converted);
-            }
+            append_anthropic_message_to_chat(message, &mut messages);
         }
     }
 
@@ -3270,21 +4562,53 @@ fn anthropic_tool_choice_to_openai(tool_choice: &Value) -> Option<Value> {
     }
 }
 
-fn anthropic_message_item_to_chat(message: &Value) -> Option<Value> {
-    let object = message.as_object()?;
+fn append_anthropic_message_to_chat(message: &Value, messages: &mut Vec<Value>) {
+    let Some(object) = message.as_object() else {
+        return;
+    };
     let role = object
         .get("role")
         .and_then(Value::as_str)
         .unwrap_or("user")
         .to_string();
-    let content = object
-        .get("content")
-        .map(anthropic_content_to_text)
-        .unwrap_or_default();
+    let source_content = object.get("content").unwrap_or(&Value::Null);
+
+    if role == "user"
+        && let Some(parts) = source_content.as_array()
+        && parts
+            .iter()
+            .any(|part| part.get("type").and_then(Value::as_str) == Some("tool_result"))
+    {
+        let mut pending = Vec::new();
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("tool_result") {
+                push_chat_content_message(messages, "user", &mut pending);
+                let call_id = part
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let content = part
+                    .get("content")
+                    .map(anthropic_content_to_text)
+                    .unwrap_or_default();
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": content
+                }));
+            } else if let Some(content) = anthropic_content_part_to_chat_part(part) {
+                pending.push(content);
+            }
+        }
+        push_chat_content_message(messages, "user", &mut pending);
+        return;
+    }
+
+    let content = anthropic_content_to_chat_content(source_content);
 
     let mut converted = Map::from_iter([
         ("role".to_string(), Value::String(role.clone())),
-        ("content".to_string(), Value::String(content)),
+        ("content".to_string(), content),
     ]);
 
     if role == "assistant" {
@@ -3297,7 +4621,87 @@ fn anthropic_message_item_to_chat(message: &Value) -> Option<Value> {
         }
     }
 
-    Some(Value::Object(converted))
+    messages.push(Value::Object(converted));
+}
+
+fn anthropic_content_to_chat_content(content: &Value) -> Value {
+    match content {
+        Value::String(text) => Value::String(text.clone()),
+        Value::Array(parts) => chat_content_parts_to_value(
+            parts
+                .iter()
+                .filter_map(anthropic_content_part_to_chat_part)
+                .collect(),
+        ),
+        Value::Object(_) => anthropic_content_part_to_chat_part(content)
+            .map(|part| chat_content_parts_to_value(vec![part]))
+            .unwrap_or_else(|| Value::String(content.to_string())),
+        Value::Null => Value::String(String::new()),
+        other => Value::String(other.to_string()),
+    }
+}
+
+fn anthropic_content_part_to_chat_part(part: &Value) -> Option<Value> {
+    match part {
+        Value::String(text) => Some(json!({ "type": "text", "text": text })),
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("text") => object
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| json!({ "type": "text", "text": text })),
+            Some("image") => anthropic_image_to_chat_part(object),
+            Some("tool_use" | "thinking" | "redacted_thinking") => None,
+            Some("tool_result") => anthropic_content_part_to_text(part)
+                .map(|text| json!({ "type": "text", "text": text })),
+            _ => object
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| json!({ "type": "text", "text": text })),
+        },
+        Value::Null => None,
+        other => Some(json!({ "type": "text", "text": other.to_string() })),
+    }
+}
+
+fn anthropic_image_to_chat_part(object: &Map<String, Value>) -> Option<Value> {
+    let source = object.get("source")?;
+    let source_type = source.get("type").and_then(Value::as_str);
+    let url = match source_type {
+        Some("base64") => {
+            let media_type = source.get("media_type").and_then(Value::as_str)?;
+            let data = source.get("data").and_then(Value::as_str)?;
+            format!("data:{media_type};base64,{data}")
+        }
+        Some("url") => source.get("url").and_then(Value::as_str)?.to_string(),
+        _ => source.get("url").and_then(Value::as_str)?.to_string(),
+    };
+    Some(json!({ "type": "image_url", "image_url": { "url": url } }))
+}
+
+fn chat_content_parts_to_value(parts: Vec<Value>) -> Value {
+    if parts
+        .iter()
+        .all(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+    {
+        return Value::String(
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    Value::Array(parts)
+}
+
+fn push_chat_content_message(messages: &mut Vec<Value>, role: &str, parts: &mut Vec<Value>) {
+    if parts.is_empty() {
+        return;
+    }
+    messages.push(json!({
+        "role": role,
+        "content": chat_content_parts_to_value(std::mem::take(parts))
+    }));
 }
 
 fn anthropic_content_to_openai_tool_calls(content: &Value) -> Vec<Value> {
@@ -3653,6 +5057,19 @@ fn append_response_input_item(item: &Value, messages: &mut Vec<Value>) {
                         return;
                     }
                 }
+                Some("reasoning" | "compaction" | "compaction_trigger") => return,
+                Some("input_text" | "output_text") => {
+                    if let Some(text) = object.get("text").and_then(Value::as_str) {
+                        messages.push(json!({ "role": "user", "content": text }));
+                        return;
+                    }
+                }
+                Some("input_image") => {
+                    if let Some(part) = response_content_part_to_chat(item) {
+                        messages.push(json!({ "role": "user", "content": [part] }));
+                        return;
+                    }
+                }
                 _ => {}
             }
 
@@ -3721,24 +5138,49 @@ fn response_function_call_output_to_chat_message(object: &Map<String, Value>) ->
 fn chat_content_from_response_content(content: &Value) -> Value {
     match content {
         Value::Array(parts) => {
-            let text_parts: Vec<String> = parts
+            let converted = parts
                 .iter()
-                .filter_map(|part| {
-                    part.get("text")
-                        .and_then(Value::as_str)
-                        .or_else(|| part.get("input_text").and_then(Value::as_str))
-                        .or_else(|| part.get("output_text").and_then(Value::as_str))
-                        .map(ToOwned::to_owned)
-                })
-                .collect();
-            if text_parts.is_empty() {
+                .filter_map(response_content_part_to_chat)
+                .collect::<Vec<_>>();
+            if converted.is_empty() {
                 Value::String(text_from_value(content))
             } else {
-                Value::String(text_parts.join("\n"))
+                chat_content_parts_to_value(converted)
             }
         }
         Value::String(_) => content.clone(),
         other => Value::String(text_from_value(other)),
+    }
+}
+
+fn response_content_part_to_chat(part: &Value) -> Option<Value> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("text" | "input_text" | "output_text") => part
+            .get("text")
+            .or_else(|| part.get("input_text"))
+            .or_else(|| part.get("output_text"))
+            .and_then(Value::as_str)
+            .map(|text| json!({ "type": "text", "text": text })),
+        Some("input_image" | "image_url") => {
+            let image_url = part.get("image_url")?;
+            let url = image_url
+                .as_str()
+                .or_else(|| image_url.get("url").and_then(Value::as_str))?;
+            let mut converted = json!({ "type": "image_url", "image_url": { "url": url } });
+            if let Some(detail) = part
+                .get("detail")
+                .or_else(|| image_url.get("detail"))
+                .and_then(Value::as_str)
+            {
+                converted["image_url"]["detail"] = Value::String(detail.to_string());
+            }
+            Some(converted)
+        }
+        Some("reasoning") => None,
+        _ => part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| json!({ "type": "text", "text": text })),
     }
 }
 
@@ -3948,6 +5390,92 @@ fn qwen_xml_tool_arguments_to_json(input: &str) -> Option<Map<String, Value>> {
     }
 }
 
+fn anthropic_response_as_chat(
+    response: reqwest::Response,
+    client_model: Option<String>,
+    meta: Option<UpstreamRequestMeta>,
+) -> reqwest::Response {
+    let mut upstream_stream = response.bytes_stream();
+    let response_request_id = meta.as_ref().map(|meta| meta.request_id.clone());
+    let stream_meta = meta.clone();
+    let mut translator = AnthropicStreamTranslator::new(client_model, unix_timestamp());
+
+    let stream = async_stream::stream! {
+        let mut buffer = Vec::new();
+        let mut data_lines = Vec::new();
+        let mut upstream_done = false;
+
+        while !upstream_done {
+            match upstream_stream.next().await {
+                Some(Ok(chunk)) => buffer.extend_from_slice(&chunk),
+                Some(Err(error)) => {
+                    let error_message = error.to_string();
+                    if let Some(meta) = &stream_meta {
+                        let failure = UpstreamFailure::from_reqwest(meta, error);
+                        log_upstream_failure(&failure, "stream");
+                        yield Ok::<Bytes, std::io::Error>(generic_stream_error_event(&failure));
+                    } else {
+                        error!(error = %error_message, "upstream Anthropic stream failed");
+                        yield Ok(sse_error_event(
+                            "upstream_error",
+                            &format!("upstream stream failed: {error_message}"),
+                            None,
+                            None,
+                        ));
+                    }
+                    return;
+                }
+                None => upstream_done = true,
+            }
+
+            let mut events = take_sse_data_events(&mut buffer, &mut data_lines);
+            if upstream_done {
+                let (tail, incomplete) = finish_sse_data_events(&mut buffer, &mut data_lines);
+                if incomplete {
+                    log_incomplete_sse_tail(stream_meta.as_ref());
+                }
+                events.extend(tail);
+            }
+
+            for data in events {
+                let Ok(value) = serde_json::from_str::<Value>(data.trim()) else {
+                    log_malformed_sse_data(stream_meta.as_ref(), &data);
+                    continue;
+                };
+                if value.get("type").and_then(Value::as_str) == Some("error") {
+                    yield Ok(sse_event("error", value));
+                    return;
+                }
+                for chunk in translator.translate(&value) {
+                    yield Ok(chat_sse_data(chunk));
+                }
+            }
+        }
+        yield Ok(chat_sse_done());
+    };
+
+    let mut builder = axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .header(CACHE_CONTROL, "no-cache");
+    if let Some(request_id) = &response_request_id {
+        builder = builder.header("x-request-id", request_id.as_str());
+    }
+    reqwest::Response::from(
+        builder
+            .body(reqwest::Body::wrap_stream(stream))
+            .expect("translated Anthropic response is valid"),
+    )
+}
+
+fn chat_sse_data(value: Value) -> Bytes {
+    Bytes::from(format!("data: {value}\n\n"))
+}
+
+fn chat_sse_done() -> Bytes {
+    Bytes::from_static(b"data: [DONE]\n\n")
+}
+
 fn stream_chat_as_responses(
     response: reqwest::Response,
     client_model: Option<String>,
@@ -4016,7 +5544,7 @@ fn stream_chat_as_responses(
                             created_at,
                         ));
                     } else {
-                        warn!(
+                        error!(
                             error = %error_message,
                             "upstream response stream failed"
                         );
@@ -4304,7 +5832,7 @@ fn stream_chat_as_anthropic(
                         log_upstream_failure(&failure, "stream");
                         yield Ok(anthropic_stream_error_event(&failure));
                     } else {
-                        warn!(
+                        error!(
                             error = %error_message,
                             "upstream anthropic stream failed"
                         );
@@ -4804,7 +6332,7 @@ fn push_sse_line(line: &str, data_lines: &mut Vec<String>, events: &mut Vec<Stri
 
 fn log_incomplete_sse_tail(meta: Option<&UpstreamRequestMeta>) {
     if let Some(meta) = meta {
-        warn!(
+        error!(
             request_id = %meta.request_id,
             method = %meta.method,
             upstream_path = %meta.path,
@@ -4812,14 +6340,14 @@ fn log_incomplete_sse_tail(meta: Option<&UpstreamRequestMeta>) {
             "upstream SSE stream ended with an incomplete event"
         );
     } else {
-        warn!("upstream SSE stream ended with an incomplete event");
+        error!("upstream SSE stream ended with an incomplete event");
     }
 }
 
 fn log_malformed_sse_data(meta: Option<&UpstreamRequestMeta>, data: &str) {
     let prefix = body_prefix(data.as_bytes());
     if let Some(meta) = meta {
-        warn!(
+        error!(
             request_id = %meta.request_id,
             method = %meta.method,
             upstream_path = %meta.path,
@@ -4828,7 +6356,7 @@ fn log_malformed_sse_data(meta: Option<&UpstreamRequestMeta>, data: &str) {
             "discarded malformed upstream SSE data event"
         );
     } else {
-        warn!(
+        error!(
             data_prefix = %prefix,
             "discarded malformed upstream SSE data event"
         );
@@ -4950,11 +6478,32 @@ fn unix_timestamp() -> i64 {
 fn validate_config(config: &Config) -> Result<()> {
     let providers = effective_provider_configs(config)?;
     for (name, provider) in &providers {
+        if name.is_empty() || name.contains('/') {
+            bail!("provider names must be non-empty and cannot contain '/': {name:?}");
+        }
         if provider.base_url.trim().is_empty() {
             bail!("provider {name:?} base_url cannot be empty");
         }
+        if provider.kind == ProviderKind::Copilot && provider.reasoning_effort.is_some() {
+            bail!(
+                "provider {name:?} cannot set reasoning_effort for kind \"copilot\"; configure the native client instead"
+            );
+        }
+        if provider.kind == ProviderKind::Anthropic
+            && matches!(
+                provider.reasoning_effort,
+                Some(ReasoningEffort::None | ReasoningEffort::Minimal)
+            )
+        {
+            bail!(
+                "provider {name:?} reasoning_effort must be low, medium, high, xhigh, or max for Anthropic"
+            );
+        }
     }
     for (alias, route) in &config.model_aliases {
+        if alias == INTEGRATED_AUTO_MODEL {
+            bail!("model alias {INTEGRATED_AUTO_MODEL:?} is reserved for integrated routing");
+        }
         let provider = route.provider(&config.default_provider);
         if !providers.contains_key(provider) {
             bail!("model alias {alias:?} references unknown provider {provider:?}");
@@ -4963,7 +6512,12 @@ fn validate_config(config: &Config) -> Result<()> {
             bail!("model alias {alias:?} has an empty upstream model");
         }
     }
-    interceptor::validate_config(&config.interceptor, &providers)?;
+    let mut routing_interceptor = config.interceptor.clone();
+    if config.integrated.enabled {
+        routing_interceptor.enabled = true;
+    }
+    interceptor::validate_config(&routing_interceptor, &providers)?;
+    interceptor::validate_integrated_config(&config.integrated, &routing_interceptor, &providers)?;
     if config.admin.enable {
         let address = admin::listen_address(&config.admin);
         let parsed: SocketAddr = address
@@ -4984,17 +6538,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn config_discovery_prefers_overrides_then_local_then_user() {
+        let explicit = PathBuf::from("explicit.toml");
+        let configured = PathBuf::from("configured.toml");
+        let home = PathBuf::from("user-home");
+        let local = PathBuf::from("config.toml");
+        let user = home.join(".llmproxy").join("config.toml");
+
+        assert_eq!(
+            resolve_config_path(
+                Some(explicit.clone()),
+                Some(configured.clone()),
+                Some(&home),
+                &|_| true,
+            ),
+            Some(explicit)
+        );
+        assert_eq!(
+            resolve_config_path(None, Some(configured.clone()), Some(&home), &|_| true,),
+            Some(configured)
+        );
+        assert_eq!(
+            resolve_config_path(None, None, Some(&home), &|path| path == local),
+            Some(local)
+        );
+        assert_eq!(
+            resolve_config_path(None, None, Some(&home), &|path| path == user),
+            Some(user)
+        );
+        assert_eq!(resolve_config_path(None, None, None, &|_| false), None);
+    }
+
+    #[test]
+    fn auto_model_alias_is_reserved_for_integrated_routing() {
+        let mut config = Config::default();
+        config.model_aliases.insert(
+            INTEGRATED_AUTO_MODEL.to_string(),
+            ModelAlias::Model("upstream-model".to_string()),
+        );
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+    }
+
+    #[test]
     fn startup_banner_shows_proxy_and_admin_destinations() {
         let info = RuntimeInfo {
             pid: 42,
             proxy_url: "http://127.0.0.1:8080/".to_string(),
             admin_url: Some("http://127.0.0.1:18080/".to_string()),
+            integrated: false,
+            log_file: Some("llmproxy-20260719120000.log".to_string()),
         };
         let banner = startup_banner(&info, "started");
         assert!(banner.contains("llmproxy") || banner.contains("| | |_"));
         assert!(banner.contains("Status : started"));
         assert!(banner.contains("Proxy  : http://127.0.0.1:8080/"));
         assert!(banner.contains("Admin  : http://127.0.0.1:18080/"));
+        assert!(banner.contains("Log    : ~/.llmproxy/llmproxy-20260719120000.log"));
     }
 
     #[test]
@@ -5003,8 +6607,24 @@ mod tests {
             pid: 42,
             proxy_url: "http://127.0.0.1:8080/".to_string(),
             admin_url: None,
+            integrated: false,
+            log_file: None,
         };
         assert!(startup_banner(&info, "running").contains("enable = true"));
+    }
+
+    #[tokio::test]
+    async fn unknown_routes_return_a_diagnostic_404_body() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/unknown?secret=not-logged")
+            .body(Body::empty())
+            .unwrap();
+        let response = route_not_found(request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let text = collect_response_text(response).await;
+        assert!(text.contains("no llmproxy endpoint matches POST /v1/unknown"));
+        assert!(!text.contains("secret"));
     }
 
     #[test]
@@ -5044,6 +6664,27 @@ mod tests {
         assert_eq!(
             config.providers["local"].api_key.as_deref(),
             Some("local-api-key")
+        );
+    }
+
+    #[test]
+    fn non_openai_provider_kinds_do_not_inherit_openai_credentials() {
+        let env_value =
+            |name: &str| (name == "OPENAI_API_KEY").then(|| "openai-only-key".to_string());
+        for kind in [ProviderKind::Anthropic, ProviderKind::Copilot] {
+            let provider = UpstreamConfig {
+                kind,
+                ..UpstreamConfig::default()
+            };
+            assert_eq!(resolve_api_key_with_env(&provider, true, &env_value), None);
+        }
+        let provider = UpstreamConfig {
+            kind: ProviderKind::OpenAi,
+            ..UpstreamConfig::default()
+        };
+        assert_eq!(
+            resolve_api_key_with_env(&provider, true, &env_value).as_deref(),
+            Some("openai-only-key")
         );
     }
 
@@ -5121,12 +6762,130 @@ mod tests {
         assert!(!cli.codex);
         assert!(!cli.claude);
         assert_eq!(cli.agent_args, ["--model", "gpt-5.4"].map(OsString::from));
-        assert!(Cli::try_parse_from(["llmproxy", "--codex"]).is_err());
-        assert!(Cli::try_parse_from(["llmproxy", "--claude"]).is_err());
-        assert!(Cli::try_parse_from(["llmproxy", "--copilot"]).is_err());
+        let cli = Cli::try_parse_from([
+            "llmproxy",
+            "--integrated",
+            "--copilot",
+            "--",
+            "--model",
+            "anthropic/claude-sonnet-4-5",
+        ])
+        .unwrap();
+        assert!(cli.integrated);
+        assert!(cli.copilot);
+        assert_eq!(
+            cli.agent_args,
+            ["--model", "anthropic/claude-sonnet-4-5"].map(OsString::from)
+        );
+        let cli = Cli::try_parse_from(["llmproxy", "--proxy", "--codex"]).unwrap();
+        assert!(cli.proxy);
+        assert_eq!(cli.launcher_mode(), Some(LauncherMode::Proxy));
+        assert!(validate_cli(&cli).is_ok());
+
+        let cli = Cli::try_parse_from([
+            "llmproxy",
+            "--proxy",
+            "--codex",
+            "--upstream",
+            "http://127.0.0.1:8000/v1",
+        ])
+        .unwrap();
+        assert!(validate_cli(&cli).is_err());
+
+        for agent in ["--codex", "--claude", "--copilot"] {
+            let cli = Cli::try_parse_from(["llmproxy", agent]).unwrap();
+            assert_eq!(cli.launcher_mode(), Some(LauncherMode::Integrated));
+            assert!(validate_cli(&cli).is_ok());
+        }
+        assert!(Cli::try_parse_from(["llmproxy", "--proxy"]).is_err());
+        assert!(Cli::try_parse_from(["llmproxy", "--proxy", "--intercept", "--codex"]).is_err());
+        assert!(Cli::try_parse_from(["llmproxy", "--proxy", "--integrated", "--codex"]).is_err());
         assert!(Cli::try_parse_from(["llmproxy", "--intercept", "--codex", "--claude"]).is_err());
         assert!(Cli::try_parse_from(["llmproxy", "--intercept", "--claude", "--copilot"]).is_err());
         assert!(Cli::try_parse_from(["llmproxy", "--", "--model", "sonnet"]).is_err());
+    }
+
+    #[test]
+    fn caller_credentials_only_forward_to_the_external_default_provider() {
+        let mut incoming = HeaderMap::new();
+        incoming.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer caller-secret"),
+        );
+        incoming.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("caller-account"),
+        );
+
+        let local = test_state("http://127.0.0.1:8000/v1".to_string());
+        assert!(provider_request_headers(&local, &incoming, local.default_provider()).is_empty());
+
+        let external = test_state("https://api.example.test/v1".to_string());
+        let forwarded = provider_request_headers(&external, &incoming, external.default_provider());
+        assert_eq!(forwarded.get(AUTHORIZATION), incoming.get(AUTHORIZATION));
+        assert_eq!(
+            forwarded.get("chatgpt-account-id"),
+            incoming.get("chatgpt-account-id")
+        );
+
+        let config = Config {
+            upstream: UpstreamConfig {
+                base_url: "https://default.example.test/v1".to_string(),
+                ..UpstreamConfig::default()
+            },
+            providers: HashMap::from([(
+                "secondary".to_string(),
+                UpstreamConfig {
+                    base_url: "https://secondary.example.test/v1".to_string(),
+                    ..UpstreamConfig::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let state = test_state_with_config(config);
+        assert!(
+            provider_request_headers(&state, &incoming, &state.providers["secondary"]).is_empty()
+        );
+    }
+
+    #[test]
+    fn launcher_runtime_validation_is_mode_specific() {
+        let mut config = Config::default();
+        assert!(validate_launcher_runtime(&config, LauncherMode::Proxy).is_ok());
+        assert!(validate_launcher_runtime(&config, LauncherMode::Intercept).is_err());
+
+        config.providers.insert(
+            "local".to_string(),
+            UpstreamConfig {
+                base_url: "http://127.0.0.1:11434/v1".to_string(),
+                ..UpstreamConfig::default()
+            },
+        );
+        config.interceptor = local_interceptor_config("local", "triage-model");
+        config.interceptor.enabled = false;
+        assert!(validate_launcher_runtime(&config, LauncherMode::Intercept).is_ok());
+        assert!(validate_launcher_runtime(&config, LauncherMode::Integrated).is_err());
+
+        config.integrated.targets.insert(
+            "PROVIDER_DEFAULT".to_string(),
+            interceptor::IntegratedTarget {
+                provider: "default".to_string(),
+                model: "local-model".to_string(),
+                hint: "larger local work".to_string(),
+                reasoning_effort: None,
+            },
+        );
+        assert!(validate_launcher_runtime(&config, LauncherMode::Integrated).is_ok());
+
+        let state = test_state_with_config(config);
+        let session =
+            LauncherSession::local(LauncherKind::Codex, LauncherMode::Integrated).unwrap();
+        let scoped = state.with_launcher_session(&session).unwrap();
+        assert!(!scoped.config.interceptor.enabled);
+        assert!(scoped.config.integrated.enabled);
+        assert_eq!(scoped.launcher_kind, None);
+        assert_eq!(scoped.launcher_mode, Some(LauncherMode::Integrated));
+        assert!(!scoped.forward_caller_credentials);
     }
 
     fn test_config() -> Config {
@@ -5147,6 +6906,7 @@ mod tests {
     }
 
     fn test_state_with_config(config: Config) -> AppState {
+        let forward_caller_credentials = !config.integrated.enabled;
         let provider_configs = effective_provider_configs(&config).unwrap();
         let providers = provider_configs
             .into_iter()
@@ -5167,6 +6927,8 @@ mod tests {
             config: Arc::new(config),
             providers: Arc::new(providers),
             launcher_kind: None,
+            launcher_mode: None,
+            forward_caller_credentials,
         }
     }
 
@@ -5232,6 +6994,21 @@ mod tests {
                 "type": "function",
                 "function": {
                     "name": "PASS",
+                    "arguments": "{}"
+                }
+            }]),
+        )
+    }
+
+    fn route_default_completion() -> Value {
+        chat_completion(
+            "local-fast",
+            Value::Null,
+            json!([{
+                "id": "call-route-default",
+                "type": "function",
+                "function": {
+                    "name": "ROUTE_DEFAULT",
                     "arguments": "{}"
                 }
             }]),
@@ -5358,6 +7135,487 @@ mod tests {
 
         local_server.abort();
         external_server.abort();
+    }
+
+    #[tokio::test]
+    async fn integrated_route_default_uses_normal_routing_and_proxy_credentials() {
+        let local_capture = Arc::new(Mutex::new(None::<(HeaderMap, Value)>));
+        let local_capture_for_handler = local_capture.clone();
+        let local_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let capture = local_capture_for_handler.clone();
+                async move {
+                    *capture.lock().unwrap() = Some((headers, body));
+                    Json(route_default_completion())
+                }
+            }),
+        );
+        let (local_url, local_server) = spawn_test_upstream(local_app).await;
+
+        let external_capture = Arc::new(Mutex::new(None::<(HeaderMap, Value)>));
+        let external_capture_for_handler = external_capture.clone();
+        let external_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let capture = external_capture_for_handler.clone();
+                async move {
+                    *capture.lock().unwrap() = Some((headers, body));
+                    Json(chat_completion(
+                        "default-model",
+                        json!("default routed"),
+                        json!([]),
+                    ))
+                }
+            }),
+        );
+        let (external_url, external_server) = spawn_test_upstream(external_app).await;
+
+        let config = Config {
+            default_provider: "external".to_string(),
+            providers: HashMap::from([
+                (
+                    "local".to_string(),
+                    UpstreamConfig {
+                        base_url: local_url,
+                        ..UpstreamConfig::default()
+                    },
+                ),
+                (
+                    "external".to_string(),
+                    UpstreamConfig {
+                        kind: ProviderKind::OpenAi,
+                        base_url: external_url,
+                        api_key: Some("proxy-owned-credential".to_string()),
+                        ..UpstreamConfig::default()
+                    },
+                ),
+            ]),
+            interceptor: local_interceptor_config("local", "local-fast"),
+            integrated: IntegratedConfig {
+                enabled: true,
+                targets: std::collections::BTreeMap::from([(
+                    "PROVIDER_EXTERNAL".to_string(),
+                    interceptor::IntegratedTarget {
+                        provider: "external".to_string(),
+                        model: "target-model".to_string(),
+                        hint: "explicitly selected work".to_string(),
+                        reasoning_effort: None,
+                    },
+                )]),
+                ..IntegratedConfig::default()
+            },
+            model_aliases: HashMap::from([(
+                "frontend-model".to_string(),
+                ModelAlias::Route {
+                    provider: "external".to_string(),
+                    model: "default-model".to_string(),
+                },
+            )]),
+            ..Config::default()
+        };
+        validate_config(&config).unwrap();
+        let state = test_state_with_config(config);
+        state.providers["external"]
+            .model_cache
+            .replace_upstream_models(
+                vec!["default-model".to_string()],
+                json!({ "data": [{ "id": "default-model" }] }),
+            );
+        let mut caller_headers = HeaderMap::new();
+        caller_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer caller-secret"),
+        );
+        caller_headers.insert("x-api-key", HeaderValue::from_static("caller-key"));
+
+        let response = chat_completions(
+            State(SharedState::new(state)),
+            caller_headers,
+            Json(json!({
+                "model": INTEGRATED_AUTO_MODEL,
+                "messages": [{ "role": "user", "content": "use normal routing" }],
+                "metadata": { "preserve": true }
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            collect_response_text(response)
+                .await
+                .contains("default routed")
+        );
+
+        let (local_headers, local_body) = local_capture.lock().unwrap().clone().unwrap();
+        assert!(local_headers.get(AUTHORIZATION).is_none());
+        assert!(local_headers.get("x-api-key").is_none());
+        let local_tools = local_body["tools"].as_array().unwrap();
+        assert!(
+            local_tools
+                .iter()
+                .any(|tool| { tool["function"]["name"].as_str() == Some("ROUTE_DEFAULT") })
+        );
+        assert!(
+            local_tools
+                .iter()
+                .all(|tool| { tool["function"]["name"].as_str() != Some("PASS") })
+        );
+
+        let (external_headers, external_body) = external_capture.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            external_headers.get(AUTHORIZATION).unwrap(),
+            "Bearer proxy-owned-credential"
+        );
+        assert!(external_headers.get("x-api-key").is_none());
+        assert_eq!(external_body["model"], "default-model");
+        assert_eq!(external_body["metadata"]["preserve"], true);
+
+        local_server.abort();
+        external_server.abort();
+    }
+
+    #[tokio::test]
+    async fn integrated_redirect_uses_target_provider_credentials_only() {
+        let local_capture = Arc::new(Mutex::new(None::<(HeaderMap, Value)>));
+        let local_capture_for_handler = local_capture.clone();
+        let local_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let capture = local_capture_for_handler.clone();
+                async move {
+                    *capture.lock().unwrap() = Some((headers, body));
+                    Json(chat_completion(
+                        "triage",
+                        Value::Null,
+                        json!([{
+                            "id": "redirect-call",
+                            "type": "function",
+                            "function": {
+                                "name": "PROVIDER_EXTERNAL",
+                                "arguments": "{}"
+                            }
+                        }]),
+                    ))
+                }
+            }),
+        );
+        let (local_url, local_server) = spawn_test_upstream(local_app).await;
+
+        let external_capture = Arc::new(Mutex::new(None::<(HeaderMap, Value)>));
+        let external_capture_for_handler = external_capture.clone();
+        let external_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let capture = external_capture_for_handler.clone();
+                async move {
+                    *capture.lock().unwrap() = Some((headers, body));
+                    Json(chat_completion(
+                        "target-model",
+                        json!("redirected"),
+                        json!([]),
+                    ))
+                }
+            }),
+        );
+        let (external_url, external_server) = spawn_test_upstream(external_app).await;
+
+        let config = Config {
+            default_provider: "external".to_string(),
+            providers: HashMap::from([
+                (
+                    "local".to_string(),
+                    UpstreamConfig {
+                        base_url: local_url,
+                        ..UpstreamConfig::default()
+                    },
+                ),
+                (
+                    "external".to_string(),
+                    UpstreamConfig {
+                        kind: ProviderKind::OpenAi,
+                        base_url: external_url,
+                        api_key: Some("target-credential".to_string()),
+                        ..UpstreamConfig::default()
+                    },
+                ),
+            ]),
+            interceptor: {
+                let mut interceptor = local_interceptor_config("local", "triage");
+                interceptor.enabled = false;
+                interceptor
+            },
+            integrated: IntegratedConfig {
+                enabled: true,
+                targets: std::collections::BTreeMap::from([(
+                    "PROVIDER_EXTERNAL".to_string(),
+                    interceptor::IntegratedTarget {
+                        provider: "external".to_string(),
+                        model: "target-model".to_string(),
+                        hint: "complex work".to_string(),
+                        reasoning_effort: Some(ReasoningEffort::Max),
+                    },
+                )]),
+                ..IntegratedConfig::default()
+            },
+            ..Config::default()
+        };
+        validate_config(&config).unwrap();
+        let state = test_state_with_config(config);
+        let mut caller_headers = HeaderMap::new();
+        caller_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer caller-secret"),
+        );
+        caller_headers.insert("x-api-key", HeaderValue::from_static("caller-key"));
+        let response = chat_completions(
+            State(SharedState::new(state)),
+            caller_headers,
+            Json(json!({
+                "model": INTEGRATED_AUTO_MODEL,
+                "messages": [{ "role": "user", "content": "unique integrated task" }]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(collect_response_text(response).await.contains("redirected"));
+
+        let (local_headers, local_body) = local_capture.lock().unwrap().clone().unwrap();
+        assert!(local_headers.get(AUTHORIZATION).is_none());
+        assert!(local_headers.get("x-api-key").is_none());
+        assert!(
+            local_body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| { tool["function"]["name"].as_str() == Some("PROVIDER_EXTERNAL") })
+        );
+        let (external_headers, external_body) = external_capture.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            external_headers.get(AUTHORIZATION).unwrap(),
+            "Bearer target-credential"
+        );
+        assert!(external_headers.get("x-api-key").is_none());
+        assert_eq!(external_body["model"], "target-model");
+        assert_eq!(external_body["reasoning_effort"], "max");
+
+        local_server.abort();
+        external_server.abort();
+    }
+
+    #[tokio::test]
+    async fn integrated_explicit_namespace_runs_pass_check_and_uses_proxy_credentials() {
+        let local_capture = Arc::new(Mutex::new(None::<Value>));
+        let local_capture_for_handler = local_capture.clone();
+        let local_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let capture = local_capture_for_handler.clone();
+                async move {
+                    *capture.lock().unwrap() = Some(body);
+                    Json(pass_completion())
+                }
+            }),
+        );
+        let (local_url, local_server) = spawn_test_upstream(local_app).await;
+
+        let external_capture = Arc::new(Mutex::new(None::<(HeaderMap, Value)>));
+        let capture_for_handler = external_capture.clone();
+        let external_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let capture = capture_for_handler.clone();
+                async move {
+                    *capture.lock().unwrap() = Some((headers, body));
+                    Json(chat_completion("pinned-model", json!("pinned"), json!([])))
+                }
+            }),
+        );
+        let (external_url, external_server) = spawn_test_upstream(external_app).await;
+        let config = Config {
+            default_provider: "external".to_string(),
+            providers: HashMap::from([
+                (
+                    "local".to_string(),
+                    UpstreamConfig {
+                        base_url: local_url,
+                        ..UpstreamConfig::default()
+                    },
+                ),
+                (
+                    "external".to_string(),
+                    UpstreamConfig {
+                        base_url: external_url,
+                        api_key: Some("proxy-credential".to_string()),
+                        ..UpstreamConfig::default()
+                    },
+                ),
+            ]),
+            interceptor: local_interceptor_config("local", "triage"),
+            integrated: IntegratedConfig {
+                enabled: true,
+                targets: std::collections::BTreeMap::from([(
+                    "PROVIDER_EXTERNAL".to_string(),
+                    interceptor::IntegratedTarget {
+                        provider: "external".to_string(),
+                        model: "fallback-model".to_string(),
+                        hint: "complex work".to_string(),
+                        reasoning_effort: None,
+                    },
+                )]),
+                ..IntegratedConfig::default()
+            },
+            ..Config::default()
+        };
+        validate_config(&config).unwrap();
+        let mut caller_headers = HeaderMap::new();
+        caller_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer caller-secret"),
+        );
+        let response = chat_completions(
+            State(SharedState::new(test_state_with_config(config))),
+            caller_headers,
+            Json(json!({
+                "model": "external/pinned-model",
+                "messages": [{ "role": "user", "content": "explicit namespace task" }]
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let local_body = local_capture.lock().unwrap().clone().unwrap();
+        let local_tools = local_body["tools"].as_array().unwrap();
+        assert!(
+            local_tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == "PASS")
+        );
+        assert!(
+            local_tools
+                .iter()
+                .all(|tool| tool["function"]["name"] != "ROUTE_DEFAULT"
+                    && tool["function"]["name"] != "PROVIDER_EXTERNAL")
+        );
+        let (headers, body) = external_capture.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer proxy-credential"
+        );
+        assert_eq!(body["model"], "pinned-model");
+        local_server.abort();
+        external_server.abort();
+    }
+
+    #[tokio::test]
+    async fn integrated_redirect_failure_does_not_issue_a_second_generation() {
+        let local_app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(chat_completion(
+                    "triage",
+                    Value::Null,
+                    json!([{
+                        "id": "redirect-call",
+                        "type": "function",
+                        "function": { "name": "PROVIDER_TARGET", "arguments": "{}" }
+                    }]),
+                ))
+            }),
+        );
+        let (local_url, local_server) = spawn_test_upstream(local_app).await;
+        let target_app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { (StatusCode::SERVICE_UNAVAILABLE, "target unavailable") }),
+        );
+        let (target_url, target_server) = spawn_test_upstream(target_app).await;
+        let default_calls = Arc::new(AtomicU64::new(0));
+        let default_calls_for_handler = default_calls.clone();
+        let default_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let default_calls = default_calls_for_handler.clone();
+                async move {
+                    default_calls.fetch_add(1, Ordering::Relaxed);
+                    Json(chat_completion(
+                        "default-model",
+                        json!("default answer"),
+                        json!([]),
+                    ))
+                }
+            }),
+        );
+        let (default_url, default_server) = spawn_test_upstream(default_app).await;
+        let config = Config {
+            default_provider: "default".to_string(),
+            providers: HashMap::from([
+                (
+                    "local".to_string(),
+                    UpstreamConfig {
+                        base_url: local_url,
+                        ..UpstreamConfig::default()
+                    },
+                ),
+                (
+                    "target".to_string(),
+                    UpstreamConfig {
+                        base_url: target_url,
+                        api_key: Some("target-key".to_string()),
+                        ..UpstreamConfig::default()
+                    },
+                ),
+                (
+                    "default".to_string(),
+                    UpstreamConfig {
+                        base_url: default_url,
+                        api_key: Some("default-key".to_string()),
+                        ..UpstreamConfig::default()
+                    },
+                ),
+            ]),
+            interceptor: local_interceptor_config("local", "triage"),
+            integrated: IntegratedConfig {
+                enabled: true,
+                targets: std::collections::BTreeMap::from([(
+                    "PROVIDER_TARGET".to_string(),
+                    interceptor::IntegratedTarget {
+                        provider: "target".to_string(),
+                        model: "target-model".to_string(),
+                        hint: "complex work".to_string(),
+                        reasoning_effort: None,
+                    },
+                )]),
+                ..IntegratedConfig::default()
+            },
+            model_aliases: HashMap::from([(
+                "frontend-model".to_string(),
+                ModelAlias::Route {
+                    provider: "default".to_string(),
+                    model: "default-model".to_string(),
+                },
+            )]),
+            ..Config::default()
+        };
+        validate_config(&config).unwrap();
+        let response = chat_completions(
+            State(SharedState::new(test_state_with_config(config))),
+            HeaderMap::new(),
+            Json(json!({
+                "model": INTEGRATED_AUTO_MODEL,
+                "messages": [{ "role": "user", "content": "unique redirect fallback task" }]
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            collect_response_text(response)
+                .await
+                .contains("target unavailable")
+        );
+        assert_eq!(default_calls.load(Ordering::Relaxed), 0);
+        local_server.abort();
+        target_server.abort();
+        default_server.abort();
     }
 
     #[tokio::test]
@@ -5811,6 +8069,214 @@ mod tests {
 
         local_server.abort();
         external_server.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_launchers_only_remap_protocols_to_the_default_provider() {
+        let captured = Arc::new(Mutex::new(Vec::<(HeaderMap, Value)>::new()));
+        let captured_for_handler = captured.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    captured.lock().unwrap().push((headers, body));
+                    Json(chat_completion(
+                        "local-model",
+                        json!("local proxy response"),
+                        json!([]),
+                    ))
+                }
+            }),
+        );
+        let (local_base_url, local_server) = spawn_test_upstream(app).await;
+        let config = Config {
+            default_provider: "local".to_string(),
+            providers: HashMap::from([
+                (
+                    "local".to_string(),
+                    UpstreamConfig {
+                        base_url: local_base_url,
+                        api_key: Some("provider-owned-key".to_string()),
+                        ..UpstreamConfig::default()
+                    },
+                ),
+                (
+                    "external".to_string(),
+                    UpstreamConfig {
+                        base_url: "http://external.invalid/v1".to_string(),
+                        api_key: Some("must-not-be-used".to_string()),
+                        ..UpstreamConfig::default()
+                    },
+                ),
+            ]),
+            interceptor: local_interceptor_config("local", "interceptor-model"),
+            model_aliases: HashMap::from([(
+                "agent-model".to_string(),
+                ModelAlias::Route {
+                    provider: "external".to_string(),
+                    model: "external-model".to_string(),
+                },
+            )]),
+            ..Config::default()
+        };
+        let shared = SharedState::new(test_state_with_config(config));
+        let mut caller_headers = HeaderMap::new();
+        caller_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer caller-secret"),
+        );
+        caller_headers.insert("x-api-key", HeaderValue::from_static("caller-secret"));
+
+        let codex_token = LauncherSession::local(LauncherKind::Codex, LauncherMode::Proxy)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let codex_response = launcher_responses(
+            AxumPath(codex_token),
+            State(shared.clone()),
+            caller_headers.clone(),
+            Json(json!({
+                "model": "local/local-model",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "from codex" }]
+                }]
+            })),
+        )
+        .await;
+        assert_eq!(codex_response.status(), StatusCode::OK);
+        assert!(
+            collect_response_text(codex_response)
+                .await
+                .contains("local proxy response")
+        );
+
+        let claude_token = LauncherSession::local(LauncherKind::Claude, LauncherMode::Proxy)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let claude_response = launcher_anthropic_messages(
+            AxumPath(claude_token),
+            State(shared.clone()),
+            caller_headers.clone(),
+            Json(json!({
+                "model": "local/local-model",
+                "max_tokens": 64,
+                "messages": [{ "role": "user", "content": "from claude" }]
+            })),
+        )
+        .await;
+        assert_eq!(claude_response.status(), StatusCode::OK);
+        assert!(
+            collect_response_text(claude_response)
+                .await
+                .contains("local proxy response")
+        );
+
+        let copilot_token = LauncherSession::local(LauncherKind::Copilot, LauncherMode::Proxy)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let copilot_response = launcher_chat_completions(
+            AxumPath(copilot_token),
+            State(shared),
+            caller_headers,
+            Json(json!({
+                "model": "local/local-model",
+                "messages": [{ "role": "user", "content": "from copilot" }]
+            })),
+        )
+        .await;
+        assert_eq!(copilot_response.status(), StatusCode::OK);
+        assert!(
+            collect_response_text(copilot_response)
+                .await
+                .contains("local proxy response")
+        );
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            3,
+            "proxy mode must not make an interceptor call"
+        );
+        for (headers, body) in captured.iter() {
+            assert_eq!(body["model"], "local-model");
+            assert!(
+                body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|message| message["role"] != "system")
+            );
+            let serialized = body.to_string();
+            assert!(!serialized.contains("PASS"));
+            assert!(!serialized.contains("ROUTE_DEFAULT"));
+            assert!(!serialized.contains("PROVIDER_"));
+            assert_eq!(
+                headers
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer provider-owned-key")
+            );
+            assert!(headers.get("x-api-key").is_none());
+        }
+        drop(captured);
+        local_server.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_codex_control_requests_stay_on_the_default_provider() {
+        let captured = Arc::new(Mutex::new(None::<(HeaderMap, Value)>));
+        let captured_for_handler = captured.clone();
+        let app = Router::new().route(
+            "/v1/responses/compact",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    *captured.lock().unwrap() = Some((headers, body));
+                    Json(json!({ "id": "compact-local", "output": [] }))
+                }
+            }),
+        );
+        let (local_base_url, local_server) = spawn_test_upstream(app).await;
+        let config = Config {
+            upstream: UpstreamConfig {
+                base_url: local_base_url,
+                api_key: Some("provider-owned-key".to_string()),
+                ..UpstreamConfig::default()
+            },
+            ..Config::default()
+        };
+        let token = LauncherSession::local(LauncherKind::Codex, LauncherMode::Proxy)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer caller-secret"),
+        );
+        let response = launcher_codex_responses_compact(
+            AxumPath(token),
+            State(SharedState::new(test_state_with_config(config))),
+            headers,
+            Json(json!({ "model": "default/local-model", "input": [] })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (headers, body) = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(body["model"], "local-model");
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer provider-owned-key")
+        );
+        local_server.abort();
     }
 
     #[tokio::test]
@@ -6553,6 +9019,43 @@ mod tests {
         validate_config(&config).unwrap();
     }
 
+    #[test]
+    fn parses_documented_and_legacy_provider_kind_spellings() {
+        for (spelling, expected) in [
+            ("openai-compatible", ProviderKind::OpenAiCompatible),
+            ("open-ai-compatible", ProviderKind::OpenAiCompatible),
+            ("openai", ProviderKind::OpenAi),
+            ("open-ai", ProviderKind::OpenAi),
+            ("anthropic", ProviderKind::Anthropic),
+            ("copilot", ProviderKind::Copilot),
+        ] {
+            let provider: UpstreamConfig = toml::from_str(&format!("kind = {spelling:?}")).unwrap();
+            assert_eq!(provider.kind, expected);
+        }
+    }
+
+    #[test]
+    fn validates_provider_reasoning_effort_by_protocol() {
+        let high: UpstreamConfig = toml::from_str("reasoning_effort = \"high\"").unwrap();
+        assert_eq!(high.reasoning_effort, Some(ReasoningEffort::High));
+
+        let anthropic: Config =
+            toml::from_str("[upstream]\nkind = \"anthropic\"\nreasoning_effort = \"none\"\n")
+                .unwrap();
+        assert!(validate_config(&anthropic).is_err());
+
+        let copilot: Config =
+            toml::from_str("[upstream]\nkind = \"copilot\"\nreasoning_effort = \"high\"\n")
+                .unwrap();
+        assert!(validate_config(&copilot).is_err());
+    }
+
+    #[test]
+    fn example_config_parses_and_validates() {
+        let config: Config = toml::from_str(include_str!("../llmproxy.example.toml")).unwrap();
+        validate_config(&config).unwrap();
+    }
+
     #[tokio::test]
     async fn routed_embedding_alias_uses_selected_provider_and_model() {
         let seen_body = Arc::new(Mutex::new(None::<Value>));
@@ -6692,6 +9195,91 @@ mod tests {
         assert_eq!(value["nested"]["model"], "Qwen/Qwen2.5-Coder-32B-Instruct");
     }
 
+    #[tokio::test]
+    async fn namespaced_models_select_provider_and_strip_only_the_prefix() {
+        let mut config = Config {
+            default_provider: "primary".to_string(),
+            providers: HashMap::from([
+                ("primary".to_string(), UpstreamConfig::default()),
+                ("anthropic".to_string(), UpstreamConfig::default()),
+            ]),
+            ..Config::default()
+        };
+        config.model_aliases.insert(
+            "anthropic/pinned".to_string(),
+            ModelAlias::Route {
+                provider: "primary".to_string(),
+                model: "alias-wins".to_string(),
+            },
+        );
+        let state = test_state_with_config(config);
+
+        let mut dynamic = json!({ "model": "anthropic/claude/test" });
+        let provider = rewrite_proxy_request_value(&state, &HeaderMap::new(), &mut dynamic)
+            .await
+            .unwrap();
+        assert_eq!(provider.name, "anthropic");
+        assert_eq!(dynamic["model"], "claude/test");
+
+        let mut exact_alias = json!({ "model": "anthropic/pinned" });
+        let provider = rewrite_proxy_request_value(&state, &HeaderMap::new(), &mut exact_alias)
+            .await
+            .unwrap();
+        assert_eq!(provider.name, "primary");
+        assert_eq!(exact_alias["model"], "alias-wins");
+    }
+
+    #[tokio::test]
+    async fn integrated_explicit_raw_model_is_preserved_on_default_provider() {
+        let mut config = test_config();
+        config.integrated.enabled = true;
+        let state = test_state_with_config(config);
+        state
+            .default_provider()
+            .model_cache
+            .replace_upstream_models(
+                vec!["fallback-model".to_string()],
+                json!({ "data": [{ "id": "fallback-model" }] }),
+            );
+        let mut request = json!({ "model": "selected-model" });
+
+        let provider = rewrite_proxy_request_value(&state, &HeaderMap::new(), &mut request)
+            .await
+            .unwrap();
+
+        assert_eq!(provider.name, state.config.default_provider);
+        assert_eq!(request["model"], "selected-model");
+    }
+
+    #[test]
+    fn provider_models_include_typed_namespaced_ids() {
+        let mut data = Vec::new();
+        append_provider_models(
+            &mut data,
+            json!({ "data": [{ "id": "model-a", "object": "model" }] }),
+            "provider",
+            true,
+        );
+        assert!(data.iter().any(|model| model["id"] == "model-a"));
+        let namespaced = data
+            .iter()
+            .find(|model| model["id"] == "provider/model-a")
+            .unwrap();
+        assert_eq!(namespaced["proxy_target"], "model-a");
+        assert_eq!(namespaced["proxy_provider"], "provider");
+        assert_eq!(namespaced["proxy_route"], "namespaced");
+
+        let mut namespaced_only = Vec::new();
+        append_provider_models(
+            &mut namespaced_only,
+            json!({ "data": [{ "id": "model-a", "object": "model" }] }),
+            "provider",
+            false,
+        );
+        assert_eq!(namespaced_only.len(), 1);
+        assert_eq!(namespaced_only[0]["id"], "provider/model-a");
+    }
+
     #[test]
     fn extracts_upstream_model_ids_in_order() {
         let upstream = json!({
@@ -6708,6 +9296,58 @@ mod tests {
             extract_model_ids(&upstream),
             vec!["first-model", "second-model"]
         );
+    }
+
+    #[tokio::test]
+    async fn anthropic_model_discovery_collects_paginated_results() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_for_handler = calls.clone();
+        let app = Router::new().route(
+            "/v1/models",
+            get(
+                move |axum::extract::Query(query): axum::extract::Query<
+                    HashMap<String, String>,
+                >| {
+                    let calls = calls_for_handler.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        if query.get("after_id").map(String::as_str) == Some("model/one") {
+                            Json(json!({
+                                "data": [{ "id": "model-two" }],
+                                "first_id": "model-two",
+                                "last_id": "model-two",
+                                "has_more": false
+                            }))
+                        } else {
+                            Json(json!({
+                                "data": [{ "id": "model/one" }],
+                                "first_id": "model/one",
+                                "last_id": "model/one",
+                                "has_more": true
+                            }))
+                        }
+                    }
+                },
+            ),
+        );
+        let (base_url, server) = spawn_test_upstream(app).await;
+        let provider = build_provider_state(
+            "anthropic".to_string(),
+            UpstreamConfig {
+                kind: ProviderKind::Anthropic,
+                base_url,
+                api_key: Some("provider-key".to_string()),
+                ..UpstreamConfig::default()
+            },
+        )
+        .unwrap();
+
+        let models = fetch_upstream_models(&provider, &HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(extract_model_ids(&models), ["model/one", "model-two"]);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        server.abort();
     }
 
     #[test]
@@ -6763,6 +9403,516 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_backend_adapts_chat_and_isolates_caller_credentials() {
+        let captured = Arc::new(Mutex::new(None::<(HeaderMap, Value)>));
+        let captured_for_handler = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    *captured.lock().unwrap() = Some((headers, body));
+                    Json(json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "model": "claude-test",
+                        "content": [{ "type": "text", "text": "adapted" }],
+                        "stop_reason": "end_turn",
+                        "usage": { "input_tokens": 5, "output_tokens": 2 }
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_test_upstream(app).await;
+        let config = Config {
+            upstream: UpstreamConfig {
+                kind: ProviderKind::Anthropic,
+                base_url,
+                api_key: Some("provider-key".to_string()),
+                ..UpstreamConfig::default()
+            },
+            ..Config::default()
+        };
+        let state = test_state_with_config(config);
+        let mut caller_headers = HeaderMap::new();
+        caller_headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer caller"));
+        caller_headers.insert("x-api-key", HeaderValue::from_static("caller-key"));
+
+        let response = chat_completions(
+            State(SharedState::new(state)),
+            caller_headers,
+            Json(json!({
+                "model": "default/claude-test",
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = serde_json::from_str(&collect_response_text(response).await).unwrap();
+        assert_eq!(response["choices"][0]["message"]["content"], "adapted");
+        assert_eq!(response["usage"]["total_tokens"], 7);
+
+        let (headers, body) = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(headers.get("x-api-key").unwrap(), "provider-key");
+        assert!(headers.get(AUTHORIZATION).is_none());
+        assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+        assert_eq!(body["model"], "claude-test");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_backend_streams_as_openai_chat() {
+        let sse = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"model\":\"claude-test\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let app = Router::new().route(
+            "/v1/messages",
+            post(
+                move || async move { (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], sse) },
+            ),
+        );
+        let (base_url, server) = spawn_test_upstream(app).await;
+        let config = Config {
+            upstream: UpstreamConfig {
+                kind: ProviderKind::Anthropic,
+                base_url,
+                api_key: Some("provider-key".to_string()),
+                ..UpstreamConfig::default()
+            },
+            ..Config::default()
+        };
+        let state = test_state_with_config(config);
+        let response = chat_completions(
+            State(SharedState::new(state)),
+            HeaderMap::new(),
+            Json(json!({
+                "model": "default/claude-test",
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+        let body = collect_response_text(response).await;
+        assert!(body.contains("chat.completion.chunk"), "body: {body}");
+        assert!(body.contains("hello"), "body: {body}");
+        assert!(body.contains("[DONE]"), "body: {body}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn copilot_backend_adds_identity_headers_and_sanitizes_content() {
+        let captured = Arc::new(Mutex::new(None::<(HeaderMap, Value)>));
+        let captured_for_handler = captured.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    *captured.lock().unwrap() = Some((headers, body));
+                    Json(chat_completion("gpt-test", json!("ok"), json!([])))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_test_upstream(app).await;
+        let config = Config {
+            upstream: UpstreamConfig {
+                kind: ProviderKind::Copilot,
+                base_url: base_url.trim_end_matches("/v1").to_string(),
+                api_key: Some("copilot-token".to_string()),
+                ..UpstreamConfig::default()
+            },
+            ..Config::default()
+        };
+        let state = test_state_with_config(config);
+        let response = proxy_chat(
+            state.default_provider(),
+            &HeaderMap::new(),
+            &json!({
+                "model": "gpt-test",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "hello" },
+                        { "type": "thinking", "thinking": "private", "signature": "signed" }
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (headers, body) = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            headers.get("copilot-integration-id").unwrap(),
+            "vscode-chat"
+        );
+        assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+        assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer copilot-token");
+        assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 1);
+        assert!(!body.to_string().contains("signed"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn all_frontends_route_through_each_provider_kind() {
+        let openai_capture = Arc::new(Mutex::new(Vec::<(HeaderMap, Value)>::new()));
+        let openai_capture_for_handler = openai_capture.clone();
+        let openai_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let capture = openai_capture_for_handler.clone();
+                async move {
+                    capture.lock().unwrap().push((headers, body));
+                    Json(chat_completion("gpt-test", json!("openai-ok"), json!([])))
+                }
+            }),
+        );
+        let (openai_url, openai_server) = spawn_test_upstream(openai_app).await;
+
+        let anthropic_capture = Arc::new(Mutex::new(Vec::<(HeaderMap, Value)>::new()));
+        let anthropic_capture_for_handler = anthropic_capture.clone();
+        let anthropic_app = Router::new().route(
+            "/v1/messages",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let capture = anthropic_capture_for_handler.clone();
+                async move {
+                    capture.lock().unwrap().push((headers, body));
+                    Json(json!({
+                        "id": "msg_matrix",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "content": [{ "type": "text", "text": "anthropic-ok" }],
+                        "stop_reason": "end_turn",
+                        "usage": { "input_tokens": 3, "output_tokens": 1 }
+                    }))
+                }
+            }),
+        );
+        let (anthropic_url, anthropic_server) = spawn_test_upstream(anthropic_app).await;
+
+        let copilot_capture = Arc::new(Mutex::new(Vec::<(HeaderMap, Value)>::new()));
+        let copilot_capture_for_handler = copilot_capture.clone();
+        let copilot_app = Router::new().route(
+            "/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let capture = copilot_capture_for_handler.clone();
+                async move {
+                    capture.lock().unwrap().push((headers, body));
+                    Json(chat_completion(
+                        "copilot-test",
+                        json!("copilot-ok"),
+                        json!([]),
+                    ))
+                }
+            }),
+        );
+        let (copilot_url, copilot_server) = spawn_test_upstream(copilot_app).await;
+
+        let config = Config {
+            default_provider: "openai".to_string(),
+            providers: HashMap::from([
+                (
+                    "openai".to_string(),
+                    UpstreamConfig {
+                        kind: ProviderKind::OpenAi,
+                        base_url: openai_url,
+                        api_key: Some("openai-provider-key".to_string()),
+                        reasoning_effort: Some(ReasoningEffort::High),
+                        ..UpstreamConfig::default()
+                    },
+                ),
+                (
+                    "anthropic".to_string(),
+                    UpstreamConfig {
+                        kind: ProviderKind::Anthropic,
+                        base_url: anthropic_url,
+                        api_key: Some("anthropic-provider-key".to_string()),
+                        reasoning_effort: Some(ReasoningEffort::Max),
+                        ..UpstreamConfig::default()
+                    },
+                ),
+                (
+                    "copilot".to_string(),
+                    UpstreamConfig {
+                        kind: ProviderKind::Copilot,
+                        base_url: copilot_url.trim_end_matches("/v1").to_string(),
+                        api_key: Some("copilot-provider-key".to_string()),
+                        ..UpstreamConfig::default()
+                    },
+                ),
+            ]),
+            ..Config::default()
+        };
+        let shared = SharedState::new(test_state_with_config(config));
+
+        for (provider, model, expected) in [
+            ("openai", "gpt-test", "openai-ok"),
+            ("anthropic", "claude-test", "anthropic-ok"),
+            ("copilot", "copilot-test", "copilot-ok"),
+        ] {
+            for frontend in ["chat", "responses", "anthropic"] {
+                let mut headers = HeaderMap::new();
+                headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer caller-key"));
+                headers.insert("x-api-key", HeaderValue::from_static("caller-key"));
+                let namespaced_model = format!("{provider}/{model}");
+                let response = match frontend {
+                    "chat" => {
+                        chat_completions(
+                            State(shared.clone()),
+                            headers,
+                            Json(json!({
+                                "model": namespaced_model,
+                                "messages": [{ "role": "user", "content": "hello" }]
+                            })),
+                        )
+                        .await
+                    }
+                    "responses" => {
+                        responses(
+                            State(shared.clone()),
+                            headers,
+                            Json(json!({ "model": namespaced_model, "input": "hello" })),
+                        )
+                        .await
+                    }
+                    "anthropic" => {
+                        anthropic_messages(
+                            State(shared.clone()),
+                            headers,
+                            Json(json!({
+                                "model": namespaced_model,
+                                "max_tokens": 64,
+                                "messages": [{ "role": "user", "content": "hello" }]
+                            })),
+                        )
+                        .await
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{frontend} -> {provider}"
+                );
+                assert!(
+                    collect_response_text(response).await.contains(expected),
+                    "{frontend} -> {provider} did not preserve the provider response"
+                );
+            }
+        }
+
+        let openai_requests = openai_capture.lock().unwrap();
+        assert_eq!(openai_requests.len(), 3);
+        assert!(openai_requests.iter().all(|(headers, body)| {
+            headers
+                .get(AUTHORIZATION)
+                .is_some_and(|value| value.as_bytes() == b"Bearer openai-provider-key")
+                && headers.get("x-api-key").is_none()
+                && body["model"] == "gpt-test"
+                && body["reasoning_effort"] == "high"
+        }));
+        let anthropic_requests = anthropic_capture.lock().unwrap();
+        assert_eq!(anthropic_requests.len(), 3);
+        assert!(anthropic_requests.iter().all(|(headers, body)| {
+            headers
+                .get("x-api-key")
+                .is_some_and(|value| value.as_bytes() == b"anthropic-provider-key")
+                && headers.get(AUTHORIZATION).is_none()
+                && headers
+                    .get("anthropic-version")
+                    .is_some_and(|value| value.as_bytes() == b"2023-06-01")
+                && body["model"] == "claude-test"
+                && body["output_config"]["effort"] == "max"
+        }));
+        let copilot_requests = copilot_capture.lock().unwrap();
+        assert_eq!(copilot_requests.len(), 3);
+        assert!(copilot_requests.iter().all(|(headers, body)| {
+            headers
+                .get(AUTHORIZATION)
+                .is_some_and(|value| value.as_bytes() == b"Bearer copilot-provider-key")
+                && headers
+                    .get("copilot-integration-id")
+                    .is_some_and(|value| value.as_bytes() == b"vscode-chat")
+                && body["model"] == "copilot-test"
+        }));
+
+        drop(openai_requests);
+        drop(anthropic_requests);
+        drop(copilot_requests);
+        openai_server.abort();
+        anthropic_server.abort();
+        copilot_server.abort();
+    }
+
+    #[test]
+    fn copilot_claude_models_use_native_messages_wire() {
+        let upstream = UpstreamConfig {
+            kind: ProviderKind::Copilot,
+            ..UpstreamConfig::default()
+        };
+        let provider = build_provider_state("copilot".to_string(), upstream).unwrap();
+        let prepared = prepare_provider_chat_request(
+            &provider,
+            &json!({
+                "model": "claude-sonnet-test",
+                "messages": [{ "role": "user", "content": "hello" }]
+            }),
+        );
+        assert_eq!(prepared.path, "v1/messages");
+        assert!(prepared.anthropic_wire);
+        assert_eq!(prepared.body["messages"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn provider_reasoning_effort_overrides_openai_chat_wire() {
+        let provider = build_provider_state(
+            "openai".to_string(),
+            UpstreamConfig {
+                kind: ProviderKind::OpenAi,
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..UpstreamConfig::default()
+            },
+        )
+        .unwrap();
+        let request = json!({
+            "model": "gpt-test",
+            "reasoning_effort": "low",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+
+        let prepared = prepare_provider_chat_request(&provider, &request);
+
+        assert_eq!(prepared.path, "chat/completions");
+        assert_eq!(prepared.body["reasoning_effort"], "high");
+        assert_eq!(request["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn provider_reasoning_effort_maps_to_anthropic_messages_wire() {
+        let provider = build_provider_state(
+            "anthropic".to_string(),
+            UpstreamConfig {
+                kind: ProviderKind::Anthropic,
+                reasoning_effort: Some(ReasoningEffort::Max),
+                ..UpstreamConfig::default()
+            },
+        )
+        .unwrap();
+
+        let prepared = prepare_provider_chat_request(
+            &provider,
+            &json!({
+                "model": "claude-test",
+                "messages": [{ "role": "user", "content": "hello" }]
+            }),
+        );
+
+        assert_eq!(prepared.path, "messages");
+        assert_eq!(prepared.body["output_config"]["effort"], "max");
+    }
+
+    #[test]
+    fn provider_reasoning_effort_overrides_responses_wire_without_losing_options() {
+        let provider = build_provider_state(
+            "openai".to_string(),
+            UpstreamConfig {
+                kind: ProviderKind::OpenAi,
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..UpstreamConfig::default()
+            },
+        )
+        .unwrap();
+        let mut request = json!({
+            "model": "gpt-test",
+            "reasoning": { "effort": "low", "summary": "auto" },
+            "input": "hello"
+        });
+
+        apply_provider_reasoning_effort(&provider, ReasoningWire::Responses, &mut request);
+
+        assert_eq!(request["reasoning"]["effort"], "high");
+        assert_eq!(request["reasoning"]["summary"], "auto");
+    }
+
+    #[tokio::test]
+    async fn responses_passthrough_enforces_provider_reasoning_effort() {
+        let captured = Arc::new(Mutex::new(None));
+        let capture = captured.clone();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let capture = capture.clone();
+                async move {
+                    *capture.lock().unwrap() = Some(body);
+                    Json(json!({ "id": "resp_test", "object": "response", "output": [] }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_test_upstream(app).await;
+        let config = Config {
+            upstream: UpstreamConfig {
+                kind: ProviderKind::OpenAi,
+                base_url,
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..UpstreamConfig::default()
+            },
+            model_aliases: HashMap::from([(
+                "gpt-test".to_string(),
+                ModelAlias::Model("gpt-test".to_string()),
+            )]),
+            responses: ResponsesConfig {
+                mode: ResponsesMode::Passthrough,
+            },
+            ..Config::default()
+        };
+
+        let response = responses(
+            State(SharedState::new(test_state_with_config(config))),
+            HeaderMap::new(),
+            Json(json!({
+                "model": "gpt-test",
+                "input": "hello",
+                "reasoning": { "effort": "low", "summary": "auto" }
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(request["reasoning"]["effort"], "high");
+        assert_eq!(request["reasoning"]["summary"], "auto");
+        server.abort();
+    }
+
+    #[test]
+    fn native_interceptor_session_does_not_inherit_reasoning_policy() {
+        let state = test_state_with_config(Config {
+            upstream: UpstreamConfig {
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..UpstreamConfig::default()
+            },
+            ..Config::default()
+        });
+        let session = LauncherSession::new(
+            LauncherKind::Codex,
+            "https://example.invalid/v1".to_string(),
+        )
+        .unwrap();
+
+        let session_state = state.with_native_interceptor_session(&session).unwrap();
+
+        assert_eq!(
+            session_state.default_provider().config.reasoning_effort,
+            None
+        );
     }
 
     #[tokio::test]
@@ -7196,6 +10346,30 @@ mod tests {
     }
 
     #[test]
+    fn responses_adapter_preserves_image_inputs() {
+        let chat = responses_to_chat_request(&json!({
+            "model": "test",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "inspect this" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,dGVzdA==", "detail": "high" }
+                ]
+            }]
+        }));
+
+        let content = chat["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,dGVzdA=="
+        );
+        assert_eq!(content[1]["image_url"]["detail"], "high");
+    }
+
+    #[test]
     fn converts_responses_function_tools_to_chat_completion_tools() {
         let value = json!({
             "model": "codex-qwen",
@@ -7285,6 +10459,29 @@ mod tests {
     }
 
     #[test]
+    fn responses_adapter_drops_provider_signed_reasoning_history() {
+        let value = json!({
+            "input": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "provider-signed-state",
+                    "summary": []
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "continue" }]
+                }
+            ]
+        });
+
+        let chat = responses_to_chat_request(&value);
+        assert_eq!(chat["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(chat["messages"][0]["content"], "continue");
+        assert!(!chat.to_string().contains("provider-signed-state"));
+    }
+
+    #[test]
     fn exposes_model_aliases_in_model_list() {
         let upstream = json!({
             "object": "list",
@@ -7305,6 +10502,73 @@ mod tests {
                 .any(|model| model["id"] == "codex-qwen"
                     && model["proxy_target"] == "Qwen/Qwen2.5-Coder-32B-Instruct")
         );
+    }
+
+    #[test]
+    fn exposes_auto_and_integrated_targets_in_model_list() {
+        let mut config = test_config();
+        config.providers.insert(
+            "openai".to_string(),
+            UpstreamConfig {
+                base_url: "https://api.example.test/v1".to_string(),
+                ..UpstreamConfig::default()
+            },
+        );
+        config.integrated.targets.insert(
+            "PROVIDER_OPENAI".to_string(),
+            interceptor::IntegratedTarget {
+                provider: "openai".to_string(),
+                model: "gpt-test".to_string(),
+                hint: "everything else".to_string(),
+                reasoning_effort: None,
+            },
+        );
+        config.integrated.targets.insert(
+            "PROVIDER_MISSING".to_string(),
+            interceptor::IntegratedTarget {
+                provider: "absent".to_string(),
+                model: "ghost".to_string(),
+                hint: "unreachable".to_string(),
+                reasoning_effort: None,
+            },
+        );
+
+        // The provider fetch failed, so no openai models are listed; the
+        // integrated target must still be advertised as a namespaced id.
+        let rewritten = rewrite_models_response(json!({ "object": "list", "data": [] }), &config);
+        let data = rewritten["data"].as_array().unwrap().clone();
+        let auto = data
+            .iter()
+            .find(|model| model["id"] == INTEGRATED_AUTO_MODEL)
+            .expect("Auto routing model listed");
+        assert_eq!(auto["proxy_route"], "integrated");
+        let entry = data
+            .iter()
+            .find(|model| model["id"] == "openai/gpt-test")
+            .expect("integrated target listed");
+        assert_eq!(entry["proxy_route"], "namespaced");
+        assert!(entry.get("proxy_tool").is_none());
+        assert_eq!(entry["proxy_provider"], "openai");
+        assert!(!data.iter().any(|model| model["id"] == "absent/ghost"));
+
+        // A listed upstream model that a target routes to is not duplicated.
+        let listed = json!({
+            "object": "list",
+            "data": [{
+                "id": "openai/gpt-test",
+                "object": "model",
+                "proxy_provider": "openai"
+            }]
+        });
+        let rewritten = rewrite_models_response(listed, &config);
+        let data = rewritten["data"].as_array().unwrap();
+        assert_eq!(
+            data.iter()
+                .filter(|model| model["id"] == "openai/gpt-test")
+                .count(),
+            1
+        );
+        assert!(data[0].get("proxy_tool").is_none());
     }
 
     #[test]
@@ -7460,14 +10724,41 @@ mod tests {
         assert_eq!(chat["messages"][0]["role"], "system");
         assert_eq!(chat["messages"][0]["content"], "You are concise.");
         assert_eq!(chat["messages"][1]["role"], "user");
-        assert!(
-            chat["messages"][1]["content"]
-                .as_str()
-                .unwrap()
-                .contains("[tool_result toolu_1]")
-        );
+        assert_eq!(chat["messages"][1]["content"], "Run ls");
+        assert_eq!(chat["messages"][2]["role"], "tool");
+        assert_eq!(chat["messages"][2]["tool_call_id"], "toolu_1");
+        assert_eq!(chat["messages"][2]["content"], "ok");
         assert_eq!(chat["tools"][0]["function"]["name"], "Bash");
         assert_eq!(chat["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn anthropic_adapter_preserves_base64_image_inputs() {
+        let chat = anthropic_message_to_chat_request(&json!({
+            "model": "test",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "inspect this" },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "dGVzdA=="
+                        }
+                    }
+                ]
+            }]
+        }));
+
+        let content = chat["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,dGVzdA=="
+        );
     }
 
     #[test]

@@ -30,30 +30,53 @@ Responses, Anthropic Messages, and native agent launcher traffic.
 
 ```text
 agent request -> separate local interceptor request -> local response
-                                               \-> PASS -> original external request
+                                               \-> PASS -> original external request (intercept)
+                                               \-> Auto + ROUTE_DEFAULT -> normal configured routing
+                                               \-> Auto + configured route -> provider/model
 ```
 
-- The interceptor receives a separate dynamic request with compatible tools
-  and a zero-argument `PASS` function. It must never mutate the external copy.
-- `PASS` is valid only as the sole tool call or exact text output. Mixed output
-  is invalid.
+- The triage model receives a separate dynamic request with compatible tools.
+  Model `Auto` enables integrated `ROUTE_DEFAULT` and configured route tools.
+  Other models bypass integrated triage; they receive `PASS` only when the
+  standalone interceptor is enabled. The local copy must never mutate the
+  external copy.
+- Routing controls are valid only as the sole tool call or exact text output.
+  Mixed output is invalid. Integrated mode accepts legacy `PASS` output but
+  does not advertise it.
 - Caller authentication, account headers, and external credentials must never
   reach the local provider.
 - Accepted local output is rendered in the caller's native protocol. Buffered
-  speculation and `PASS` must never appear in the conversation.
+  speculation and routing controls must never appear in the conversation.
 - Timeout or local failure follows `interceptor.fallback_on_error`.
-- Codex control requests, including compaction triggers and non-turn request
-  kinds, bypass local execution because they require native response items.
+- Integrated launcher routes, including explicit-model and `ROUTE_DEFAULT`
+  traffic, strip caller credentials; every external destination must have a
+  proxy-owned credential.
+- Codex control requests bypass interceptor/integrated local execution because
+  they require native response items. Pure proxy sessions relay them directly
+  to the default provider with only model remapping.
 
 ## Normal Routing
 
 Without a launcher, preserve these rules:
 
 - Explicit model aliases win.
+- A recognized `provider/model` namespace selects that provider and strips only
+  the first prefix. It bypasses integrated triage; standalone interception may
+  still perform its independent `PASS` check.
 - Otherwise the first upstream model is selected and cached.
+- In integrated sessions, a non-`Auto` model that is not an alias or namespace
+  is preserved on the default provider. It is locally checked only when the
+  standalone interceptor is also enabled.
 - Alias-covered requests skip model discovery.
 - Provider selection, role rewriting, and protocol adapters remain active.
+- A configured provider `reasoning_effort` is an enforced outbound policy:
+  Chat Completions uses `reasoning_effort`, Responses uses `reasoning.effort`,
+  and Anthropic Messages uses `output_config.effort`.
+- An integrated target's `reasoning_effort` overrides its provider default and
+  is included in the dynamic routing prompt and admin route editor.
 - `--intercept` alone keeps normal external remapping after `PASS`.
+- Provider `kind` selects OpenAI-compatible, OpenAI, Anthropic, or Copilot
+  upstream adaptation. OpenAI Chat Completions remains the canonical format.
 
 ## Upstream And Streaming
 
@@ -68,10 +91,18 @@ Without a launcher, preserve these rules:
   complete SSE body.
 - Convert stream body failures into native protocol error events rather than
   closing sockets abruptly.
+- Anthropic upstream Messages and typed SSE translate through the canonical
+  chat pipeline. Copilot Claude models use its native `/v1/messages` wire.
+- Signed reasoning/thinking artifacts are removed when crossing providers;
+  tool-call and tool-result ids remain paired.
 - Client-facing protocol changes require wire-level streaming coverage.
 
 ## Launchers
 
+- `--proxy --codex|--claude|--copilot` is a tokenized pure-adapter session. It
+  disables interceptor and integrated routing, clears aliases and non-default
+  providers, strips caller credentials, and remaps every generation request to
+  the configured default provider. It adds no system prompt or control tools.
 - `--intercept --codex` uses native OpenAI Responses passthrough and preserves
   Codex models and request metadata only for its tokenized launcher session.
 - `--intercept --claude` uses native Anthropic Messages passthrough and
@@ -80,8 +111,15 @@ Without a launcher, preserve these rules:
   Completions, Responses, and Anthropic-wire requests. GitHub MCP and remote
   sessions stay external; provider-specific BYOK variables must not bypass the
   launcher.
-- Each agent owns credential loading and refresh. Caller-generated credentials
-  are accepted only on loopback and forwarded only to the external provider.
+- `--integrated` launchers use tokenized sessions over the protocol adapters
+  and default their wire model to `Auto` unless the user selected a model.
+  Copilot uses its documented BYOK Responses surface; GitHub MCP and remote
+  sessions remain external.
+- `--codex`, `--claude`, or `--copilot` without a mode defaults to integrated;
+  `--proxy`, `--intercept`, and `--integrated` remain explicit overrides.
+- Native interceptor sessions leave credential loading and refresh with the
+  matching agent. Proxy and integrated sessions do not require agent login and
+  never forward caller-generated credentials.
 - Launcher modes are mutually exclusive, loopback-only, and protected against
   upstream loops.
 - Interactive launchers resume only when their native session behavior permits;
@@ -92,7 +130,16 @@ Without a launcher, preserve these rules:
 - Normal startup creates or reuses the managed background daemon.
 - `--restart` replaces it and `--shutdown` stops it.
 - The daemon publishes credential-free runtime metadata after the proxy and
-  optional admin listeners bind. Startup prints the exact proxy and admin URLs.
+  optional admin listeners bind. Startup prints the exact proxy, admin, and log
+  locations.
+- Each server instance writes full request/response TRACE events through a
+  bounded asynchronous timestamped file writer under the llmproxy state
+  directory. Backpressure preserves diagnostics instead of dropping them. HTTP
+  failures, response-stream failures, and timeouts are ERROR events. Never log
+  credential headers. Log files are owner-only. Startup removes only matching
+  log files older than `max_logging_retention_days`; zero disables cleanup.
+- Proxy, interceptor, and integrated launcher sessions can safely share one
+  daemon because routing mode is encoded in each loopback-only session token.
 - The admin interface is unauthenticated and must remain loopback-only.
 - Runtime config updates must validate and build replacement providers before
   atomically swapping shared state; persist edits without discarding comments.
@@ -101,13 +148,20 @@ Without a launcher, preserve these rules:
 
 - `src/main.rs`: CLI, daemon lifecycle, routes, upstream pipeline, adapters,
   launcher sessions, and startup output.
-- `src/interceptor.rs`: local request construction, `PASS`, failure policy, and
-  local response rendering.
+- `src/backend_adapters.rs`: provider-facing Anthropic and Copilot adapters and
+  cross-provider history sanitization.
+- `src/interceptor.rs`: local request construction, routing controls, failure
+  policy, and local response rendering.
+- `src/logging.rs`: bounded asynchronous trace file setup, timestamp naming,
+  and retention cleanup.
 - `src/agent_launcher.rs`: shared launcher selection and lifecycle.
 - `src/*_launcher.rs`: agent-specific discovery and environment injection.
 - `src/admin.rs`: loopback admin API, UI serving, and runtime config swaps.
-- `src/stats.rs`: request classification, latency, usage, and traffic logs.
-- `ui/`: admin interface assets.
+- `src/stats.rs`: request classification, latency, attempted frontend/provider/
+  model routes, completed token and cumulative-time usage, and traffic logs.
+- `ui/`: task-oriented admin interface organized as Overview, Activity,
+  Routing, Models, Providers, and Settings; Activity and Routing use focused
+  secondary views instead of long mixed-purpose pages.
 - `llmproxy.example.toml`: public credential-free configuration reference.
 
 ## Editing And Verification

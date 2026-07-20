@@ -7,6 +7,7 @@ use super::*;
 #[test]
 fn latency_percentiles_use_nearest_rank() {
     let window = LatencyWindow::default();
+    assert_eq!(window.percentiles(), (None, None, 0));
     for ms in 1..=100u64 {
         window.record(Duration::from_millis(ms));
     }
@@ -27,9 +28,13 @@ fn latency_window_is_bounded() {
 }
 
 #[test]
-fn empty_latency_window_has_no_percentiles() {
-    let window = LatencyWindow::default();
-    assert_eq!(window.percentiles(), (None, None, 0));
+fn provider_call_window_is_bounded_but_count_is_not() {
+    let mut calls = ProviderCalls::default();
+    for _ in 0..(PROVIDER_LATENCY_CAP + 10) {
+        calls.record(Duration::from_millis(5));
+    }
+    assert_eq!(calls.count as usize, PROVIDER_LATENCY_CAP + 10);
+    assert_eq!(calls.latency.percentiles().2, PROVIDER_LATENCY_CAP);
 }
 
 #[test]
@@ -88,7 +93,14 @@ fn sniffer_reads_usage_from_buffered_json() {
     sniffer.feed(
         br#"{"id":"x","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":100,"completion_tokens":25}}"#,
     );
-    assert_eq!(sniffer.finish(), (100, 25, false));
+    assert_eq!(
+        sniffer.finish(1, true),
+        TokenUsage {
+            input_tokens: 100,
+            output_tokens: 25,
+            estimated: false,
+        }
+    );
 }
 
 #[test]
@@ -99,17 +111,42 @@ fn sniffer_skips_null_usage_in_stream_chunks() {
         b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
     );
     sniffer.feed(b"data: [DONE]\n\n");
-    assert_eq!(sniffer.finish(), (7, 3, false));
+    assert_eq!(
+        sniffer.finish(1, true),
+        TokenUsage {
+            input_tokens: 7,
+            output_tokens: 3,
+            estimated: false,
+        }
+    );
 }
 
 #[test]
 fn sniffer_estimates_when_usage_is_missing() {
     let mut sniffer = UsageSniffer::new(false);
     sniffer.feed(&[b'x'; 400]);
-    let (prompt, completion, estimated) = sniffer.finish();
-    assert_eq!(prompt, 0);
-    assert_eq!(completion, 100);
-    assert!(estimated);
+    assert_eq!(
+        sniffer.finish(33, true),
+        TokenUsage {
+            input_tokens: 33,
+            output_tokens: 100,
+            estimated: true,
+        }
+    );
+}
+
+#[test]
+fn sniffer_does_not_invent_embedding_output_tokens() {
+    let mut sniffer = UsageSniffer::new(false);
+    sniffer.feed(br#"{"usage":{"prompt_tokens":12,"total_tokens":12},"data":[[1,2,3]]}"#);
+    assert_eq!(
+        sniffer.finish(1, false),
+        TokenUsage {
+            input_tokens: 12,
+            output_tokens: 0,
+            estimated: true,
+        }
+    );
 }
 
 #[test]
@@ -119,7 +156,29 @@ fn sniffer_survives_usage_split_across_tail_boundary() {
     // still contain the complete usage object.
     sniffer.feed(&vec![b'p'; SNIFFER_TAIL_CAP + 512]);
     sniffer.feed(b"data: {\"usage\":{\"input_tokens\":11,\"output_tokens\":22}}\n\n");
-    assert_eq!(sniffer.finish(), (11, 22, false));
+    assert_eq!(
+        sniffer.finish(1, true),
+        TokenUsage {
+            input_tokens: 11,
+            output_tokens: 22,
+            estimated: false,
+        }
+    );
+}
+
+#[test]
+fn sniffer_combines_anthropic_stream_usage_events() {
+    let mut sniffer = UsageSniffer::new(true);
+    sniffer.feed(b"data: {\"usage\":{\"input_tokens\":17}}\n\n");
+    sniffer.feed(b"data: {\"usage\":{\"output_tokens\":8}}\n\n");
+    assert_eq!(
+        sniffer.finish(1, true),
+        TokenUsage {
+            input_tokens: 17,
+            output_tokens: 8,
+            estimated: false,
+        }
+    );
 }
 
 #[test]
@@ -135,30 +194,96 @@ fn stats_counters_and_snapshot_shape() {
     stats.touch_start();
     stats.record_request();
     stats.record_remap(RemapKind::Alias);
+    stats.record_remap(RemapKind::Namespace);
     stats.record_remap(RemapKind::Auto);
     stats.record_intercept_attempt();
     stats.record_intercept_bypass();
-    stats.record_intercept_local(
-        Duration::from_millis(120),
+    let local_usage = TokenUsage::from_response(
         Some(&json!({ "prompt_tokens": 10, "completion_tokens": 5 })),
+        1,
+        1,
+    );
+    stats.record_model_usage(
+        "local",
+        "triage-model",
+        Duration::from_millis(100),
+        local_usage,
+    );
+    stats.record_intercept_local(
+        "local",
+        "responses",
+        Duration::from_millis(120),
+        local_usage,
     );
     stats.record_intercept_pass();
+    stats.record_intercept_redirect("PROVIDER_TEST");
     stats.record_intercept_fallback();
-    stats.record_served(RouteClass::External, Duration::from_millis(900));
+    stats.record_served(
+        RouteClass::External,
+        "openai",
+        "responses",
+        Duration::from_millis(900),
+    );
+    stats.record_model_usage(
+        "openai",
+        "gpt-test",
+        Duration::from_millis(800),
+        TokenUsage {
+            input_tokens: 20,
+            output_tokens: 30,
+            estimated: false,
+        },
+    );
+    stats.record_routing_destination("responses", "openai", "gpt-test", false);
+    stats.record_routing_destination("responses", "openai", "gpt-test", true);
     stats.record_tokens_saved(0, 50, true);
 
     let snapshot = stats.snapshot_json();
     assert_eq!(snapshot["requests"]["total"], 1);
-    assert_eq!(snapshot["requests"]["remapped"], 2);
+    assert_eq!(snapshot["requests"]["remapped"], 3);
+    assert_eq!(snapshot["requests"]["remap_namespace"], 1);
     assert_eq!(snapshot["intercept"]["attempts"], 1);
     assert_eq!(snapshot["intercept"]["bypass"], 1);
     assert_eq!(snapshot["intercept"]["local"], 1);
     assert_eq!(snapshot["intercept"]["pass"], 1);
+    assert_eq!(snapshot["intercept"]["redirect"], 1);
+    assert_eq!(snapshot["intercept"]["redirects"]["PROVIDER_TEST"], 1);
     assert_eq!(snapshot["intercept"]["fallback"], 1);
     assert_eq!(snapshot["served"]["local"], 1);
     assert_eq!(snapshot["served"]["external"], 1);
+    assert_eq!(snapshot["served"]["providers"]["local"]["count"], 1);
+    assert_eq!(snapshot["served"]["providers"]["openai"]["count"], 1);
+    assert_eq!(snapshot["served"]["providers"]["openai"]["p50_ms"], 900);
+    assert_eq!(snapshot["served"]["providers"]["openai"]["p99_ms"], 900);
+    assert_eq!(snapshot["served"]["providers"]["openai"]["samples"], 1);
+    assert_eq!(snapshot["served"]["matrix"]["responses"]["openai"], 1);
+    assert_eq!(
+        snapshot["served"]["destinations"][0]["frontend"],
+        "responses"
+    );
+    assert_eq!(snapshot["served"]["destinations"][0]["provider"], "openai");
+    assert_eq!(snapshot["served"]["destinations"][0]["model"], "gpt-test");
+    assert_eq!(snapshot["served"]["destinations"][0]["requests"], 2);
+    assert_eq!(snapshot["served"]["destinations"][0]["errors"], 1);
     assert_eq!(snapshot["latency"]["local"]["p50_ms"], 120);
     assert_eq!(snapshot["latency"]["external"]["p99_ms"], 900);
+    let models = snapshot["model_usage"].as_array().unwrap();
+    let local_model = models
+        .iter()
+        .find(|entry| entry["provider"] == "local")
+        .unwrap();
+    assert_eq!(local_model["model"], "triage-model");
+    assert_eq!(local_model["requests"], 1);
+    assert_eq!(local_model["input_tokens"], 10);
+    assert_eq!(local_model["output_tokens"], 5);
+    assert_eq!(local_model["total_time_ms"], 100);
+    let external_model = models
+        .iter()
+        .find(|entry| entry["provider"] == "openai")
+        .unwrap();
+    assert_eq!(external_model["model"], "gpt-test");
+    assert_eq!(external_model["total_tokens"], 50);
+    assert_eq!(external_model["total_time_ms"], 800);
     assert_eq!(snapshot["tokens_saved"]["prompt"], 10);
     assert_eq!(snapshot["tokens_saved"]["completion"], 55);
     assert_eq!(snapshot["tokens_saved"]["total"], 65);
@@ -170,21 +295,39 @@ fn stats_counters_and_snapshot_shape() {
     assert_eq!(snapshot["intercept"]["bypass"], 0);
     assert_eq!(snapshot["served"]["local"], 0);
     assert_eq!(snapshot["latency"]["local"]["samples"], 0);
+    assert!(snapshot["model_usage"].as_array().unwrap().is_empty());
+    assert!(
+        snapshot["served"]["destinations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
 fn traffic_log_records_only_when_enabled() {
     let log = TrafficLog::default();
-    log.record(RouteClass::Local, LogDirection::Request, "ignored".into());
+    log.record(
+        RouteClass::Local,
+        "local",
+        LogDirection::Request,
+        "ignored".into(),
+    );
     assert_eq!(
         log.snapshot_after(0)["entries"].as_array().unwrap().len(),
         0
     );
 
     log.set_enabled(true);
-    log.record(RouteClass::Local, LogDirection::Request, "req body".into());
+    log.record(
+        RouteClass::Local,
+        "local",
+        LogDirection::Request,
+        "req body".into(),
+    );
     log.record(
         RouteClass::External,
+        "openai",
         LogDirection::Response,
         "rsp body".into(),
     );
@@ -192,6 +335,7 @@ fn traffic_log_records_only_when_enabled() {
     let entries = snapshot["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0]["class"], "local");
+    assert_eq!(entries[0]["provider"], "local");
     assert_eq!(entries[0]["dir"], "req");
     assert_eq!(entries[0]["text"], "req body");
     assert_eq!(entries[1]["class"], "external");
@@ -203,11 +347,21 @@ fn traffic_log_records_only_when_enabled() {
 fn traffic_log_snapshot_is_incremental_and_clearable() {
     let log = TrafficLog::default();
     log.set_enabled(true);
-    log.record(RouteClass::Local, LogDirection::Request, "one".into());
+    log.record(
+        RouteClass::Local,
+        "local",
+        LogDirection::Request,
+        "one".into(),
+    );
     let first = log.snapshot_after(0);
     let latest = first["latest_id"].as_u64().unwrap();
 
-    log.record(RouteClass::Local, LogDirection::Response, "two".into());
+    log.record(
+        RouteClass::Local,
+        "local",
+        LogDirection::Response,
+        "two".into(),
+    );
     let update = log.snapshot_after(latest);
     let entries = update["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
@@ -225,39 +379,17 @@ fn traffic_log_is_bounded() {
     let log = TrafficLog::default();
     log.set_enabled(true);
     for index in 0..(TRAFFIC_LOG_CAP + 25) {
-        log.record(RouteClass::Local, LogDirection::Request, index.to_string());
+        log.record(
+            RouteClass::Local,
+            "local",
+            LogDirection::Request,
+            index.to_string(),
+        );
     }
     let snapshot = log.snapshot_after(0);
     let entries = snapshot["entries"].as_array().unwrap();
     assert_eq!(entries.len(), TRAFFIC_LOG_CAP);
-    assert_eq!(entries[0]["text"], "25"); // oldest 25 dropped
-}
-
-#[test]
-fn traffic_log_prunes_expired_entries() {
-    let mut entries = VecDeque::new();
-    entries.push_back(TrafficLogEntry {
-        id: 1,
-        epoch_ms: 0,
-        recorded_at: Instant::now(),
-        class: RouteClass::Local,
-        direction: LogDirection::Request,
-        preview: "old".into(),
-    });
-    std::thread::sleep(Duration::from_millis(3));
-    TrafficLog::prune(&mut entries, Duration::from_millis(1));
-    assert!(entries.is_empty());
-
-    entries.push_back(TrafficLogEntry {
-        id: 2,
-        epoch_ms: 0,
-        recorded_at: Instant::now(),
-        class: RouteClass::Local,
-        direction: LogDirection::Request,
-        preview: "fresh".into(),
-    });
-    TrafficLog::prune(&mut entries, Duration::from_secs(60));
-    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["text"], "25");
 }
 
 #[test]
@@ -266,7 +398,7 @@ fn previews_are_single_line_and_truncated_to_the_budget() {
     assert_eq!(flattened, "line one line two tabbed");
 
     let long = flatten_preview("x".repeat(TRAFFIC_PREVIEW_CHARS * 3));
-    assert_eq!(long.chars().count(), TRAFFIC_PREVIEW_CHARS + 1); // budget + ellipsis
+    assert_eq!(long.chars().count(), TRAFFIC_PREVIEW_CHARS + 1);
     assert!(long.ends_with('…'));
 
     let short = json_preview(&json!({ "model": "gpt-x" }));
@@ -276,7 +408,6 @@ fn previews_are_single_line_and_truncated_to_the_budget() {
         &json!({ "model": "gpt-x", "content": "y".repeat(TRAFFIC_PREVIEW_CHARS * 3) }),
     );
     assert_eq!(big.chars().count(), TRAFFIC_PREVIEW_CHARS + 1);
-    // serde_json serializes keys sorted, so "content" leads.
     assert!(big.starts_with(r#"{"content":"yyy"#), "got: {big}");
     assert!(big.ends_with('…'));
 }

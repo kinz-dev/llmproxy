@@ -1,28 +1,19 @@
 use super::*;
 
 #[test]
-fn missing_listen_address_uses_loopback_random_port() {
-    let admin = AdminConfig::default();
-    assert_eq!(listen_address(&admin), "127.0.0.1:0");
-    let admin = AdminConfig {
-        listen_address: Some("127.0.0.1:11180".to_string()),
-        ..AdminConfig::default()
-    };
-    assert_eq!(listen_address(&admin), "127.0.0.1:11180");
-}
-
-#[test]
 fn admin_config_defaults_to_disabled() {
     let config: Config = toml::from_str("").unwrap();
     assert!(!config.admin.enable);
     assert!(config.admin.listen_address.is_none());
+    assert_eq!(listen_address(&config.admin), "127.0.0.1:0");
 
     let config: Config = toml::from_str("[admin]\nenable = true\n").unwrap();
     assert!(config.admin.enable);
 
-    // `enabled` is accepted as an alias.
-    let config: Config = toml::from_str("[admin]\nenabled = true\n").unwrap();
+    let config: Config =
+        toml::from_str("[admin]\nenabled = true\nlisten_address = \"127.0.0.1:11180\"\n").unwrap();
     assert!(config.admin.enable);
+    assert_eq!(listen_address(&config.admin), "127.0.0.1:11180");
 }
 
 #[test]
@@ -36,7 +27,6 @@ fn non_loopback_admin_listen_address_is_rejected() {
         toml::from_str("[admin]\nenable = true\nlisten_address = \"127.0.0.1:11180\"\n").unwrap();
     validate_config(&config).unwrap();
 
-    // A non-loopback address is fine while the admin interface stays disabled.
     let config: Config = toml::from_str("[admin]\nlisten_address = \"0.0.0.0:11180\"\n").unwrap();
     validate_config(&config).unwrap();
 }
@@ -90,7 +80,6 @@ fn alias_doc_edits_preserve_comments() {
     assert!(rendered.contains("\"gpt-5.5\" = \"Qwen/Qwen3-32B\""));
     assert!(rendered.contains("provider = \"embeddings\""));
 
-    // Round-trips into a valid config with both alias forms.
     let config: Config = toml::from_str(&rendered).unwrap();
     assert_eq!(
         config.model_aliases.get("gpt-5.5"),
@@ -127,18 +116,25 @@ fn provider_put_body_merges_only_provided_fields() {
         ..crate::UpstreamConfig::default()
     };
     let body = ProviderPutBody {
+        kind: None,
         base_url: Some("http://127.0.0.1:9000/v1 ".to_string()),
+        auth: None,
         api_key: None,
         api_key_env: Some(String::new()),
+        reasoning_effort: Some("high".to_string()),
         timeout_secs: Some(120),
         connect_timeout_secs: None,
         pool_max_idle_per_host: None,
         pool_idle_timeout_secs: None,
     };
-    body.apply(&mut upstream);
+    body.apply(&mut upstream).unwrap();
     assert_eq!(upstream.base_url, "http://127.0.0.1:9000/v1");
     assert_eq!(upstream.api_key.as_deref(), Some("placeholder")); // kept
     assert_eq!(upstream.api_key_env, None); // cleared
+    assert_eq!(
+        upstream.reasoning_effort,
+        Some(crate::ReasoningEffort::High)
+    );
     assert_eq!(upstream.timeout_secs, 120);
     assert_eq!(
         upstream.connect_timeout_secs,
@@ -150,9 +146,12 @@ fn provider_put_body_merges_only_provided_fields() {
 fn provider_doc_edit_writes_section_style_tables() {
     let mut doc: DocumentMut = "listen_addr = \"127.0.0.1:4000\"\n".parse().unwrap();
     let body = ProviderPutBody {
+        kind: None,
         base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+        auth: None,
         api_key: None,
         api_key_env: Some("LOCAL_KEY".to_string()),
+        reasoning_effort: Some("max".to_string()),
         timeout_secs: Some(30),
         connect_timeout_secs: Some(2),
         pool_max_idle_per_host: None,
@@ -177,5 +176,48 @@ fn provider_doc_edit_writes_section_style_tables() {
     let provider = &config.providers["local_interceptor"];
     assert_eq!(provider.base_url, "http://127.0.0.1:11434/v1");
     assert_eq!(provider.api_key_env.as_deref(), Some("LOCAL_KEY"));
+    assert_eq!(provider.reasoning_effort, Some(crate::ReasoningEffort::Max));
     assert_eq!(provider.timeout_secs, 30);
+}
+
+#[test]
+fn integrated_doc_edit_writes_valid_target_tables() {
+    let mut doc: DocumentMut =
+        "# keep\n[interceptor]\nmodel = \"triage\"\n[integrated]\nrespect_explicit_model = false\n"
+            .parse()
+            .unwrap();
+    let body = IntegratedPutBody {
+        enabled: Some(true),
+        sticky_ttl_secs: Some(900),
+        sticky_capacity: Some(64),
+        instructions: Some("Route GUI work to the visual provider.".to_string()),
+        targets: Some(BTreeMap::from([(
+            "backend".to_string(),
+            IntegratedTarget {
+                provider: "openai".to_string(),
+                model: "gpt-test".to_string(),
+                hint: "tool-heavy work".to_string(),
+                reasoning_effort: Some(crate::ReasoningEffort::Max),
+            },
+        )])),
+    };
+    body.apply_to_doc(&mut doc).unwrap();
+
+    let rendered = doc.to_string();
+    assert!(rendered.contains("# keep"));
+    assert!(!rendered.contains("respect_explicit_model"));
+    assert!(rendered.contains("[integrated.targets.backend]"));
+    assert!(rendered.contains("reasoning_effort = \"max\""));
+    let config: Config = toml::from_str(&rendered).unwrap();
+    assert!(!config.interceptor.enabled);
+    assert!(config.integrated.enabled);
+    assert_eq!(config.integrated.targets["backend"].provider, "openai");
+    assert_eq!(
+        config.integrated.targets["backend"].reasoning_effort,
+        Some(crate::ReasoningEffort::Max)
+    );
+    assert_eq!(
+        config.integrated.instructions,
+        "Route GUI work to the visual provider."
+    );
 }

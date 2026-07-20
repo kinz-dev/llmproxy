@@ -1,4 +1,6 @@
 listen_addr = "127.0.0.1:8080"
+# Timestamped trace logs are written under ~/.llmproxy. Set 0 to retain them indefinitely.
+max_logging_retention_days = 7
 
 # Optional loopback-only admin web interface (monitoring + runtime config
 # editing). Disabled unless enable = true. Omitting listen_address binds
@@ -8,17 +10,21 @@ listen_addr = "127.0.0.1:8080"
 [admin]
 enable = false
 # listen_address = "127.0.0.1:11180"
-# ui_dir = "/path/to/llmproxy/ui"
 
 [upstream]
+kind = "openai-compatible"
 base_url = "http://127.0.0.1:8000/v1"
 # api_key_env = "VLLM_API_KEY"
+# Force the outbound value after routing. "high" is the portable choice;
+# use "max" only when every model routed here supports it.
+# reasoning_effort = "high"
 timeout_secs = 600
 connect_timeout_secs = 10
 pool_max_idle_per_host = 64
 pool_idle_timeout_secs = 90
 
 [providers.embeddings]
+kind = "openai-compatible"
 base_url = "http://127.0.0.1:18000/v1"
 timeout_secs = 600
 connect_timeout_secs = 10
@@ -30,6 +36,7 @@ pool_idle_timeout_secs = 90
 # A normal completion is returned to the client; a sole PASS function call sends
 # the untouched original request through the existing provider/model remapping.
 [providers.local_interceptor]
+kind = "openai-compatible"
 base_url = "http://127.0.0.1:11434/v1"
 # api_key_env = "LOCAL_LLM_API_KEY"
 timeout_secs = 30
@@ -50,13 +57,94 @@ fallback_on_error = true
 # max_tokens = 512
 # parallel_tool_calls = false
 # instructions = """Override the default local routing instructions here."""
-# Launch Codex or Claude with this block enabled only for the child process:
+# Native launchers borrow only the matching CLI provider login:
 # llmproxy --config llmproxy.example.toml --intercept --codex
 # llmproxy --config llmproxy.example.toml --intercept --claude
+# llmproxy --config llmproxy.example.toml --intercept --copilot
+# Pure proxy launchers skip interception and use only the default provider:
+# llmproxy --config llmproxy.example.toml --proxy --codex
+# llmproxy --config llmproxy.example.toml --proxy --claude
+# llmproxy --config llmproxy.example.toml --proxy --copilot
+
+# Provider kinds select the upstream wire protocol and authentication shape.
+# Cross-provider routes require an explicit proxy-owned API credential, OR a
+# borrowed CLI login via auth = "codex-oauth"/"claude-oauth" (see below). These
+# examples stay commented so this file starts without contacting external APIs.
+# [providers.openai]
+# kind = "openai"
+# base_url = "https://api.openai.com/v1"
+# api_key_env = "OPENAI_API_KEY"
+# reasoning_effort = "high"
+#
+# [providers.anthropic]
+# kind = "anthropic"
+# base_url = "https://api.anthropic.com/v1"
+# api_key_env = "ANTHROPIC_API_KEY"
+# reasoning_effort = "high"
+#
+# [providers.copilot]
+# kind = "copilot"
+# base_url = "https://api.githubcopilot.com"
+# api_key_env = "COPILOT_BACKEND_TOKEN"
+
+# Borrowed subscription OAuth: instead of a proxy-owned API key, reuse the login
+# the official CLI already wrote to disk. llmproxy reads the token, refreshes it
+# against the vendor endpoint when near expiry, and writes the rotated token back
+# so the CLI keeps working. No key, no per-token billing — it uses your plan.
+#
+# codex-oauth borrows ~/.codex/auth.json (run `codex login` first) and speaks the
+# ChatGPT Codex Responses backend; base_url MUST be the Codex backend, not
+# api.openai.com. claude-oauth borrows ~/.claude/.credentials.json and presents
+# requests as Claude Code so the subscription token is accepted.
+# [providers.codex_sub]
+# kind = "openai"
+# auth = "codex-oauth"
+# base_url = "https://chatgpt.com/backend-api/codex"
+# reasoning_effort = "high"
+#
+# [providers.claude_sub]
+# kind = "anthropic"
+# auth = "claude-oauth"
+# base_url = "https://api.anthropic.com/v1"
+# reasoning_effort = "high"
+
+# Integrated mode is selected per request with model "Auto". The local triager
+# then receives ROUTE_DEFAULT plus the zero-argument route tools below. Any
+# other model bypasses integrated triage; standalone interception can still be
+# enabled independently. Unmatched model IDs stay unchanged on the default
+# provider. Redirects are sticky per hashed conversation key for the configured
+# TTL; no message or session text is kept.
+[integrated]
+enabled = true
+sticky_ttl_secs = 1800
+sticky_capacity = 1024
+# instructions = """Override the integrated routing policy here; empty uses the built-in default."""
+#
+[integrated.targets.PROVIDER_DEFAULT]
+provider = "default"
+model = "Qwen/Qwen2.5-Coder-32B-Instruct"
+hint = "all non-routine work not claimed by a more specific route (default route)"
+
+# [integrated.targets.backend]
+# provider = "openai"
+# model = "gpt-5.4"
+# reasoning_effort = "max" # overrides the provider default for this target
+# hint = "server-side and backend work, deep exploration and debugging, and everything else not claimed by another route (default route)"
+#
+# [integrated.targets.frontend]
+# provider = "anthropic"
+# model = "claude-sonnet-4-5"
+# hint = "GUI and frontend work: interface design, visual investigation, and UI implementation"
+#
+# [integrated.targets.routine]
+# provider = "copilot"
+# model = "gpt-5.4"
+# hint = "routine external work assigned to the Copilot backend"
 
 # Optional manual overrides. Without these, every incoming model is mapped to
 # the first id returned by the default upstream /v1/models. Inline route tables
-# select both a named provider and its upstream model.
+# select both a named provider and its upstream model. Any configured provider
+# can also be selected dynamically as provider/model without declaring an alias.
 [model_aliases]
 # codex-qwen = "Qwen/Qwen2.5-Coder-32B-Instruct"
 # claude-sonnet = "Qwen/Qwen2.5-Coder-32B-Instruct"

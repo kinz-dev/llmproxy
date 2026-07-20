@@ -141,7 +141,10 @@ fn reads_openai_base_url_from_codex_config_shapes() {
 
 #[test]
 fn provider_override_leaves_authentication_to_codex() {
-    let provider = codex_provider_override("http://127.0.0.1:8080/v1");
+    let provider = codex_provider_override("http://127.0.0.1:8080/v1", true);
     assert!(!provider.contains("env_key"));
     assert!(provider.contains("requires_openai_auth = true"));
+
+    let provider = codex_provider_override("http://127.0.0.1:8080/v1", false);
+    assert!(provider.contains("requires_openai_auth = false"));
 }

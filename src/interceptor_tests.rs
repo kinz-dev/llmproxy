@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::http::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
+use super::{IntegratedConfig, IntegratedTarget, classify_completion_with_targets};
 use crate::Config;
+use crate::INTEGRATED_AUTO_MODEL;
 use crate::interceptor::CompletionDecision;
 use crate::interceptor::InterceptionPolicy;
 use crate::interceptor::InterceptorConfig;
@@ -80,7 +82,7 @@ fn ordinary_responses_remain_eligible_for_local_interception() {
 }
 
 #[test]
-fn pass_must_be_the_only_local_output() {
+fn default_route_control_must_be_the_only_local_output() {
     let pass = json!({
         "choices": [{
             "message": {
@@ -93,7 +95,15 @@ fn pass_must_be_the_only_local_output() {
             }
         }]
     });
-    assert_eq!(classify_completion(&pass), CompletionDecision::Pass);
+    assert_eq!(classify_completion(&pass), CompletionDecision::DefaultRoute);
+
+    let mut route_default = pass.clone();
+    route_default["choices"][0]["message"]["tool_calls"][0]["function"]["name"] =
+        json!("ROUTE_DEFAULT");
+    assert_eq!(
+        classify_completion(&route_default),
+        CompletionDecision::DefaultRoute
+    );
 
     let mixed = json!({
         "choices": [{
@@ -107,7 +117,264 @@ fn pass_must_be_the_only_local_output() {
             }
         }]
     });
-    assert_eq!(classify_completion(&mixed), CompletionDecision::InvalidPass);
+    assert_eq!(
+        classify_completion(&mixed),
+        CompletionDecision::InvalidControl
+    );
+
+    let mut arguments = pass;
+    arguments["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+        json!(r#"{"unexpected":true}"#);
+    assert_eq!(
+        classify_completion(&arguments),
+        CompletionDecision::InvalidControl
+    );
+}
+
+#[test]
+fn integrated_redirect_must_be_the_only_local_output() {
+    let targets = BTreeMap::from([(
+        "PROVIDER_OPENAI".to_string(),
+        IntegratedTarget {
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            hint: "complex work".to_string(),
+            reasoning_effort: None,
+        },
+    )]);
+    let redirect = json!({
+        "choices": [{
+            "message": {
+                "content": Value::Null,
+                "tool_calls": [{
+                    "function": { "name": "PROVIDER-OPENAI", "arguments": "{}" }
+                }]
+            }
+        }]
+    });
+    assert_eq!(
+        classify_completion_with_targets(&redirect, &targets),
+        CompletionDecision::Redirect("PROVIDER_OPENAI".to_string())
+    );
+
+    let mut mixed = redirect;
+    mixed["choices"][0]["message"]["content"] = json!("partial answer");
+    assert_eq!(
+        classify_completion_with_targets(&mixed, &targets),
+        CompletionDecision::InvalidControl
+    );
+
+    let mut arguments = mixed;
+    arguments["choices"][0]["message"]["content"] = Value::Null;
+    arguments["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+        json!(r#"{"model":"other"}"#);
+    assert_eq!(
+        classify_completion_with_targets(&arguments, &targets),
+        CompletionDecision::InvalidControl
+    );
+}
+
+#[test]
+fn integrated_request_adds_target_tools_and_prompt_hints() {
+    let proxy_config = Config {
+        integrated: IntegratedConfig {
+            enabled: true,
+            targets: BTreeMap::from([(
+                "backend".to_string(),
+                IntegratedTarget {
+                    provider: "openai".to_string(),
+                    model: "gpt-test".to_string(),
+                    hint: "complex coding".to_string(),
+                    reasoning_effort: Some(crate::ReasoningEffort::Max),
+                },
+            )]),
+            ..IntegratedConfig::default()
+        },
+        ..Config::default()
+    };
+    let local = build_local_request(
+        json!({ "messages": [{ "role": "user", "content": "work" }] }),
+        &InterceptorConfig {
+            model: "triage".to_string(),
+            ..InterceptorConfig::default()
+        },
+        InterceptorProtocol::ChatCompletions,
+        Some(INTEGRATED_AUTO_MODEL),
+        &HashMap::new(),
+        &proxy_config,
+    )
+    .unwrap();
+
+    let tool_names = local["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"ROUTE_DEFAULT"));
+    assert!(!tool_names.contains(&"PASS"));
+    assert!(tool_names.contains(&"backend"));
+    let prompt = local["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| text_from_value(&message["content"]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains("Call backend when: complex coding."));
+    assert!(prompt.contains("Destination: openai/gpt-test with max reasoning effort."));
+    assert!(prompt.contains("ROUTE_DEFAULT"));
+}
+
+#[test]
+fn explicit_model_in_integrated_config_uses_pass_only_prompt() {
+    let proxy_config = Config {
+        integrated: IntegratedConfig {
+            enabled: true,
+            targets: BTreeMap::from([(
+                "backend".to_string(),
+                IntegratedTarget {
+                    provider: "openai".to_string(),
+                    model: "gpt-test".to_string(),
+                    hint: "complex coding".to_string(),
+                    reasoning_effort: None,
+                },
+            )]),
+            ..IntegratedConfig::default()
+        },
+        ..Config::default()
+    };
+    let local = build_local_request(
+        json!({ "messages": [{ "role": "user", "content": "work" }] }),
+        &InterceptorConfig {
+            model: "triage".to_string(),
+            ..InterceptorConfig::default()
+        },
+        InterceptorProtocol::ChatCompletions,
+        Some("openai/gpt-test"),
+        &HashMap::new(),
+        &proxy_config,
+    )
+    .unwrap();
+
+    let tool_names = local["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"PASS"));
+    assert!(!tool_names.contains(&"ROUTE_DEFAULT"));
+    assert!(!tool_names.contains(&"backend"));
+    assert!(local.to_string().contains("local fast path"));
+    assert!(!local.to_string().contains("routing tier"));
+}
+
+#[test]
+fn integrated_mode_swaps_in_the_routing_tier_prompt_unless_overridden() {
+    let proxy_config = Config {
+        integrated: IntegratedConfig {
+            enabled: true,
+            targets: BTreeMap::from([(
+                "PROVIDER_OPENAI".to_string(),
+                IntegratedTarget {
+                    provider: "openai".to_string(),
+                    model: "gpt-test".to_string(),
+                    hint: "everything else (default route)".to_string(),
+                    reasoning_effort: None,
+                },
+            )]),
+            ..IntegratedConfig::default()
+        },
+        ..Config::default()
+    };
+    let request = json!({ "messages": [{ "role": "user", "content": "work" }] });
+    let prompt_for = |config: &InterceptorConfig| {
+        let local = build_local_request(
+            request.clone(),
+            config,
+            InterceptorProtocol::ChatCompletions,
+            Some(INTEGRATED_AUTO_MODEL),
+            &HashMap::new(),
+            &proxy_config,
+        )
+        .unwrap();
+        local["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| text_from_value(&message["content"]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let stock = prompt_for(&InterceptorConfig {
+        model: "triage".to_string(),
+        ..InterceptorConfig::default()
+    });
+    assert!(stock.contains("routing tier"));
+    assert!(!stock.contains("local fast path"));
+    assert!(stock.contains("ROUTE_DEFAULT"));
+    assert!(!stock.contains("PASS"));
+
+    // Intercept-mode overrides stay out of integrated mode; the integrated
+    // policy has its own override field.
+    let intercept_override = prompt_for(&InterceptorConfig {
+        model: "triage".to_string(),
+        instructions: "Custom intercept policy.".to_string(),
+        ..InterceptorConfig::default()
+    });
+    assert!(intercept_override.contains("routing tier"));
+    assert!(!intercept_override.contains("Custom intercept policy."));
+
+    let mut config_with_override = proxy_config.clone();
+    config_with_override.integrated.instructions = "Custom integrated policy.".to_string();
+    let overridden = build_local_request(
+        request.clone(),
+        &InterceptorConfig {
+            model: "triage".to_string(),
+            ..InterceptorConfig::default()
+        },
+        InterceptorProtocol::ChatCompletions,
+        Some(INTEGRATED_AUTO_MODEL),
+        &HashMap::new(),
+        &config_with_override,
+    )
+    .unwrap();
+    let overridden = overridden["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| text_from_value(&message["content"]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(overridden.contains("Custom integrated policy."));
+    assert!(!overridden.contains("routing tier"));
+    // Route hints are still appended around a custom policy.
+    assert!(overridden.contains("Call PROVIDER_OPENAI when: everything else (default route)."));
+
+    // Without integrated mode the stock intercept prompt is untouched.
+    let plain = build_local_request(
+        request,
+        &InterceptorConfig {
+            model: "triage".to_string(),
+            ..InterceptorConfig::default()
+        },
+        InterceptorProtocol::ChatCompletions,
+        None,
+        &HashMap::new(),
+        &Config::default(),
+    )
+    .unwrap();
+    let plain_prompt = plain["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| text_from_value(&message["content"]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plain_prompt.contains("local fast path"));
+    assert!(!plain_prompt.contains("routing tier"));
 }
 
 #[test]
@@ -180,7 +447,6 @@ fn local_request_applies_routing_decision_params() {
     assert_eq!(local["temperature"], 0.0);
     assert_eq!(local["max_tokens"], 512);
     assert_eq!(local["parallel_tool_calls"], false);
-    // Our cap replaces the client's larger one.
     assert!(local.get("max_completion_tokens").is_none());
 }
 
@@ -236,4 +502,90 @@ fn temperature_out_of_range_is_rejected() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("temperature"), "unexpected error: {error}");
+}
+
+#[test]
+fn integrated_external_targets_require_proxy_credentials() {
+    let mut provider = crate::UpstreamConfig {
+        base_url: "https://provider.example/v1".to_string(),
+        ..crate::UpstreamConfig::default()
+    };
+    let mut providers = HashMap::from([
+        ("local".to_string(), crate::UpstreamConfig::default()),
+        ("external".to_string(), provider.clone()),
+    ]);
+    let config = IntegratedConfig {
+        enabled: true,
+        targets: BTreeMap::from([(
+            "PROVIDER_EXTERNAL".to_string(),
+            IntegratedTarget {
+                provider: "external".to_string(),
+                model: "model".to_string(),
+                hint: "complex work".to_string(),
+                reasoning_effort: None,
+            },
+        )]),
+        ..IntegratedConfig::default()
+    };
+    let interceptor = InterceptorConfig {
+        provider: "local".to_string(),
+        ..InterceptorConfig::default()
+    };
+    assert!(
+        crate::interceptor::validate_integrated_config(&config, &interceptor, &providers)
+            .unwrap_err()
+            .to_string()
+            .contains("proxy-owned")
+    );
+
+    provider.api_key = Some("placeholder".to_string());
+    providers.insert("external".to_string(), provider);
+    crate::interceptor::validate_integrated_config(&config, &interceptor, &providers).unwrap();
+}
+
+#[test]
+fn integrated_target_names_are_generic_tool_names() {
+    let providers = HashMap::from([
+        ("local".to_string(), crate::UpstreamConfig::default()),
+        ("external".to_string(), crate::UpstreamConfig::default()),
+    ]);
+    let interceptor = InterceptorConfig {
+        provider: "local".to_string(),
+        ..InterceptorConfig::default()
+    };
+    let target = IntegratedTarget {
+        provider: "external".to_string(),
+        model: "model".to_string(),
+        hint: "complex work".to_string(),
+        reasoning_effort: None,
+    };
+    let config_for = |name: String| IntegratedConfig {
+        enabled: true,
+        targets: BTreeMap::from([(name, target.clone())]),
+        ..IntegratedConfig::default()
+    };
+
+    for name in ["backend", "visual-route", "ROUTE_2"] {
+        crate::interceptor::validate_integrated_config(
+            &config_for(name.to_string()),
+            &interceptor,
+            &providers,
+        )
+        .unwrap();
+    }
+    for name in [
+        "PASS".to_string(),
+        "ROUTE_DEFAULT".to_string(),
+        "bad name".to_string(),
+        "x".repeat(65),
+    ] {
+        assert!(
+            crate::interceptor::validate_integrated_config(
+                &config_for(name),
+                &interceptor,
+                &providers,
+            )
+            .is_err()
+        );
+    }
 }

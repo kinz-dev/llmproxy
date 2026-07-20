@@ -10,9 +10,39 @@ use tokio::process::{Child, Command};
 use tracing::info;
 
 use super::Cli;
-use crate::agent_launcher::{LauncherKind, LauncherSession, no_proxy_value};
+use crate::agent_launcher::{
+    LauncherKind, LauncherMode, LauncherSession, configure_proxy_process, contains_arg, home_dir,
+    non_empty_env_value, prepend_args, require_loopback, with_integrated_auto_model,
+};
 
 const ANTHROPIC_API_BASE_URL: &str = "https://api.anthropic.com";
+const EXPLICIT_ARGS: &[&str] = &[
+    "agents",
+    "auth",
+    "auto-mode",
+    "doctor",
+    "gateway",
+    "install",
+    "mcp",
+    "plugin",
+    "plugins",
+    "project",
+    "setup-token",
+    "ultrareview",
+    "update",
+    "upgrade",
+    "-c",
+    "--continue",
+    "-r",
+    "--resume",
+    "--from-pr",
+    "--session-id",
+    "-h",
+    "--help",
+    "-v",
+    "--version",
+];
+const EXPLICIT_VALUE_PREFIXES: &[&str] = &["--resume=", "--from-pr=", "--session-id="];
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,42 +57,55 @@ pub(super) struct ClaudeLaunch {
     claude_bin: PathBuf,
     claude_args: Vec<OsString>,
     upstream_base_url: String,
+    mode: LauncherMode,
 }
 
 impl ClaudeLaunch {
-    pub(super) async fn discover(cli: &Cli) -> Result<Self> {
-        reject_third_party_provider_env()?;
+    pub(super) async fn discover(cli: &Cli, mode: LauncherMode) -> Result<Self> {
         let claude_bin = cli
             .claude_bin
             .clone()
             .or_else(|| env::var_os("LLMPROXY_CLAUDE_BIN").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("claude"));
-        detect_auth_method(&claude_bin).await?;
-        let upstream_base_url = cli
-            .upstream
-            .clone()
-            .or_else(|| non_empty_env_value("ANTHROPIC_BASE_URL"))
-            .unwrap_or_else(|| ANTHROPIC_API_BASE_URL.to_string());
-        let upstream_base_url = normalize_anthropic_base_url(&upstream_base_url)?;
+        let upstream_base_url = if mode == LauncherMode::Intercept {
+            reject_third_party_provider_env()?;
+            detect_auth_method(&claude_bin).await?;
+            let upstream_base_url = cli
+                .upstream
+                .clone()
+                .or_else(|| non_empty_env_value("ANTHROPIC_BASE_URL"))
+                .unwrap_or_else(|| ANTHROPIC_API_BASE_URL.to_string());
+            normalize_anthropic_base_url(&upstream_base_url)?
+        } else {
+            String::new()
+        };
         let current_session_exists = claude_session_exists_for_current_dir(&claude_bin);
 
         Ok(Self {
             claude_bin,
-            claude_args: claude_launch_args(&cli.agent_args, current_session_exists),
+            claude_args: with_integrated_auto_model(
+                &claude_launch_args(&cli.agent_args, current_session_exists),
+                mode,
+            ),
             upstream_base_url,
+            mode,
         })
     }
 
     pub(super) fn spawn(&self, proxy_addr: SocketAddr) -> Result<Child> {
-        if !proxy_addr.ip().is_loopback() {
-            bail!("--intercept --claude requires a loopback listen address, got {proxy_addr}");
-        }
+        require_loopback("Claude", proxy_addr)?;
         let proxy_root_url = format!("http://{proxy_addr}");
-        if normalize_anthropic_base_url(&proxy_root_url)? == self.upstream_base_url {
+        if self.mode == LauncherMode::Intercept
+            && normalize_anthropic_base_url(&proxy_root_url)? == self.upstream_base_url
+        {
             bail!("Claude upstream resolves back to this proxy");
         }
-        let session = self.launcher_session()?;
-        let token = session.encode()?;
+        let token = LauncherSession::for_launcher(
+            LauncherKind::Claude,
+            self.mode,
+            &self.upstream_base_url,
+        )?
+        .encode()?;
         let proxy_base_url = format!("http://{proxy_addr}/_launcher/{token}");
 
         let mut command = Command::new(&self.claude_bin);
@@ -70,15 +113,27 @@ impl ClaudeLaunch {
             .args(&self.claude_args)
             .env("ANTHROPIC_BASE_URL", &proxy_base_url)
             .env("LLMPROXY_CLAUDE_ACTIVE", "1")
-            .env("LLMPROXY_CLAUDE_PROXY_URL", &proxy_base_url)
-            .env("NO_PROXY", no_proxy_value("NO_PROXY"))
-            .env("no_proxy", no_proxy_value("no_proxy"))
-            .kill_on_drop(true);
+            .env("LLMPROXY_CLAUDE_PROXY_URL", &proxy_base_url);
+        configure_proxy_process(&mut command);
+        if self.mode != LauncherMode::Intercept {
+            for name in [
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY",
+                "ANTHROPIC_AUTH_TOKEN",
+            ] {
+                command.env_remove(name);
+            }
+            // Claude requires a credential-shaped value even for a loopback endpoint.
+            // The proxy session strips it before constructing provider headers.
+            command.env("ANTHROPIC_API_KEY", "llmproxy-local");
+        }
 
         info!(
             executable = %self.claude_bin.display(),
             proxy = %proxy_base_url,
-            "launching Claude through local interceptor"
+            mode = ?self.mode,
+            "launching Claude through llmproxy"
         );
         command.spawn().with_context(|| {
             format!(
@@ -86,10 +141,6 @@ impl ClaudeLaunch {
                 self.claude_bin.display()
             )
         })
-    }
-
-    fn launcher_session(&self) -> Result<LauncherSession> {
-        LauncherSession::new(LauncherKind::Claude, self.upstream_base_url.clone())
     }
 }
 
@@ -154,10 +205,6 @@ fn normalize_anthropic_base_url(base_url: &str) -> Result<String> {
     }
 }
 
-fn non_empty_env_value(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.trim().is_empty())
-}
-
 fn env_truthy(name: &str) -> bool {
     non_empty_env_value(name).is_some_and(|value| {
         matches!(
@@ -168,50 +215,10 @@ fn env_truthy(name: &str) -> bool {
 }
 
 fn claude_launch_args(args: &[OsString], current_session_exists: bool) -> Vec<OsString> {
-    if args.iter().any(|arg| {
-        matches!(
-            arg.to_str(),
-            Some(
-                "agents"
-                    | "auth"
-                    | "auto-mode"
-                    | "doctor"
-                    | "gateway"
-                    | "install"
-                    | "mcp"
-                    | "plugin"
-                    | "plugins"
-                    | "project"
-                    | "setup-token"
-                    | "ultrareview"
-                    | "update"
-                    | "upgrade"
-                    | "-c"
-                    | "--continue"
-                    | "-r"
-                    | "--resume"
-                    | "--from-pr"
-                    | "--session-id"
-                    | "-h"
-                    | "--help"
-                    | "-v"
-                    | "--version"
-            )
-        ) || arg.to_str().is_some_and(|arg| {
-            arg.starts_with("--resume=")
-                || arg.starts_with("--from-pr=")
-                || arg.starts_with("--session-id=")
-        })
-    }) {
+    if !current_session_exists || contains_arg(args, EXPLICIT_ARGS, EXPLICIT_VALUE_PREFIXES) {
         return args.to_vec();
     }
-    if !current_session_exists {
-        return args.to_vec();
-    }
-
-    std::iter::once(OsString::from("--continue"))
-        .chain(args.iter().cloned())
-        .collect()
+    prepend_args(args, &["--continue"])
 }
 
 fn claude_session_exists_for_current_dir(claude_bin: &Path) -> bool {
@@ -238,17 +245,13 @@ fn claude_config_home(claude_bin: &Path) -> Option<PathBuf> {
     if let Some(path) = env::var_os(override_name).filter(|path| !path.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .map(|home| {
-            home.join(if is_openclaude {
-                ".openclaude"
-            } else {
-                ".claude"
-            })
+    home_dir().map(|home| {
+        home.join(if is_openclaude {
+            ".openclaude"
+        } else {
+            ".claude"
         })
+    })
 }
 
 fn claude_session_exists(config_home: &Path, cwd: &Path) -> bool {

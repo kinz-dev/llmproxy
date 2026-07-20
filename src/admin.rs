@@ -6,7 +6,7 @@
 //! [`AppState`] into [`SharedState`] and are persisted back to the loaded
 //! TOML file with `toml_edit` so user comments survive.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
@@ -27,14 +27,14 @@ use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use toml_edit::{DocumentMut, Item, Table, value};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-use crate::interceptor::InterceptorConfig;
+use crate::interceptor::{IntegratedTarget, InterceptorConfig};
 use crate::stats::{proxy_stats, route_class_for_base_url, traffic_log};
 use crate::{
     AdminConfig, AnthropicMode, AppState, Config, ModelAlias, ModelRoutingMode, ResponsesMode,
     SharedState, build_provider_state, effective_provider_configs, finalize_config_keys,
-    refresh_upstream_models, validate_config,
+    refresh_upstream_models, update_runtime_integrated, validate_config,
 };
 
 /// Effective bind address: missing config means loopback on a random port.
@@ -119,7 +119,7 @@ pub(crate) async fn spawn(
     let app = router(AdminState { shared, context });
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
-            warn!(error = %error, "admin interface server exited");
+            error!(error = %error, "admin interface server exited");
         }
     });
     Ok(bound)
@@ -129,10 +129,13 @@ fn router(state: AdminState) -> Router {
     Router::new()
         .route("/api/overview", get(api_overview))
         .route("/api/models", get(api_models))
+        .route("/api/model-list", get(api_model_list))
         .route("/api/stats", get(api_stats))
         .route("/api/stats/reset", post(api_stats_reset))
         .route("/api/logs", get(api_logs))
         .route("/api/logs/clear", post(api_logs_clear))
+        .route("/api/errors", get(api_errors))
+        .route("/api/errors/clear", post(api_errors_clear))
         .route("/api/launch", get(api_launch))
         .route("/api/config", get(api_config))
         .route(
@@ -144,6 +147,7 @@ fn router(state: AdminState) -> Router {
             put(api_alias_put).delete(api_alias_delete),
         )
         .route("/api/interceptor", put(api_interceptor_put))
+        .route("/api/integrated", put(api_integrated_put))
         .route("/api/interceptor/test", post(api_interceptor_test))
         .route("/api/interceptor/revise", post(api_interceptor_revise))
         .route(
@@ -155,7 +159,6 @@ fn router(state: AdminState) -> Router {
         .with_state(state)
 }
 
-// ---------------------------------------------------------------------------
 // Static UI serving
 
 enum UiSource {
@@ -317,7 +320,6 @@ async fn ui_asset(State(state): State<AdminState>, uri: Uri) -> Response {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Read-only monitoring APIs
 
 fn api_error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -361,6 +363,10 @@ async fn api_overview(State(state): State<AdminState>) -> Response {
             "timeout_ms": config.interceptor.timeout_ms,
             "fallback_on_error": config.interceptor.fallback_on_error,
         },
+        "integrated": {
+            "enabled": config.integrated.enabled,
+            "targets": config.integrated.targets.len(),
+        },
     }))
     .into_response()
 }
@@ -378,10 +384,12 @@ async fn api_models(State(state): State<AdminState>) -> Response {
             let (models, fetched) = provider.model_cache.cached_ids();
             json!({
                 "name": name,
+                "kind": provider.config.kind.as_str(),
                 "base_url": provider.config.base_url,
                 "class": class_str(&provider.config.base_url),
                 "is_default": *name == config.default_provider,
-                "is_interceptor": config.interceptor.enabled && *name == config.interceptor.provider,
+                "is_interceptor": (config.interceptor.enabled || config.integrated.enabled)
+                    && *name == config.interceptor.provider,
                 "models": models,
                 "models_fetched": fetched,
             })
@@ -450,13 +458,41 @@ async fn api_logs_clear() -> Response {
     Json(json!({ "ok": true })).into_response()
 }
 
+/// The catalog a client of this proxy sees from `GET /v1/models`.
+async fn api_model_list(State(state): State<AdminState>) -> Response {
+    let snapshot = state.shared.snapshot();
+    let catalog = crate::models_catalog_json(&snapshot).await;
+    Json(json!({
+        "routing_mode": match snapshot.config.model_routing {
+            ModelRoutingMode::Remap => "remap",
+            ModelRoutingMode::Passthrough => "passthrough",
+        },
+        "expose_aliases": snapshot.config.models.expose_aliases,
+        "expose_upstream": snapshot.config.models.expose_upstream,
+        "models": catalog.get("data").cloned().unwrap_or_else(|| json!([])),
+    }))
+    .into_response()
+}
+
+async fn api_errors(Query(query): Query<LogsQuery>) -> Response {
+    Json(crate::stats::error_log().snapshot_after(query.after)).into_response()
+}
+
+async fn api_errors_clear() -> Response {
+    crate::stats::error_log().clear();
+    Json(json!({ "ok": true })).into_response()
+}
+
 #[derive(Deserialize)]
 struct InterceptorTestBody {
     prompt: String,
     /// Test with these routing instructions instead of the saved ones;
-    /// empty string means the built-in default policy.
+    /// empty string means the built-in default policy for the mode.
     #[serde(default)]
     instructions: Option<String>,
+    /// "intercept" (default) or "integrated".
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 async fn api_interceptor_test(
@@ -467,9 +503,13 @@ async fn api_interceptor_test(
     if prompt.is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "test prompt cannot be empty");
     }
+    let mode = match crate::interceptor::RouteTestMode::parse(body.mode.as_deref()) {
+        Ok(mode) => mode,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, &message),
+    };
     let snapshot = state.shared.snapshot();
     let verdict =
-        crate::interceptor::test_route(&snapshot, prompt, body.instructions.as_deref()).await;
+        crate::interceptor::test_route(&snapshot, prompt, body.instructions.as_deref(), mode).await;
     Json(verdict).into_response()
 }
 
@@ -477,9 +517,13 @@ async fn api_interceptor_test(
 struct InterceptorReviseBody {
     /// The requested change, e.g. "also handle git commands locally".
     request: String,
-    /// The editor's current policy text; empty means the built-in default.
+    /// The editor's current policy text; empty means the built-in default
+    /// for the mode.
     #[serde(default)]
     instructions: String,
+    /// "intercept" (default) or "integrated".
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 async fn api_interceptor_revise(
@@ -490,9 +534,13 @@ async fn api_interceptor_revise(
     if request.is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "describe the change to make");
     }
+    let mode = match crate::interceptor::RouteTestMode::parse(body.mode.as_deref()) {
+        Ok(mode) => mode,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, &message),
+    };
     let snapshot = state.shared.snapshot();
     let result =
-        crate::interceptor::revise_instructions(&snapshot, &body.instructions, request).await;
+        crate::interceptor::revise_instructions(&snapshot, &body.instructions, request, mode).await;
     if let Some(error) = result.get("error").and_then(Value::as_str) {
         return api_error(StatusCode::BAD_GATEWAY, error);
     }
@@ -546,15 +594,24 @@ async fn api_launch(State(state): State<AdminState>) -> Response {
 
     Json(json!({
         "proxy_addr": proxy_addr,
+        "default_provider": config.default_provider,
         "config_path": context.config_path.as_ref().map(|path| path.display().to_string()),
         "interceptor_enabled": config.interceptor.enabled,
         "interceptor_configured": !config.interceptor.provider.trim().is_empty()
             && !config.interceptor.model.trim().is_empty(),
         "interceptor_model": config.interceptor.model,
+        "integrated_enabled": config.integrated.enabled,
+        "integrated_targets": config.integrated.targets.len(),
         "commands": {
+            "codex_proxy": format!("llmproxy{config_flag} --proxy --codex"),
+            "claude_proxy": format!("llmproxy{config_flag} --proxy --claude"),
+            "copilot_proxy": format!("llmproxy{config_flag} --proxy --copilot"),
             "codex_launcher": format!("llmproxy{config_flag} --intercept --codex"),
             "claude_launcher": format!("llmproxy{config_flag} --intercept --claude"),
             "copilot_launcher": format!("llmproxy{config_flag} --intercept --copilot"),
+            "codex_integrated": format!("llmproxy{config_flag} --codex"),
+            "claude_integrated": format!("llmproxy{config_flag} --claude"),
+            "copilot_integrated": format!("llmproxy{config_flag} --copilot"),
             "codex_env": codex_env,
             "claude_env": claude_env,
             "copilot_env": "Native Copilot CAPI routing requires --intercept --copilot",
@@ -583,9 +640,12 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
             (
                 name.clone(),
                 json!({
+                    "kind": upstream.kind.as_str(),
                     "base_url": upstream.base_url,
+                    "auth": upstream.auth.as_str(),
                     "api_key_set": upstream.api_key.is_some(),
                     "api_key_env": upstream.api_key_env,
+                    "reasoning_effort": upstream.reasoning_effort.map(|effort| effort.as_str()),
                     "timeout_secs": upstream.timeout_secs,
                     "connect_timeout_secs": upstream.connect_timeout_secs,
                     "pool_max_idle_per_host": upstream.pool_max_idle_per_host,
@@ -615,11 +675,28 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
             )
         })
         .collect::<serde_json::Map<_, _>>();
+    let integrated_targets = config
+        .integrated
+        .targets
+        .iter()
+        .map(|(name, target)| {
+            (
+                name.clone(),
+                json!({
+                    "provider": target.provider,
+                    "model": target.model,
+                    "hint": target.hint,
+                    "reasoning_effort": target.reasoning_effort.map(crate::ReasoningEffort::as_str),
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
 
     json!({
         "config_path": context.config_path.as_ref().map(|path| path.display().to_string()),
         "config_persistable": context.config_path.is_some(),
         "listen_addr": config.listen_addr,
+        "max_logging_retention_days": config.max_logging_retention_days,
         "default_provider": config.default_provider,
         "providers": providers,
         "model_aliases": aliases,
@@ -629,12 +706,23 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
             "model": config.interceptor.model,
             "timeout_ms": config.interceptor.timeout_ms,
             "fallback_on_error": config.interceptor.fallback_on_error,
-            "instructions": config.interceptor.instructions,
-            "instructions_are_default": config.interceptor.instructions
-                == InterceptorConfig::default().instructions,
+            "instructions": crate::interceptor::intercept_instructions(&config.interceptor),
+            "instructions_are_default": crate::interceptor::intercept_instructions_are_default(
+                &config.interceptor,
+            ),
             "temperature": config.interceptor.temperature,
             "max_tokens": config.interceptor.max_tokens,
             "parallel_tool_calls": config.interceptor.parallel_tool_calls,
+        },
+        "integrated": {
+            "enabled": config.integrated.enabled,
+            "sticky_ttl_secs": config.integrated.sticky_ttl_secs,
+            "sticky_capacity": config.integrated.sticky_capacity,
+            "instructions": crate::interceptor::integrated_instructions(&config.integrated),
+            "instructions_are_default": crate::interceptor::integrated_instructions_are_default(
+                &config.integrated,
+            ),
+            "targets": integrated_targets,
         },
         "role_map": config.role_map,
         "chat": { "disable_thinking": config.chat.disable_thinking },
@@ -656,7 +744,6 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
     })
 }
 
-// ---------------------------------------------------------------------------
 // Runtime config editing
 
 /// How an accepted change is written back to the config file.
@@ -714,11 +801,18 @@ async fn apply_config_change(
 
     let auto_mapping = config.model_routing == ModelRoutingMode::Remap;
     let new_state = AppState {
+        forward_caller_credentials: !config.integrated.enabled,
         config: Arc::new(config),
         providers: Arc::new(providers),
         launcher_kind: None,
+        launcher_mode: None,
     };
     state.shared.replace(new_state.clone());
+    if let Some(addr) = state.context.proxy_addr.get()
+        && let Err(error) = update_runtime_integrated(*addr, new_state.config.integrated.enabled)
+    {
+        error!(error = %error, "failed to update daemon mode metadata");
+    }
     info!(
         rebuilt_providers = rebuilt.len(),
         "runtime config change applied"
@@ -729,7 +823,7 @@ async fn apply_config_change(
             tokio::spawn(async move {
                 let _refresh_guard = provider.model_refresh.lock().await;
                 if let Err(error) = refresh_upstream_models(&provider, &HeaderMap::new()).await {
-                    warn!(
+                    error!(
                         error = %error,
                         provider = %provider.name,
                         "failed to load upstream models after config change; will retry on request"
@@ -770,7 +864,7 @@ fn persist_change(state: &AdminState, persist: Persist) -> (bool, Option<String>
     match result {
         Ok(()) => (true, None),
         Err(error) => {
-            warn!(error = %error, path = %path.display(), "config change applied but not persisted");
+            error!(error = %error, path = %path.display(), "config change applied but not persisted");
             (
                 false,
                 Some(format!(
@@ -992,12 +1086,106 @@ async fn api_interceptor_put(
 }
 
 #[derive(Clone, Deserialize)]
+struct IntegratedPutBody {
+    enabled: Option<bool>,
+    sticky_ttl_secs: Option<u64>,
+    sticky_capacity: Option<usize>,
+    /// Empty string resets to the built-in integrated routing policy.
+    instructions: Option<String>,
+    targets: Option<BTreeMap<String, IntegratedTarget>>,
+}
+
+impl IntegratedPutBody {
+    fn apply(&self, config: &mut Config) {
+        if let Some(enabled) = self.enabled {
+            config.integrated.enabled = enabled;
+        }
+        if let Some(ttl) = self.sticky_ttl_secs {
+            config.integrated.sticky_ttl_secs = ttl;
+        }
+        if let Some(capacity) = self.sticky_capacity {
+            config.integrated.sticky_capacity = capacity;
+        }
+        if let Some(instructions) = &self.instructions {
+            config.integrated.instructions = if instructions.trim().is_empty() {
+                String::new()
+            } else {
+                instructions.clone()
+            };
+        }
+        if let Some(targets) = &self.targets {
+            config.integrated.targets = targets.clone();
+        }
+    }
+
+    fn apply_to_doc(&self, doc: &mut DocumentMut) -> Result<(), String> {
+        let table = ensure_table(doc, "integrated")?;
+        table.remove("respect_explicit_model");
+        if let Some(enabled) = self.enabled {
+            table.insert("enabled", value(enabled));
+        }
+        if let Some(ttl) = self.sticky_ttl_secs {
+            table.insert("sticky_ttl_secs", value(ttl as i64));
+        }
+        if let Some(capacity) = self.sticky_capacity {
+            table.insert("sticky_capacity", value(capacity as i64));
+        }
+        match self.instructions.as_deref() {
+            Some(instructions) if instructions.trim().is_empty() => {
+                table.remove("instructions");
+            }
+            Some(instructions) => {
+                table.insert("instructions", value(instructions));
+            }
+            None => {}
+        }
+        if let Some(targets) = &self.targets {
+            let mut target_table = Table::new();
+            target_table.set_implicit(true);
+            for (name, target) in targets {
+                let mut entry = Table::new();
+                entry.insert("provider", value(target.provider.as_str()));
+                entry.insert("model", value(target.model.as_str()));
+                entry.insert("hint", value(target.hint.as_str()));
+                if let Some(effort) = target.reasoning_effort {
+                    entry.insert("reasoning_effort", value(effort.as_str()));
+                }
+                target_table.insert(name, Item::Table(entry));
+            }
+            table.insert("targets", Item::Table(target_table));
+        }
+        Ok(())
+    }
+}
+
+async fn api_integrated_put(
+    State(state): State<AdminState>,
+    Json(body): Json<IntegratedPutBody>,
+) -> Response {
+    let doc_body = body.clone();
+    apply_config_change(
+        &state,
+        move |config| {
+            body.apply(config);
+            Ok(())
+        },
+        Persist::Edit(Box::new(move |doc| doc_body.apply_to_doc(doc))),
+    )
+    .await
+}
+
+#[derive(Clone, Deserialize)]
 struct ProviderPutBody {
+    kind: Option<crate::ProviderKind>,
     base_url: Option<String>,
+    /// Borrowed-OAuth mode: "none", "codex-oauth", or "claude-oauth".
+    auth: Option<crate::ProviderAuth>,
     /// Empty string clears the stored key; missing keeps it.
     api_key: Option<String>,
     /// Empty string clears; missing keeps.
     api_key_env: Option<String>,
+    /// Empty string clears the enforced outbound reasoning effort.
+    reasoning_effort: Option<String>,
     timeout_secs: Option<u64>,
     connect_timeout_secs: Option<u64>,
     pool_max_idle_per_host: Option<usize>,
@@ -1005,9 +1193,15 @@ struct ProviderPutBody {
 }
 
 impl ProviderPutBody {
-    fn apply(&self, upstream: &mut crate::UpstreamConfig) {
+    fn apply(&self, upstream: &mut crate::UpstreamConfig) -> Result<(), String> {
+        if let Some(kind) = self.kind {
+            upstream.kind = kind;
+        }
         if let Some(base_url) = &self.base_url {
             upstream.base_url = base_url.trim().to_string();
+        }
+        if let Some(auth) = self.auth {
+            upstream.auth = auth;
         }
         match self.api_key.as_deref() {
             Some("") => upstream.api_key = None,
@@ -1018,6 +1212,13 @@ impl ProviderPutBody {
             Some("") => upstream.api_key_env = None,
             Some(name) => upstream.api_key_env = Some(name.to_string()),
             None => {}
+        }
+        if let Some(value) = &self.reasoning_effort {
+            upstream.reasoning_effort = if value.trim().is_empty() {
+                None
+            } else {
+                Some(value.parse::<crate::ReasoningEffort>()?)
+            };
         }
         if let Some(timeout_secs) = self.timeout_secs {
             upstream.timeout_secs = timeout_secs;
@@ -1031,11 +1232,22 @@ impl ProviderPutBody {
         if let Some(pool_idle_timeout_secs) = self.pool_idle_timeout_secs {
             upstream.pool_idle_timeout_secs = pool_idle_timeout_secs;
         }
+        Ok(())
     }
 
     fn apply_to_doc(&self, table: &mut Table) {
+        if let Some(kind) = self.kind {
+            table.insert("kind", value(kind.as_str()));
+        }
         if let Some(base_url) = &self.base_url {
             table.insert("base_url", value(base_url.trim()));
+        }
+        if let Some(auth) = self.auth {
+            if auth == crate::ProviderAuth::None {
+                table.remove("auth");
+            } else {
+                table.insert("auth", value(auth.as_str()));
+            }
         }
         match self.api_key.as_deref() {
             Some("") => {
@@ -1052,6 +1264,15 @@ impl ProviderPutBody {
             }
             Some(name) => {
                 table.insert("api_key_env", value(name));
+            }
+            None => {}
+        }
+        match self.reasoning_effort.as_deref().map(str::trim) {
+            Some("") => {
+                table.remove("reasoning_effort");
+            }
+            Some(effort) => {
+                table.insert("reasoning_effort", value(effort.to_ascii_lowercase()));
             }
             None => {}
         }
@@ -1096,14 +1317,14 @@ async fn api_provider_put(
         &state,
         move |config| {
             if edits_upstream_section {
-                mutate_body.apply(&mut config.upstream);
+                mutate_body.apply(&mut config.upstream)?;
             } else {
                 let mut upstream = config
                     .providers
                     .get(&mutate_name)
                     .cloned()
                     .unwrap_or_default();
-                mutate_body.apply(&mut upstream);
+                mutate_body.apply(&mut upstream)?;
                 config.providers.insert(mutate_name, upstream);
             }
             Ok(())
@@ -1156,6 +1377,7 @@ async fn api_provider_delete(
 #[derive(Clone, Deserialize)]
 struct SettingsPutBody {
     default_provider: Option<String>,
+    max_logging_retention_days: Option<u64>,
     disable_thinking: Option<bool>,
     responses_mode: Option<String>,
     expose_aliases: Option<bool>,
@@ -1169,6 +1391,15 @@ async fn api_settings_put(
     State(state): State<AdminState>,
     Json(body): Json<SettingsPutBody>,
 ) -> Response {
+    if body
+        .max_logging_retention_days
+        .is_some_and(|days| days > i64::MAX as u64)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "max_logging_retention_days is too large",
+        );
+    }
     let responses_mode = match body.responses_mode.as_deref() {
         None => None,
         Some("chat_completions") => Some(ResponsesMode::ChatCompletions),
@@ -1186,6 +1417,9 @@ async fn api_settings_put(
         move |config| {
             if let Some(default_provider) = body.default_provider {
                 config.default_provider = default_provider.trim().to_string();
+            }
+            if let Some(days) = body.max_logging_retention_days {
+                config.max_logging_retention_days = days;
             }
             if let Some(disable_thinking) = body.disable_thinking {
                 config.chat.disable_thinking = disable_thinking;
@@ -1210,6 +1444,9 @@ async fn api_settings_put(
         Persist::Edit(Box::new(move |doc| {
             if let Some(default_provider) = doc_body.default_provider {
                 doc.insert("default_provider", value(default_provider.trim()));
+            }
+            if let Some(days) = doc_body.max_logging_retention_days {
+                doc.insert("max_logging_retention_days", value(days as i64));
             }
             if let Some(disable_thinking) = doc_body.disable_thinking {
                 ensure_table(doc, "chat")?.insert("disable_thinking", value(disable_thinking));

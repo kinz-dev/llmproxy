@@ -10,9 +10,45 @@ use tokio::process::{Child, Command};
 use tracing::info;
 
 use super::Cli;
-use crate::agent_launcher::{LauncherKind, LauncherSession, no_proxy_value};
+use crate::INTEGRATED_AUTO_MODEL;
+use crate::agent_launcher::{
+    LauncherKind, LauncherMode, LauncherSession, configure_proxy_process, contains_arg,
+    has_model_arg, home_dir, non_empty_env_value, prepend_args, require_loopback,
+};
 
 const COPILOT_API_BASE_URL: &str = "https://api.githubcopilot.com";
+const LOCAL_COPILOT_MODEL_ID: &str = "gpt-5.4";
+const PROXY_COPILOT_WIRE_MODEL: &str = "llmproxy-auto";
+const EXPLICIT_ARGS: &[&str] = &[
+    "completion",
+    "help",
+    "init",
+    "login",
+    "mcp",
+    "plugin",
+    "update",
+    "version",
+    "--connect",
+    "--continue",
+    "--resume",
+    "--session-id",
+    "--prompt",
+    "-p",
+    "--interactive",
+    "-i",
+    "--worktree",
+    "-h",
+    "--help",
+    "-v",
+    "--version",
+];
+const EXPLICIT_VALUE_PREFIXES: &[&str] = &[
+    "--connect=",
+    "--resume=",
+    "--session-id=",
+    "--prompt=",
+    "--worktree=",
+];
 const COPILOT_PROVIDER_ENV: [&str; 10] = [
     "COPILOT_PROVIDER_BASE_URL",
     "COPILOT_PROVIDER_TYPE",
@@ -33,10 +69,11 @@ pub(super) struct CopilotLaunch {
     upstream_base_url: String,
     github_mcp_url: String,
     remote_sessions_url: String,
+    mode: LauncherMode,
 }
 
 impl CopilotLaunch {
-    pub(super) async fn discover(cli: &Cli) -> Result<Self> {
+    pub(super) async fn discover(cli: &Cli, mode: LauncherMode) -> Result<Self> {
         let copilot_bin = cli
             .copilot_bin
             .clone()
@@ -55,43 +92,66 @@ impl CopilotLaunch {
             upstream_base_url,
             github_mcp_url,
             remote_sessions_url,
+            mode,
         })
     }
 
     pub(super) fn spawn(&self, proxy_addr: SocketAddr) -> Result<Child> {
-        if !proxy_addr.ip().is_loopback() {
-            bail!("--intercept --copilot requires a loopback listen address, got {proxy_addr}");
-        }
+        require_loopback("Copilot", proxy_addr)?;
         if base_url_targets_addr(&self.upstream_base_url, proxy_addr) {
             bail!("Copilot upstream resolves back to this proxy");
         }
-        let token = self.launcher_session()?.encode()?;
-        let proxy_base_url = format!("http://{proxy_addr}/_launcher/{token}");
+        let token = LauncherSession::for_launcher(
+            LauncherKind::Copilot,
+            self.mode,
+            &self.upstream_base_url,
+        )?
+        .encode()?;
+        let proxy_base_url = match self.mode {
+            LauncherMode::Intercept => format!("http://{proxy_addr}/_launcher/{token}"),
+            LauncherMode::Proxy | LauncherMode::Integrated => {
+                format!("http://{proxy_addr}/_launcher/{token}/v1")
+            }
+        };
 
         let mut command = Command::new(&self.copilot_bin);
         command
             .args(&self.copilot_args)
-            // COPILOT_API_URL is a shipped CAPI compatibility hook. Copilot still
-            // owns credential loading and sends its native authorization headers.
-            .env("COPILOT_API_URL", &proxy_base_url)
             .env("GITHUB_MCP_URL_OVERRIDE", &self.github_mcp_url)
             .env("COPILOT_MC_BASE_URL", &self.remote_sessions_url)
             .env("COPILOT_CLI_DISABLE_WEBSOCKET_RESPONSES", "1")
             .env("WEBSOCKET_RESPONSES", "false")
             .env("COPILOT_EXP_COPILOT_CLI_WEBSOCKET_RESPONSES", "false")
             .env("LLMPROXY_COPILOT_ACTIVE", "1")
-            .env("LLMPROXY_COPILOT_PROXY_URL", &proxy_base_url)
-            .env("NO_PROXY", no_proxy_value("NO_PROXY"))
-            .env("no_proxy", no_proxy_value("no_proxy"))
-            .kill_on_drop(true);
+            .env("LLMPROXY_COPILOT_PROXY_URL", &proxy_base_url);
+        configure_proxy_process(&mut command);
         for name in COPILOT_PROVIDER_ENV {
             command.env_remove(name);
+        }
+        if self.mode != LauncherMode::Intercept {
+            command
+                .env_remove("COPILOT_API_URL")
+                .env("COPILOT_PROVIDER_BASE_URL", &proxy_base_url)
+                .env("COPILOT_PROVIDER_TYPE", "openai")
+                .env("COPILOT_PROVIDER_WIRE_API", "responses");
+            if !copilot_model_is_configured(&self.copilot_args) {
+                let wire_model = copilot_default_wire_model(self.mode)
+                    .expect("native interceptor branch handled above");
+                command
+                    .env("COPILOT_MODEL", LOCAL_COPILOT_MODEL_ID)
+                    .env("COPILOT_PROVIDER_WIRE_MODEL", wire_model);
+            }
+        } else {
+            // COPILOT_API_URL is a shipped CAPI compatibility hook. Copilot still
+            // owns credential loading and sends its native authorization headers.
+            command.env("COPILOT_API_URL", &proxy_base_url);
         }
 
         info!(
             executable = %self.copilot_bin.display(),
             proxy = %proxy_base_url,
-            "launching GitHub Copilot CLI through local interceptor"
+            mode = ?self.mode,
+            "launching GitHub Copilot CLI through llmproxy"
         );
         command.spawn().with_context(|| {
             format!(
@@ -100,10 +160,25 @@ impl CopilotLaunch {
             )
         })
     }
+}
 
-    fn launcher_session(&self) -> Result<LauncherSession> {
-        LauncherSession::new(LauncherKind::Copilot, self.upstream_base_url.clone())
+fn copilot_default_wire_model(mode: LauncherMode) -> Option<&'static str> {
+    match mode {
+        LauncherMode::Proxy => Some(PROXY_COPILOT_WIRE_MODEL),
+        LauncherMode::Integrated => Some(INTEGRATED_AUTO_MODEL),
+        LauncherMode::Intercept => None,
     }
+}
+
+fn copilot_model_is_configured(args: &[OsString]) -> bool {
+    copilot_model_is_configured_with(args, &|name| non_empty_env_value(name))
+}
+
+fn copilot_model_is_configured_with(
+    args: &[OsString],
+    env_value: &impl Fn(&str) -> Option<String>,
+) -> bool {
+    env_value("COPILOT_MODEL").is_some() || has_model_arg(args)
 }
 
 fn discover_copilot_upstream(cli_upstream: Option<&str>) -> Result<String> {
@@ -179,19 +254,11 @@ fn append_path(base_url: &str, path: &str) -> String {
     )
 }
 
-fn non_empty_env_value(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.trim().is_empty())
-}
-
 fn copilot_home_path() -> Option<PathBuf> {
     if let Some(path) = env::var_os("COPILOT_HOME").filter(|path| !path.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .map(|home| home.join(".copilot"))
+    home_dir().map(|home| home.join(".copilot"))
 }
 
 fn copilot_session_exists_for_current_home() -> bool {
@@ -208,47 +275,10 @@ fn copilot_session_exists(copilot_home: &Path) -> bool {
 }
 
 fn copilot_launch_args(args: &[OsString], current_session_exists: bool) -> Vec<OsString> {
-    let explicit = args.iter().any(|arg| {
-        matches!(
-            arg.to_str(),
-            Some(
-                "completion"
-                    | "help"
-                    | "init"
-                    | "login"
-                    | "mcp"
-                    | "plugin"
-                    | "update"
-                    | "version"
-                    | "--connect"
-                    | "--continue"
-                    | "--resume"
-                    | "--session-id"
-                    | "--prompt"
-                    | "-p"
-                    | "--interactive"
-                    | "-i"
-                    | "--worktree"
-                    | "-h"
-                    | "--help"
-                    | "-v"
-                    | "--version"
-            )
-        ) || arg.to_str().is_some_and(|arg| {
-            arg.starts_with("--connect=")
-                || arg.starts_with("--resume=")
-                || arg.starts_with("--session-id=")
-                || arg.starts_with("--prompt=")
-                || arg.starts_with("--worktree=")
-        })
-    });
-    if explicit || !current_session_exists {
+    if !current_session_exists || contains_arg(args, EXPLICIT_ARGS, EXPLICIT_VALUE_PREFIXES) {
         return args.to_vec();
     }
-
-    std::iter::once(OsString::from("--continue"))
-        .chain(args.iter().cloned())
-        .collect()
+    prepend_args(args, &["--continue"])
 }
 
 #[cfg(test)]

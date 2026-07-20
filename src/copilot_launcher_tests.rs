@@ -1,9 +1,11 @@
 use std::ffi::OsString;
 
 use super::{
-    copilot_api_url_for_github_host, copilot_launch_args, copilot_session_exists,
-    normalize_copilot_base_url,
+    copilot_api_url_for_github_host, copilot_default_wire_model, copilot_launch_args,
+    copilot_model_is_configured_with, copilot_session_exists, normalize_copilot_base_url,
 };
+use crate::INTEGRATED_AUTO_MODEL;
+use crate::agent_launcher::LauncherMode;
 
 #[test]
 fn normalizes_native_copilot_api_roots() {
@@ -69,4 +71,21 @@ fn detects_persisted_copilot_sessions_without_reading_them() {
     std::fs::create_dir_all(root.join("session-state").join("session-id")).unwrap();
     assert!(copilot_session_exists(&root));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn integrated_copilot_detects_explicit_model_configuration() {
+    let no_env = |_: &str| None;
+    assert!(!copilot_model_is_configured_with(&[], &no_env));
+    assert!(copilot_model_is_configured_with(
+        &[OsString::from("--model=anthropic/claude-sonnet-4-5")],
+        &no_env
+    ));
+    assert!(copilot_model_is_configured_with(&[], &|name| {
+        (name == "COPILOT_MODEL").then(|| "openai/gpt-5.4".to_string())
+    }));
+    assert_eq!(
+        copilot_default_wire_model(LauncherMode::Integrated),
+        Some(INTEGRATED_AUTO_MODEL)
+    );
 }

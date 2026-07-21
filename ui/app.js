@@ -96,7 +96,7 @@ function currentRoute() {
     secondary = "policy";
   }
   if (!PRIMARY_VIEWS.includes(primary)) primary = "overview";
-  if (primary === "activity" && !["usage", "logs"].includes(secondary)) secondary = "usage";
+  if (primary === "activity" && !["usage", "decisions", "logs"].includes(secondary)) secondary = "usage";
   if (primary === "routing" && !["triage", "policy"].includes(secondary)) secondary = "triage";
   return { primary, secondary };
 }
@@ -117,7 +117,7 @@ function renderTab() {
     if (active) $(`#tab-${name}`).setAttribute("aria-current", "page");
     else $(`#tab-${name}`).removeAttribute("aria-current");
   }
-  renderSubview("activity", primary === "activity" ? secondary : "usage", ["usage", "logs"]);
+  renderSubview("activity", primary === "activity" ? secondary : "usage", ["usage", "decisions", "logs"]);
   renderSubview("routing", primary === "routing" ? secondary : "triage", ["triage", "policy"]);
   document.title = `llmproxy · ${primary}`;
 
@@ -302,6 +302,7 @@ function renderStats(stats) {
   $("#stat-intercepted").textContent = fmtCount(intercept.attempts);
   $("#stat-intercepted-sub").textContent =
     `fallthrough ${fmtCount(intercept.pass)} · redirect ${fmtCount(intercept.redirect || 0)} · fallback ${fmtCount(intercept.fallback)}` +
+    (intercept.reject ? ` · reject ${fmtCount(intercept.reject)}` : "") +
     (intercept.bypass ? ` · bypass ${fmtCount(intercept.bypass)}` : "") +
     (intercept.errors ? ` · errors ${fmtCount(intercept.errors)}` : "");
   $("#stat-local").textContent = fmtCount(served.local);
@@ -558,6 +559,130 @@ async function pollLogs() {
   }
 }
 
+/* Routing decision audit */
+
+let decisionLastId = 0;
+let decisionEntries = [];
+const DECISION_BOARD_MAX = 512;
+
+function decisionGroup(entry) {
+  if (entry.decision === "reject") return "reject";
+  if (entry.error || ["error", "fallback", "invalid"].includes(entry.decision)) return "error";
+  if (entry.decision === "bypass") return "bypass";
+  return entry.class || (entry.decision === "local" ? "local" : "external");
+}
+
+function destinationLabel(entry) {
+  if (entry.decision === "reject") return "no external call";
+  if (!entry.provider && !entry.model) return "destination unresolved";
+  return [entry.provider || "unknown", entry.model || "unknown"].join(" / ");
+}
+
+function decisionMatches(entry) {
+  const outcome = $("#decision-outcome").value;
+  if (outcome && decisionGroup(entry) !== outcome) return false;
+  const query = $("#decision-filter").value.trim().toLocaleLowerCase();
+  if (!query) return true;
+  return [
+    entry.prompt,
+    entry.reason,
+    entry.provider,
+    entry.model,
+    entry.target,
+    entry.target_hint,
+    entry.requested_model,
+    entry.request_id,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLocaleLowerCase()
+    .includes(query);
+}
+
+function useDecisionInTest(entry) {
+  $("#test-prompt").value = entry.prompt || "";
+  setPromptMode(entry.mode === "integrated" ? "integrated" : "intercept");
+  location.hash = "#/routing/policy";
+  $("#test-prompt").focus();
+}
+
+function renderDecisions() {
+  const ledger = $("#decision-ledger");
+  for (const card of ledger.querySelectorAll(".decision-card")) card.remove();
+  const visible = decisionEntries.filter(decisionMatches).slice().reverse();
+  $("#decision-empty").hidden = visible.length > 0;
+  $("#decision-empty").textContent = decisionEntries.length
+    ? "no decisions match these filters"
+    : "no routing decisions yet";
+  for (const entry of visible) {
+    const group = decisionGroup(entry);
+    const time = new Date(entry.ts_ms).toLocaleString("en-GB");
+    const requested = entry.requested_model || "unspecified";
+    const triage = entry.triage_model
+      ? `${entry.triage_provider || "unknown"} / ${entry.triage_model}`
+      : "not run";
+    const routeMeta = [
+      `${entry.mode} · ${entry.protocol}`,
+      `requested ${requested}`,
+      `triage ${triage}`,
+      entry.triage_elapsed_ms !== null && entry.triage_elapsed_ms !== undefined
+        ? fmtMs(entry.triage_elapsed_ms)
+        : null,
+      `${entry.policy} policy`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    const destinationMeta = [
+      destinationLabel(entry),
+      entry.class,
+      entry.reasoning_effort && `${entry.reasoning_effort} reasoning`,
+      entry.target && `target ${entry.target}`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    ledger.append(
+      el("article", { class: `decision-card decision-${group}` }, [
+        el("div", { class: "decision-card-top" }, [
+          el("span", { class: `decision-badge decision-badge-${group} mono`, text: entry.decision }),
+          el("span", { class: "decision-destination mono", text: destinationMeta }),
+          el("time", { class: "decision-time mono", datetime: new Date(entry.ts_ms).toISOString(), text: time }),
+        ]),
+        el("p", { class: "decision-reason", text: entry.reason || "No audit reason was supplied." }),
+        entry.target_hint
+          ? el("p", { class: "decision-hint", text: `route hint: ${entry.target_hint}` })
+          : null,
+        el("blockquote", { class: "decision-prompt", text: entry.prompt || "(no user text)" }),
+        entry.error ? el("p", { class: "decision-error-text mono", text: entry.error }) : null,
+        el("div", { class: "decision-card-foot" }, [
+          el("span", { class: "decision-meta mono", text: routeMeta }),
+          entry.decision === "reject"
+            ? el("span", { class: "decision-redacted mono", text: "prompt redacted" })
+            : el("button", {
+                class: "button button-quiet decision-test",
+                type: "button",
+                text: "Test this prompt",
+                onclick: () => useDecisionInTest(entry),
+              }),
+        ]),
+      ])
+    );
+  }
+}
+
+async function pollDecisions() {
+  try {
+    const data = await apiGet(`/api/decisions?after=${decisionLastId}`);
+    decisionLastId = data.latest_id ?? decisionLastId;
+    if (data.entries?.length) {
+      decisionEntries.push(...data.entries);
+      decisionEntries = decisionEntries.slice(-DECISION_BOARD_MAX);
+      renderDecisions();
+    }
+  } catch {
+    /* The proxy lamp reflects API connectivity; older builds may not expose audits. */
+  }
+}
+
 function startPolling() {
   if (statsTimer) clearInterval(statsTimer);
   statsTimer = setInterval(() => {
@@ -565,11 +690,13 @@ function startPolling() {
       pollStats();
       pollLogs();
       pollErrors();
+      pollDecisions();
     }
   }, 2000);
   pollStats();
   pollLogs();
   pollErrors();
+  pollDecisions();
 }
 
 async function loadMonitor() {
@@ -588,7 +715,9 @@ async function loadMonitor() {
     $("#meta-proxy-addr").textContent = proxyAddr;
     $("#meta-interceptor").textContent = overview.interceptor.enabled
       ? `interceptor on · ${overview.interceptor.model}`
-      : "interceptor off";
+      : overview.interceptor.reject_sensitive
+        ? `sensitive screening on · ${overview.interceptor.model}`
+        : "interceptor off";
     $("#footer-version").textContent = `llmproxy ${overview.version}` +
       (overview.launcher ? ` · ${overview.launcher} session` : "");
     $("#footer-config").textContent = overview.config_path || "no config file (defaults)";
@@ -854,6 +983,8 @@ function verdictLabel(verdict) {
   switch (verdict.decision) {
     case "local":
       return "→ local";
+    case "reject":
+      return "→ rejected (no action)";
     case "external":
       return "→ external (PASS)";
     case "default_route":
@@ -880,6 +1011,9 @@ function renderTestResult(prompt, verdict) {
   const card = el("div", { class: `test-result verdict-${verdict.decision}` }, [
     el("div", { class: "test-verdict mono", text: verdictLabel(verdict) }),
     verdict.note ? el("div", { class: "test-note", text: verdict.note }) : null,
+    verdict.reason
+      ? el("div", { class: "test-reason", text: `audit reason: ${verdict.reason}` })
+      : null,
     el("div", { class: "test-meta mono", text: meta }),
     verdict.detail
       ? el("div", { class: "test-detail", text: `local model said: ${verdict.detail}` })
@@ -1029,6 +1163,7 @@ function renderAliasEditor() {
 function renderInterceptorForm() {
   const interceptor = configData.interceptor;
   $("#int-enabled").checked = interceptor.enabled;
+  $("#int-reject-sensitive").checked = interceptor.reject_sensitive;
   providerOptions($("#int-provider"), interceptor.provider, false);
   $("#int-model").value = interceptor.model;
   $("#int-timeout").value = interceptor.timeout_ms;
@@ -1407,6 +1542,19 @@ document.addEventListener("DOMContentLoaded", () => {
     $("#error-empty").hidden = false;
   });
 
+  $("#decision-filter").addEventListener("input", renderDecisions);
+  $("#decision-outcome").addEventListener("change", renderDecisions);
+  $("#clear-decisions").addEventListener("click", async () => {
+    try {
+      await apiSend("/api/decisions/clear", "POST");
+      decisionEntries = [];
+      renderDecisions();
+      toast("Routing decision audit cleared.");
+    } catch (error) {
+      toast("Could not clear routing decisions.", "error", error.message);
+    }
+  });
+
   $("#alias-add-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const name = $("#alias-add-name").value.trim();
@@ -1428,6 +1576,7 @@ document.addEventListener("DOMContentLoaded", () => {
     event.preventDefault();
     const body = {
       enabled: $("#int-enabled").checked,
+      reject_sensitive: $("#int-reject-sensitive").checked,
       provider: $("#int-provider").value,
       model: $("#int-model").value.trim(),
       timeout_ms: Number($("#int-timeout").value) || undefined,

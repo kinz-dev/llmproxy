@@ -206,11 +206,12 @@
         <div>
           <p class="page-kicker mono">Observe / Activity</p>
           <h2>Trace routing outcomes</h2>
-          <p>Review aggregate usage separately from live request and error streams.</p>
+          <p>Review aggregate usage, routing decisions, and live request streams separately.</p>
         </div>
       </header>
       <nav class="subtabs" role="tablist" aria-label="Activity views">
         <a class="subtab" id="subtab-activity-usage" role="tab" href="#/activity/usage">Usage</a>
+        <a class="subtab" id="subtab-activity-decisions" role="tab" href="#/activity/decisions">Decisions</a>
         <a class="subtab" id="subtab-activity-logs" role="tab" href="#/activity/logs">Event log</a>
       </nav>
 
@@ -264,6 +265,35 @@
               </thead>
               <tbody></tbody>
             </table>
+          </div>
+        </section>
+      </div>
+
+      <div id="subview-activity-decisions" class="subview" role="tabpanel" aria-labelledby="subtab-activity-decisions" hidden>
+        <section class="panel decision-panel" aria-labelledby="decision-audit-label">
+          <div class="decision-head">
+            <div>
+              <h3 class="panel-label" id="decision-audit-label">Routing decision audit</h3>
+              <p class="panel-intro">Observable policy reasons and finalized destinations. Entries expire after 24 hours; the timestamped instance log keeps the structured event.</p>
+            </div>
+            <a class="button button-link" href="#/routing/policy">Edit routing policy</a>
+          </div>
+          <div class="decision-controls">
+            <label class="field decision-search"><span class="field-name mono">search decisions</span>
+              <input class="input" id="decision-filter" placeholder="prompt, reason, provider, model"></label>
+            <label class="field decision-outcome"><span class="field-name mono">outcome</span>
+              <select class="input mono" id="decision-outcome">
+                <option value="">all outcomes</option>
+                <option value="local">local</option>
+                <option value="external">external</option>
+                <option value="reject">rejected</option>
+                <option value="bypass">bypass</option>
+                <option value="error">error / fallback</option>
+              </select></label>
+            <button class="button button-quiet" id="clear-decisions" type="button">Clear audit</button>
+          </div>
+          <div class="decision-ledger" id="decision-ledger" aria-live="polite">
+            <div class="decision-empty" id="decision-empty">no routing decisions yet</div>
           </div>
         </section>
       </div>
@@ -336,6 +366,8 @@
                   <input class="input mono" type="number" id="int-max-tokens" min="0" step="64"></label>
               </div>
               <div class="field-row">
+                <label class="field field-check sensitive-reject"><input type="checkbox" id="int-reject-sensitive">
+                  <span>Reject sensitive prompts before routing <span class="choice-note">fail closed if screening is unavailable</span></span></label>
                 <label class="field field-check"><input type="checkbox" id="int-fallback">
                   <span>Fall back to external routing on local errors</span></label>
                 <label class="field field-check"><input type="checkbox" id="int-parallel">
@@ -395,6 +427,7 @@
         <section class="panel" aria-labelledby="sys-label">
           <h3 class="panel-label" id="sys-label">Routing policy</h3>
           <p class="panel-intro">Each mode sends its own system prompt to the local triage model. Changes save independently.</p>
+          <p class="hint">When sensitive rejection is enabled, its mandatory fail-closed rule is appended after this editable policy.</p>
 
           <div class="mode-row">
             <div class="mode-switch" role="group" aria-label="Routing mode">

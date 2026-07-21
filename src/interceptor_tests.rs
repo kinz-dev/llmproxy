@@ -3,7 +3,10 @@ use std::collections::{BTreeMap, HashMap};
 use axum::http::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
-use super::{IntegratedConfig, IntegratedTarget, classify_completion_with_targets};
+use super::{
+    IntegratedConfig, IntegratedTarget, classify_completion_details,
+    classify_completion_with_targets,
+};
 use crate::Config;
 use crate::INTEGRATED_AUTO_MODEL;
 use crate::interceptor::CompletionDecision;
@@ -97,6 +100,16 @@ fn default_route_control_must_be_the_only_local_output() {
     });
     assert_eq!(classify_completion(&pass), CompletionDecision::DefaultRoute);
 
+    let mut reasoned = pass.clone();
+    reasoned["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+        json!(r#"{"reason":"requires current external research"}"#);
+    let classified = classify_completion_details(&reasoned, &BTreeMap::new(), false);
+    assert_eq!(classified.decision, CompletionDecision::DefaultRoute);
+    assert_eq!(
+        classified.reason.as_deref(),
+        Some("requires current external research")
+    );
+
     let mut route_default = pass.clone();
     route_default["choices"][0]["message"]["tool_calls"][0]["function"]["name"] =
         json!("ROUTE_DEFAULT");
@@ -128,6 +141,75 @@ fn default_route_control_must_be_the_only_local_output() {
     assert_eq!(
         classify_completion(&arguments),
         CompletionDecision::InvalidControl
+    );
+}
+
+#[test]
+fn sensitive_rejection_is_optional_and_uses_safe_reason_categories() {
+    let config = Config::default();
+    let interceptor = InterceptorConfig {
+        reject_sensitive: true,
+        model: "triage".to_string(),
+        ..InterceptorConfig::default()
+    };
+    let local = build_local_request(
+        json!({ "messages": [{ "role": "user", "content": "sensitive request" }] }),
+        &interceptor,
+        InterceptorProtocol::ChatCompletions,
+        Some("agent-model"),
+        &HashMap::new(),
+        &config,
+    )
+    .unwrap();
+    let reject = local["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "REJECT")
+        .unwrap();
+    assert_eq!(
+        reject["function"]["parameters"]["properties"]["reason"]["enum"],
+        json!([
+            "credential or secret",
+            "personally identifiable information",
+            "other sensitive information"
+        ])
+    );
+    assert!(local.to_string().contains("Mandatory pre-routing rule"));
+    assert!(local.to_string().contains("rejection-screening only"));
+
+    let completion = json!({
+        "choices": [{
+            "message": {
+                "content": Value::Null,
+                "tool_calls": [{
+                    "function": {
+                        "name": "REJECT",
+                        "arguments": r#"{"reason":"personally identifiable information"}"#
+                    }
+                }]
+            }
+        }]
+    });
+    let classified = classify_completion_details(&completion, &BTreeMap::new(), true);
+    assert_eq!(classified.decision, CompletionDecision::Reject);
+    assert_eq!(
+        classified.reason.as_deref(),
+        Some("personally identifiable information")
+    );
+    assert_eq!(
+        classify_completion_details(&completion, &BTreeMap::new(), false).decision,
+        CompletionDecision::Local
+    );
+
+    let mut unsafe_reason = completion;
+    unsafe_reason["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+        json!(r#"{"reason":"the secret was abc123"}"#);
+    assert_eq!(
+        classify_completion_details(&unsafe_reason, &BTreeMap::new(), true)
+            .reason
+            .as_deref(),
+        Some("other sensitive information")
     );
 }
 
@@ -214,6 +296,16 @@ fn integrated_request_adds_target_tools_and_prompt_hints() {
     assert!(tool_names.contains(&"ROUTE_DEFAULT"));
     assert!(!tool_names.contains(&"PASS"));
     assert!(tool_names.contains(&"backend"));
+    for tool in local["tools"].as_array().unwrap() {
+        assert_eq!(
+            tool["function"]["parameters"]["required"],
+            json!(["reason"])
+        );
+        assert_eq!(
+            tool["function"]["parameters"]["additionalProperties"],
+            false
+        );
+    }
     let prompt = local["messages"]
         .as_array()
         .unwrap()

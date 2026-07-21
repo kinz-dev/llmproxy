@@ -54,6 +54,41 @@ pub(super) fn render_local_completion(
     }
 }
 
+pub(super) fn render_rejection(
+    protocol: InterceptorProtocol,
+    reason: &str,
+    client_model: Option<String>,
+    streaming: bool,
+    request_id: &str,
+) -> Response {
+    let message = format!(
+        "No action was taken. llmproxy blocked this request before external routing because it may contain {reason}. Redact the sensitive data and retry."
+    );
+    let completion = json!({
+        "id": "chatcmpl_rejected",
+        "object": "chat.completion",
+        "created": unix_timestamp(),
+        "model": "llmproxy-reject",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": message },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
+    });
+    let mut response =
+        render_local_completion(protocol, completion, client_model, streaming, request_id);
+    response.headers_mut().insert(
+        HeaderName::from_static(LOCAL_ROUTE_HEADER),
+        HeaderValue::from_static("reject"),
+    );
+    response
+}
+
 fn routed_json_response(value: Value, request_id: &str) -> Response {
     let mut response = Json(value).into_response();
     add_route_headers(&mut response, request_id);

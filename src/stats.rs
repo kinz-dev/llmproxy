@@ -13,7 +13,7 @@ use axum::body::Body;
 use axum::response::Response;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tracing::{error, trace};
+use tracing::{error, info, trace};
 
 use crate::is_event_stream_content_type;
 
@@ -195,6 +195,7 @@ pub(crate) struct ProxyStats {
     intercept_attempts: AtomicU64,
     intercept_bypass: AtomicU64,
     intercept_local: AtomicU64,
+    intercept_reject: AtomicU64,
     intercept_pass: AtomicU64,
     intercept_redirect: AtomicU64,
     intercept_fallback: AtomicU64,
@@ -260,6 +261,10 @@ impl ProxyStats {
 
     pub(crate) fn record_intercept_pass(&self) {
         self.intercept_pass.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_intercept_reject(&self) {
+        self.intercept_reject.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_intercept_redirect(&self, target: &str) {
@@ -378,6 +383,7 @@ impl ProxyStats {
             &self.intercept_attempts,
             &self.intercept_bypass,
             &self.intercept_local,
+            &self.intercept_reject,
             &self.intercept_pass,
             &self.intercept_redirect,
             &self.intercept_fallback,
@@ -524,6 +530,7 @@ impl ProxyStats {
                 "attempts": load(&self.intercept_attempts),
                 "bypass": load(&self.intercept_bypass),
                 "local": load(&self.intercept_local),
+                "reject": load(&self.intercept_reject),
                 "pass": load(&self.intercept_pass),
                 "redirect": load(&self.intercept_redirect),
                 "fallback": load(&self.intercept_fallback),
@@ -1207,6 +1214,151 @@ impl ErrorLog {
     pub(crate) fn snapshot_after(&self, after: u64) -> Value {
         self.buffer.snapshot_after(after, ERROR_LOG_TTL)
     }
+}
+
+const ROUTING_DECISION_LOG_CAP: usize = 512;
+const ROUTING_DECISION_LOG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const ROUTING_PROMPT_PREVIEW_CHARS: usize = 600;
+const ROUTING_DETAIL_CHARS: usize = 400;
+
+#[derive(Debug, Clone)]
+pub(crate) struct RoutingDecisionAudit {
+    pub(crate) request_id: String,
+    pub(crate) mode: &'static str,
+    pub(crate) protocol: &'static str,
+    pub(crate) requested_model: Option<String>,
+    pub(crate) prompt: String,
+    pub(crate) decision: &'static str,
+    pub(crate) reason: String,
+    pub(crate) policy: &'static str,
+    pub(crate) triage_provider: Option<String>,
+    pub(crate) triage_model: Option<String>,
+    pub(crate) triage_elapsed_ms: Option<u64>,
+    pub(crate) target: Option<String>,
+    pub(crate) target_hint: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) route_class: Option<RouteClass>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) error: Option<String>,
+}
+
+struct RoutingDecisionEntry {
+    metadata: LogMetadata,
+    audit: RoutingDecisionAudit,
+}
+
+impl LogEntry for RoutingDecisionEntry {
+    fn metadata(&self) -> &LogMetadata {
+        &self.metadata
+    }
+
+    fn to_json(&self) -> Value {
+        let audit = &self.audit;
+        json!({
+            "id": self.metadata.id,
+            "ts_ms": self.metadata.epoch_ms,
+            "request_id": audit.request_id,
+            "mode": audit.mode,
+            "protocol": audit.protocol,
+            "requested_model": audit.requested_model,
+            "prompt": audit.prompt,
+            "decision": audit.decision,
+            "reason": audit.reason,
+            "policy": audit.policy,
+            "triage_provider": audit.triage_provider,
+            "triage_model": audit.triage_model,
+            "triage_elapsed_ms": audit.triage_elapsed_ms,
+            "target": audit.target,
+            "target_hint": audit.target_hint,
+            "provider": audit.provider,
+            "model": audit.model,
+            "class": audit.route_class.map(RouteClass::as_str),
+            "reasoning_effort": audit.reasoning_effort,
+            "error": audit.error,
+        })
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RoutingDecisionLog {
+    buffer: LogBuffer<RoutingDecisionEntry>,
+}
+
+pub(crate) fn routing_decision_log() -> &'static RoutingDecisionLog {
+    static LOG: OnceLock<RoutingDecisionLog> = OnceLock::new();
+    LOG.get_or_init(RoutingDecisionLog::default)
+}
+
+impl RoutingDecisionLog {
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        self.buffer.set_enabled(enabled);
+    }
+
+    pub(crate) fn record(&self, mut audit: RoutingDecisionAudit) {
+        audit.prompt = bounded_single_line(audit.prompt, ROUTING_PROMPT_PREVIEW_CHARS);
+        audit.reason = bounded_single_line(audit.reason, ROUTING_DETAIL_CHARS);
+        audit.target_hint = audit
+            .target_hint
+            .map(|hint| bounded_single_line(hint, ROUTING_DETAIL_CHARS));
+        audit.error = audit
+            .error
+            .map(|error| bounded_single_line(error, ROUTING_DETAIL_CHARS));
+
+        info!(
+            request_id = audit.request_id,
+            mode = audit.mode,
+            protocol = audit.protocol,
+            requested_model = audit.requested_model.as_deref().unwrap_or(""),
+            decision = audit.decision,
+            reason = audit.reason,
+            policy = audit.policy,
+            triage_provider = audit.triage_provider.as_deref().unwrap_or(""),
+            triage_model = audit.triage_model.as_deref().unwrap_or(""),
+            triage_elapsed_ms = audit.triage_elapsed_ms,
+            target = audit.target.as_deref().unwrap_or(""),
+            target_hint = audit.target_hint.as_deref().unwrap_or(""),
+            provider = audit.provider.as_deref().unwrap_or(""),
+            model = audit.model.as_deref().unwrap_or(""),
+            route_class = audit.route_class.map(RouteClass::as_str).unwrap_or(""),
+            reasoning_effort = audit.reasoning_effort.as_deref().unwrap_or(""),
+            error = audit.error.as_deref().unwrap_or(""),
+            "routing decision audit"
+        );
+
+        self.buffer.record(
+            ROUTING_DECISION_LOG_CAP,
+            ROUTING_DECISION_LOG_TTL,
+            move |metadata| RoutingDecisionEntry { metadata, audit },
+        );
+    }
+
+    pub(crate) fn clear(&self) {
+        self.buffer.clear();
+    }
+
+    pub(crate) fn snapshot_after(&self, after: u64) -> Value {
+        self.buffer.snapshot_after(after, ROUTING_DECISION_LOG_TTL)
+    }
+}
+
+fn bounded_single_line(value: String, limit: usize) -> String {
+    let mut value = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(limit + 1)
+        .collect::<String>();
+    if value.chars().count() > limit {
+        value.pop();
+        value.push('…');
+    }
+    value
 }
 
 /// Trace the full JSON body and retain a bounded preview for the admin UI.

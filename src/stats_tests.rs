@@ -198,6 +198,7 @@ fn stats_counters_and_snapshot_shape() {
     stats.record_remap(RemapKind::Auto);
     stats.record_intercept_attempt();
     stats.record_intercept_bypass();
+    stats.record_intercept_reject();
     let local_usage = TokenUsage::from_response(
         Some(&json!({ "prompt_tokens": 10, "completion_tokens": 5 })),
         1,
@@ -245,6 +246,7 @@ fn stats_counters_and_snapshot_shape() {
     assert_eq!(snapshot["intercept"]["attempts"], 1);
     assert_eq!(snapshot["intercept"]["bypass"], 1);
     assert_eq!(snapshot["intercept"]["local"], 1);
+    assert_eq!(snapshot["intercept"]["reject"], 1);
     assert_eq!(snapshot["intercept"]["pass"], 1);
     assert_eq!(snapshot["intercept"]["redirect"], 1);
     assert_eq!(snapshot["intercept"]["redirects"]["PROVIDER_TEST"], 1);
@@ -293,6 +295,7 @@ fn stats_counters_and_snapshot_shape() {
     let snapshot = stats.snapshot_json();
     assert_eq!(snapshot["requests"]["total"], 0);
     assert_eq!(snapshot["intercept"]["bypass"], 0);
+    assert_eq!(snapshot["intercept"]["reject"], 0);
     assert_eq!(snapshot["served"]["local"], 0);
     assert_eq!(snapshot["latency"]["local"]["samples"], 0);
     assert!(snapshot["model_usage"].as_array().unwrap().is_empty());
@@ -390,6 +393,57 @@ fn traffic_log_is_bounded() {
     let entries = snapshot["entries"].as_array().unwrap();
     assert_eq!(entries.len(), TRAFFIC_LOG_CAP);
     assert_eq!(entries[0]["text"], "25");
+}
+
+#[test]
+fn routing_decision_log_is_incremental_and_sanitized() {
+    let log = RoutingDecisionLog::default();
+    log.set_enabled(true);
+    log.record(RoutingDecisionAudit {
+        request_id: "request-test".to_string(),
+        mode: "integrated",
+        protocol: "responses",
+        requested_model: Some("Auto".to_string()),
+        prompt: format!("inspect\n{}", "x".repeat(ROUTING_PROMPT_PREVIEW_CHARS + 20)),
+        decision: "redirect",
+        reason: "matched the research route\nwith current sources".to_string(),
+        policy: "built-in",
+        triage_provider: Some("local".to_string()),
+        triage_model: Some("triage".to_string()),
+        triage_elapsed_ms: Some(12),
+        target: Some("RESEARCH".to_string()),
+        target_hint: Some("online research".to_string()),
+        provider: Some("external".to_string()),
+        model: Some("research-model".to_string()),
+        route_class: Some(RouteClass::External),
+        reasoning_effort: Some("max".to_string()),
+        error: None,
+    });
+
+    let snapshot = log.snapshot_after(0);
+    let entry = &snapshot["entries"][0];
+    assert_eq!(entry["decision"], "redirect");
+    assert_eq!(entry["class"], "external");
+    assert_eq!(entry["model"], "research-model");
+    assert_eq!(entry["reasoning_effort"], "max");
+    assert!(!entry["prompt"].as_str().unwrap().contains('\n'));
+    assert!(entry["prompt"].as_str().unwrap().ends_with('…'));
+    assert!(!entry["reason"].as_str().unwrap().contains('\n'));
+
+    let latest = snapshot["latest_id"].as_u64().unwrap();
+    assert!(
+        log.snapshot_after(latest)["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    log.clear();
+    assert!(
+        log.snapshot_after(0)["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

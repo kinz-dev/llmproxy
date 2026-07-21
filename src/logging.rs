@@ -1,11 +1,13 @@
 use std::{
     fs::{self, File, OpenOptions},
     io,
-    os::unix::fs::OpenOptionsExt,
     path::Path,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, bail};
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
@@ -103,12 +105,11 @@ fn create_instance_log(directory: &Path) -> Result<(File, String)> {
         let timestamp = compact_utc_timestamp(SystemTime::now())?;
         let file_name = format!("{LOG_PREFIX}{timestamp}{LOG_SUFFIX}");
         let path = directory.join(&file_name);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
             Ok(file) => return Ok((file, file_name)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -200,6 +201,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -244,6 +246,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn instance_logs_are_owner_only() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)

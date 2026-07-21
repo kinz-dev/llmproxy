@@ -806,6 +806,125 @@ code.mono { font-size: 0.85em; color: var(--muted); }
 .log-error-src { color: var(--muted); }
 .log-error-msg { color: var(--danger); }
 
+/* Routing decision audit */
+
+.decision-panel { overflow: hidden; }
+
+.decision-head,
+.decision-card-top,
+.decision-card-foot,
+.decision-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.decision-head { justify-content: space-between; align-items: flex-start; }
+.decision-head .panel-intro { margin-bottom: 0; }
+
+.decision-controls {
+  margin: 20px 0 14px;
+  padding: 12px;
+  background: #0B1113;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.decision-search { flex: 1 1 320px; }
+.decision-outcome { flex: 0 1 190px; }
+.decision-controls .button { margin-left: auto; }
+
+.decision-ledger {
+  display: grid;
+  gap: 10px;
+  max-height: min(66vh, 760px);
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+.decision-empty {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 42px 16px;
+  text-align: center;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+}
+
+.decision-card {
+  --decision-accent: var(--line-strong);
+  position: relative;
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--decision-accent) 8%, transparent), transparent 38%),
+    var(--panel-2);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--decision-accent);
+  border-radius: 6px;
+  padding: 13px 15px;
+}
+
+.decision-local { --decision-accent: var(--local); }
+.decision-external { --decision-accent: var(--external); }
+.decision-reject { --decision-accent: var(--danger); }
+.decision-error { --decision-accent: var(--danger); }
+
+.decision-card-top { min-width: 0; }
+
+.decision-badge {
+  color: var(--decision-accent);
+  border: 1px solid color-mix(in srgb, var(--decision-accent) 55%, var(--line));
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  padding: 2px 8px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.decision-badge-bypass { color: var(--muted); }
+.decision-destination { color: var(--ink); font-size: 12px; overflow-wrap: anywhere; }
+.decision-time { color: var(--faint); font-size: 10.5px; margin-left: auto; white-space: nowrap; }
+
+.decision-reason {
+  color: var(--ink);
+  font-size: 13.5px;
+  margin: 11px 0 4px;
+}
+
+.decision-hint { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+
+.decision-prompt {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  margin: 9px 0;
+  padding: 8px 10px;
+  background: #0B1113;
+  border-left: 2px solid var(--line-strong);
+  border-radius: 0 4px 4px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.decision-error-text { color: var(--danger); font-size: 11.5px; margin: 8px 0; }
+.decision-card-foot { justify-content: space-between; align-items: flex-end; }
+.decision-meta { color: var(--faint); font-size: 10.5px; overflow-wrap: anywhere; }
+.decision-redacted { color: var(--danger); font-size: 10.5px; }
+.decision-test { flex: 0 0 auto; }
+
+@media (max-width: 700px) {
+  .decision-head,
+  .decision-card-top,
+  .decision-card-foot { align-items: flex-start; flex-direction: column; }
+  .decision-time { margin-left: 0; }
+  .decision-test { width: 100%; }
+}
+
 /* System prompt */
 
 .sys-editor { line-height: 1.6; font-size: 12.5px; }
@@ -915,7 +1034,8 @@ code.mono { font-size: 0.85em; color: var(--muted); }
 .test-result.verdict-redirect { border-left-color: var(--external); }
 .test-result.verdict-default_route { border-left-color: var(--line-strong); }
 .test-result.verdict-error,
-.test-result.verdict-invalid { border-left-color: var(--danger); }
+.test-result.verdict-invalid,
+.test-result.verdict-reject { border-left-color: var(--danger); }
 
 .test-verdict {
   font-size: 13px;
@@ -929,9 +1049,14 @@ code.mono { font-size: 0.85em; color: var(--muted); }
 .verdict-redirect .test-verdict { color: var(--external); }
 .verdict-default_route .test-verdict { color: var(--muted); }
 .verdict-error .test-verdict,
-.verdict-invalid .test-verdict { color: var(--danger); }
+.verdict-invalid .test-verdict,
+.verdict-reject .test-verdict { color: var(--danger); }
+
+.sensitive-reject { color: var(--ink); }
+.sensitive-reject input { accent-color: var(--danger); }
 
 .test-note { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+.test-reason { color: var(--ink); font-size: 12.5px; margin-top: 5px; }
 
 .test-meta {
   color: var(--faint);

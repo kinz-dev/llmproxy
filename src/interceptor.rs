@@ -22,7 +22,8 @@ use crate::normalize_chat_completion_request;
 use crate::request_id_from_headers;
 use crate::rewrite_request_roles;
 use crate::stats::{
-    RouteClass, TokenUsage, log_request_value, log_response_text, log_response_value, proxy_stats,
+    RouteClass, RoutingDecisionAudit, TokenUsage, log_request_value, log_response_text,
+    log_response_value, proxy_stats, route_class_for_base_url, routing_decision_log,
 };
 use crate::text_from_value;
 use crate::upstream_error_response;
@@ -31,6 +32,9 @@ use crate::{ProviderState, proxy_integrated_chat};
 
 const PASS_TOOL_NAME: &str = "PASS";
 const ROUTE_DEFAULT_TOOL_NAME: &str = "ROUTE_DEFAULT";
+const REJECT_TOOL_NAME: &str = "REJECT";
+const GENERIC_REJECTION_REASON: &str = "other sensitive information";
+const SENSITIVE_REJECTION_INSTRUCTIONS: &str = r#"Sensitive-data rejection is enabled and takes precedence over every local answer and routing choice. If the original request contains an actual credential, secret, personally identifiable information, or other sensitive information, call REJECT alone. Select only the matching safe reason category; never copy, quote, transform, or summarize the sensitive value. Do not answer the request, call a caller tool, or select any provider route."#;
 const LOCAL_ROUTE_HEADER: &str = "x-llmproxy-route";
 const CODEX_TURN_METADATA_KEY: &str = "x-codex-turn-metadata";
 const CODEX_REQUEST_KIND_KEY: &str = "request_kind";
@@ -45,9 +49,9 @@ Handle it locally only when ALL of these hold:
 - It needs at most one tool call, and the tool and its exact arguments are obvious without discovery.
 - One short response completes it, and you are certain it is correct.
 
-Otherwise call PASS with {} — including whenever the task needs research, current information, planning, debugging, comparison, recommendation, judgment, or could have financial, legal, medical, security, or operational consequences. When unsure, PASS.
+Otherwise call PASS with a brief reason naming the policy condition that matched — including whenever the task needs research, current information, planning, debugging, comparison, recommendation, judgment, or could have financial, legal, medical, security, or operational consequences. When unsure, PASS.
 
-Never ask clarifying questions, explain your decision, or answer partially. Emit only the PASS call, or exactly the assistant message or single tool call that completes the request."#;
+Never ask clarifying questions or answer partially. The reason is concise audit metadata, not hidden reasoning, and must appear only in the routing tool arguments. Emit only the PASS call, or exactly the assistant message or single tool call that completes the request."#;
 
 /// Base routing policy used instead of [`DEFAULT_INSTRUCTIONS`] when
 /// integrated mode is on and the operator has not overridden the prompt.
@@ -60,11 +64,11 @@ Answer locally only when ALL of these hold:
 - It needs at most one tool call, and the tool and its exact arguments are obvious without discovery.
 - One short response completes it, and you are certain it is correct.
 
-Everything else is routed, never answered locally: research, planning, investigation, design, implementation, debugging, comparison, recommendation, judgment, and anything with financial, legal, medical, security, or operational consequences. Call exactly one provider route from the list below, choosing the route whose hint matches the request; a route hinted as the default owns everything no other route clearly claims. Call ROUTE_DEFAULT with {} only when no route fits.
+Everything else is routed, never answered locally: research, planning, investigation, design, implementation, debugging, comparison, recommendation, judgment, and anything with financial, legal, medical, security, or operational consequences. Call exactly one provider route from the list below, choosing the route whose hint matches the request; a route hinted as the default owns everything no other route clearly claims. Include a brief reason naming the policy condition or route hint that matched. Call ROUTE_DEFAULT only when no route fits.
 
 Complex online research, current-information investigation, and source-backed multi-step analysis must use the matching dedicated research route at max or xhigh reasoning effort when one is configured. Never answer that work locally or send it to a weaker general route.
 
-Never ask clarifying questions, explain your decision, or answer partially. Emit only one provider route call, the ROUTE_DEFAULT call, or exactly the assistant message or single tool call that completes the request."#;
+Never ask clarifying questions or answer partially. The reason is concise audit metadata, not hidden reasoning, and must appear only in the routing tool arguments. Emit only one provider route call, the ROUTE_DEFAULT call, or exactly the assistant message or single tool call that completes the request."#;
 
 /// The intercept-mode policy: the operator override, or the built-in default
 /// when the override is empty or untouched.
@@ -98,6 +102,8 @@ pub(crate) fn integrated_instructions_are_default(integrated: &IntegratedConfig)
 #[serde(default)]
 pub(crate) struct InterceptorConfig {
     pub(crate) enabled: bool,
+    /// Fail-closed local screening before any normal/local routing outcome.
+    pub(crate) reject_sensitive: bool,
     pub(crate) provider: String,
     pub(crate) model: String,
     pub(crate) timeout_ms: u64,
@@ -154,6 +160,7 @@ impl Default for InterceptorConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            reject_sensitive: false,
             provider: "local".to_string(),
             model: String::new(),
             timeout_ms: 60_000,
@@ -261,16 +268,153 @@ fn has_compaction_trigger(request: &Value) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CompletionDecision {
     Local,
+    Reject,
     DefaultRoute,
     Redirect(String),
     InvalidControl,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionClassification {
+    decision: CompletionDecision,
+    reason: Option<String>,
+}
+
+pub(crate) enum InterceptionOutcome {
+    Continue(RoutingAuditDraft),
+    Respond(Response),
+}
+
+pub(crate) struct RoutingAuditDraft {
+    audit: RoutingDecisionAudit,
+}
+
+impl RoutingAuditDraft {
+    fn new(
+        state: &AppState,
+        request_id: String,
+        protocol: InterceptorProtocol,
+        request: &Value,
+        requested_model: Option<String>,
+        integrated: bool,
+    ) -> Self {
+        let mode = if integrated
+            || (!state.config.interceptor.enabled && state.config.integrated.enabled)
+        {
+            "integrated"
+        } else {
+            "intercept"
+        };
+        let policy = match mode {
+            "integrated" if integrated_instructions_are_default(&state.config.integrated) => {
+                "built-in"
+            }
+            "intercept" if intercept_instructions_are_default(&state.config.interceptor) => {
+                "built-in"
+            }
+            _ => "custom",
+        };
+        Self {
+            audit: RoutingDecisionAudit {
+                request_id,
+                mode,
+                protocol: protocol.as_str(),
+                requested_model,
+                prompt: request_prompt_preview(request),
+                decision: "pending",
+                reason: String::new(),
+                policy,
+                triage_provider: None,
+                triage_model: None,
+                triage_elapsed_ms: None,
+                target: None,
+                target_hint: None,
+                provider: None,
+                model: None,
+                route_class: None,
+                reasoning_effort: None,
+                error: None,
+            },
+        }
+    }
+
+    fn set_decision(&mut self, decision: &'static str, reason: impl Into<String>) {
+        self.audit.decision = decision;
+        self.audit.reason = reason.into();
+    }
+
+    fn set_triage(&mut self, provider: &ProviderState, model: &str, elapsed: Duration) {
+        self.audit.triage_provider = Some(provider.name.clone());
+        self.audit.triage_model = Some(model.to_string());
+        self.audit.triage_elapsed_ms = Some(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
+    }
+
+    fn set_target(&mut self, name: &str, target: &IntegratedTarget) {
+        self.audit.target = Some(name.to_string());
+        self.audit.target_hint = Some(target.hint.clone());
+        self.audit.reasoning_effort = target
+            .reasoning_effort
+            .map(crate::ReasoningEffort::as_str)
+            .map(str::to_string);
+    }
+
+    fn set_error(&mut self, error: impl Into<String>) {
+        self.audit.error = Some(error.into());
+    }
+
+    fn redact_prompt(&mut self) {
+        self.audit.prompt = "[redacted: sensitive prompt]".to_string();
+    }
+
+    pub(crate) fn record_destination(mut self, provider: &ProviderState, model: &str) {
+        self.audit.provider = Some(provider.name.clone());
+        self.audit.model = Some(model.to_string());
+        self.audit.route_class = Some(route_class_for_base_url(&provider.config.base_url));
+        if self.audit.reasoning_effort.is_none() {
+            self.audit.reasoning_effort = provider
+                .config
+                .reasoning_effort
+                .map(crate::ReasoningEffort::as_str)
+                .map(str::to_string);
+        }
+        routing_decision_log().record(self.audit);
+    }
+
+    pub(crate) fn record_route_error(mut self, error: impl Into<String>) {
+        self.set_error(error);
+        if self.audit.reason.is_empty() {
+            self.audit.reason =
+                "Normal routing failed before a provider/model destination was resolved."
+                    .to_string();
+        }
+        routing_decision_log().record(self.audit);
+    }
+
+    fn record(self) {
+        routing_decision_log().record(self.audit);
+    }
+}
+
+fn request_prompt_preview(request: &Value) -> String {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        })
+        .and_then(|message| message.get("content"))
+        .map(text_from_value)
+        .unwrap_or_else(|| "(no user text)".to_string())
 }
 
 pub(crate) fn validate_config(
     config: &InterceptorConfig,
     providers: &HashMap<String, UpstreamConfig>,
 ) -> Result<()> {
-    if !config.enabled {
+    if !config.enabled && !config.reject_sensitive {
         return Ok(());
     }
     if config.provider.trim().is_empty() {
@@ -475,15 +619,27 @@ pub(crate) async fn maybe_intercept(
     policy: InterceptionPolicy,
     client_model: Option<String>,
     client_streaming: bool,
-) -> Option<Response> {
+) -> InterceptionOutcome {
     let config = &state.config.interceptor;
     let integrated =
         integrated_routing_requested(&state.config.integrated, client_model.as_deref());
-    if !config.enabled && !integrated {
-        return None;
+    let request_id = request_id_from_headers(incoming_headers);
+    let mut audit = RoutingAuditDraft::new(
+        state,
+        request_id.clone(),
+        protocol,
+        &local_chat_request,
+        client_model.clone(),
+        integrated,
+    );
+    if !config.enabled && !integrated && !config.reject_sensitive {
+        audit.set_decision(
+            "bypass",
+            "An explicit model bypassed integrated triage and standalone interception is disabled.",
+        );
+        return InterceptionOutcome::Continue(audit);
     }
 
-    let request_id = request_id_from_headers(incoming_headers);
     if let Some(request_kind) = policy.bypass_kind() {
         info!(
             request_id,
@@ -493,16 +649,32 @@ pub(crate) async fn maybe_intercept(
             "local interceptor bypassed control request"
         );
         proxy_stats().record_intercept_bypass();
-        return None;
+        audit.set_decision(
+            "bypass",
+            format!("Native control request kind {request_kind:?} requires external passthrough."),
+        );
+        return InterceptionOutcome::Continue(audit);
     }
     proxy_stats().record_intercept_attempt();
 
     let conversation_key =
         integrated.then(|| conversation_key(incoming_headers, &local_chat_request));
-    if let Some(key) = conversation_key
+    if !config.reject_sensitive
+        && let Some(key) = conversation_key
         && let Some(target) = sticky_routes().lookup(key)
         && state.config.integrated.targets.contains_key(&target)
     {
+        let target_config = state
+            .config
+            .integrated
+            .targets
+            .get(&target)
+            .expect("validated sticky route target missing");
+        audit.set_decision(
+            "sticky",
+            "The conversation already has a successful integrated route within the sticky TTL.",
+        );
+        audit.set_target(&target, target_config);
         info!(
             request_id,
             protocol = protocol.as_str(),
@@ -518,6 +690,7 @@ pub(crate) async fn maybe_intercept(
             client_model,
             client_streaming,
             Some(key),
+            audit,
         )
         .await;
     }
@@ -540,7 +713,16 @@ pub(crate) async fn maybe_intercept(
                 error = %message,
                 "local interceptor could not prepare request"
             );
-            return fallback_or_error(config, StatusCode::BAD_GATEWAY, &request_id, message);
+            return fallback_or_error(
+                config,
+                StatusCode::BAD_GATEWAY,
+                &request_id,
+                message,
+                audit,
+                protocol,
+                client_model,
+                client_streaming,
+            );
         }
     };
 
@@ -556,10 +738,19 @@ pub(crate) async fn maybe_intercept(
         UpstreamResponseKind::Json,
         false,
     );
+    let meta = if config.reject_sensitive {
+        meta.without_body_logging()
+    } else {
+        meta
+    };
     let local_headers = HeaderMap::new();
     let estimated_input_tokens = crate::estimate_tokens(&local_request) as u64;
+    audit.audit.triage_provider = Some(provider.name.clone());
+    audit.audit.triage_model = Some(config.model.clone());
 
-    log_request_value(RouteClass::Local, &provider.name, &local_request);
+    if !config.reject_sensitive {
+        log_request_value(RouteClass::Local, &provider.name, &local_request);
+    }
     let started_at = std::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_millis(config.timeout_ms),
@@ -570,6 +761,8 @@ pub(crate) async fn maybe_intercept(
     let completion = match result {
         Ok(Ok(completion)) => completion,
         Ok(Err(error)) => {
+            audit.audit.triage_elapsed_ms =
+                Some(started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
             log_response_text(RouteClass::Local, &provider.name, format!("error: {error}"));
             crate::stats::error_log().record(&provider.name, "interceptor", error.to_string());
             error!(
@@ -581,15 +774,39 @@ pub(crate) async fn maybe_intercept(
                 fallback = config.fallback_on_error,
                 "local interceptor request failed"
             );
+            audit.set_error(error.to_string());
+            if config.reject_sensitive {
+                return fallback_or_error(
+                    config,
+                    StatusCode::BAD_GATEWAY,
+                    &meta.request_id,
+                    error.to_string(),
+                    audit,
+                    protocol,
+                    client_model,
+                    client_streaming,
+                );
+            }
             return if config.fallback_on_error {
                 proxy_stats().record_intercept_fallback();
-                None
+                audit.set_decision(
+                    "fallback",
+                    "The local triage request failed and fallback_on_error selected normal routing.",
+                );
+                InterceptionOutcome::Continue(audit)
             } else {
                 proxy_stats().record_intercept_error();
-                Some(upstream_error_response(&error))
+                audit.set_decision(
+                    "error",
+                    "The local triage request failed and fallback_on_error is disabled.",
+                );
+                audit.record();
+                InterceptionOutcome::Respond(upstream_error_response(&error))
             };
         }
         Err(_) => {
+            audit.audit.triage_elapsed_ms =
+                Some(started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
             let message = format!("local interceptor timed out after {}ms", config.timeout_ms);
             log_response_text(RouteClass::Local, &provider.name, message.as_str());
             error!(
@@ -605,6 +822,10 @@ pub(crate) async fn maybe_intercept(
                 StatusCode::GATEWAY_TIMEOUT,
                 &meta.request_id,
                 message,
+                audit,
+                protocol,
+                client_model,
+                client_streaming,
             );
         }
     };
@@ -614,8 +835,11 @@ pub(crate) async fn maybe_intercept(
         estimated_input_tokens,
         crate::estimate_tokens(&completion) as u64,
     );
+    audit.set_triage(provider, &config.model, local_elapsed);
     proxy_stats().record_model_usage(&provider.name, &config.model, local_elapsed, local_usage);
-    log_response_value(RouteClass::Local, &provider.name, &completion);
+    if !config.reject_sensitive {
+        log_response_value(RouteClass::Local, &provider.name, &completion);
+    }
 
     if first_chat_choice_message(&completion).is_none() {
         let message = "local interceptor returned no assistant message".to_string();
@@ -626,7 +850,16 @@ pub(crate) async fn maybe_intercept(
             fallback = config.fallback_on_error,
             "{message}"
         );
-        return fallback_or_error(config, StatusCode::BAD_GATEWAY, &meta.request_id, message);
+        return fallback_or_error(
+            config,
+            StatusCode::BAD_GATEWAY,
+            &meta.request_id,
+            message,
+            audit,
+            protocol,
+            client_model,
+            client_streaming,
+        );
     }
 
     if completion_truncated(&completion) {
@@ -643,7 +876,16 @@ pub(crate) async fn maybe_intercept(
             fallback = config.fallback_on_error,
             "{message}"
         );
-        return fallback_or_error(config, StatusCode::BAD_GATEWAY, &meta.request_id, message);
+        return fallback_or_error(
+            config,
+            StatusCode::BAD_GATEWAY,
+            &meta.request_id,
+            message,
+            audit,
+            protocol,
+            client_model,
+            client_streaming,
+        );
     }
 
     let no_targets = BTreeMap::new();
@@ -652,8 +894,45 @@ pub(crate) async fn maybe_intercept(
     } else {
         &no_targets
     };
-    match classify_completion_with_targets(&completion, decision_targets) {
+    let classification =
+        classify_completion_details(&completion, decision_targets, config.reject_sensitive);
+    let reason = classification.reason.clone().unwrap_or_else(|| {
+        match classification.decision {
+            CompletionDecision::Local =>
+                "The triage model emitted a direct answer or caller tool call and no routing control."
+                    .to_string(),
+            CompletionDecision::Reject => GENERIC_REJECTION_REASON.to_string(),
+            CompletionDecision::DefaultRoute =>
+                "The triage model emitted a legacy routing control without an audit reason."
+                    .to_string(),
+            CompletionDecision::Redirect(ref target) => state
+                .config
+                .integrated
+                .targets
+                .get(target)
+                .map(|route| format!("The triage model selected the route hinted for: {}", route.hint))
+                .unwrap_or_else(|| "The triage model selected an integrated route.".to_string()),
+            CompletionDecision::InvalidControl =>
+                "The triage model mixed routing control with other output or invalid arguments."
+                    .to_string(),
+        }
+    });
+    match classification.decision {
+        CompletionDecision::Reject => {
+            audit.set_decision("reject", reason.clone());
+            audit.redact_prompt();
+            proxy_stats().record_intercept_reject();
+            audit.record();
+            InterceptionOutcome::Respond(render_rejection(
+                protocol,
+                &reason,
+                client_model,
+                client_streaming,
+                &meta.request_id,
+            ))
+        }
         CompletionDecision::DefaultRoute => {
+            audit.set_decision(if integrated { "default_route" } else { "pass" }, reason);
             info!(
                 request_id = %meta.request_id,
                 protocol = protocol.as_str(),
@@ -663,9 +942,17 @@ pub(crate) async fn maybe_intercept(
                 "local interceptor selected route"
             );
             proxy_stats().record_intercept_pass();
-            None
+            InterceptionOutcome::Continue(audit)
         }
         CompletionDecision::Redirect(target) => {
+            let target_config = state
+                .config
+                .integrated
+                .targets
+                .get(&target)
+                .expect("classified integrated route missing from config");
+            audit.set_decision("redirect", reason);
+            audit.set_target(&target, target_config);
             info!(
                 request_id = %meta.request_id,
                 protocol = protocol.as_str(),
@@ -683,10 +970,12 @@ pub(crate) async fn maybe_intercept(
                 client_model,
                 client_streaming,
                 conversation_key,
+                audit,
             )
             .await
         }
         CompletionDecision::InvalidControl => {
+            audit.set_decision("invalid", reason);
             let message = "local interceptor mixed routing control with other output".to_string();
             error!(
                 request_id = %meta.request_id,
@@ -695,9 +984,19 @@ pub(crate) async fn maybe_intercept(
                 fallback = config.fallback_on_error,
                 "{message}"
             );
-            fallback_or_error(config, StatusCode::BAD_GATEWAY, &meta.request_id, message)
+            fallback_or_error(
+                config,
+                StatusCode::BAD_GATEWAY,
+                &meta.request_id,
+                message,
+                audit,
+                protocol,
+                client_model,
+                client_streaming,
+            )
         }
         CompletionDecision::Local => {
+            audit.set_decision("local", reason);
             info!(
                 request_id = %meta.request_id,
                 protocol = protocol.as_str(),
@@ -712,7 +1011,8 @@ pub(crate) async fn maybe_intercept(
                 local_elapsed,
                 local_usage,
             );
-            Some(render_local_completion(
+            audit.record_destination(provider, &config.model);
+            InterceptionOutcome::Respond(render_local_completion(
                 protocol,
                 completion,
                 client_model,
@@ -731,9 +1031,18 @@ async fn execute_integrated_redirect(
     client_model: Option<String>,
     client_streaming: bool,
     conversation_key: Option<u64>,
-) -> Option<Response> {
-    let target = state.config.integrated.targets.get(target_name)?;
-    let provider: &ProviderState = state.providers.get(&target.provider)?;
+    mut audit: RoutingAuditDraft,
+) -> InterceptionOutcome {
+    let target = state
+        .config
+        .integrated
+        .targets
+        .get(target_name)
+        .expect("validated integrated target missing");
+    let provider: &ProviderState = state
+        .providers
+        .get(&target.provider)
+        .expect("validated integrated provider missing");
     info!(
         target = target_name,
         provider = target.provider,
@@ -762,7 +1071,8 @@ async fn execute_integrated_redirect(
                 state.config.integrated.sticky_capacity,
             );
         }
-        Some(response)
+        audit.record_destination(provider, &target.model);
+        InterceptionOutcome::Respond(response)
     } else {
         if let Some(key) = conversation_key {
             sticky_routes().remove(key);
@@ -783,7 +1093,9 @@ async fn execute_integrated_redirect(
         // The request reached a generation endpoint, so a fall-through could
         // duplicate work or spend. Surface the original failure instead.
         proxy_stats().record_intercept_error();
-        Some(response)
+        audit.set_error(format!("HTTP {}", response.status()));
+        audit.record_destination(provider, &target.model);
+        InterceptionOutcome::Respond(response)
     }
 }
 
@@ -792,14 +1104,48 @@ fn fallback_or_error(
     status: StatusCode,
     request_id: &str,
     message: String,
-) -> Option<Response> {
+    mut audit: RoutingAuditDraft,
+    protocol: InterceptorProtocol,
+    client_model: Option<String>,
+    client_streaming: bool,
+) -> InterceptionOutcome {
     crate::stats::error_log().record(&config.provider, "interceptor", message.as_str());
+    audit.set_error(message.clone());
+    if config.reject_sensitive {
+        proxy_stats().record_intercept_reject();
+        audit.redact_prompt();
+        audit.set_decision(
+            "reject",
+            "Sensitive-data screening failed; fail-closed policy prevented external routing.",
+        );
+        audit.record();
+        return InterceptionOutcome::Respond(render_rejection(
+            protocol,
+            "sensitive information that could not be screened safely",
+            client_model,
+            client_streaming,
+            request_id,
+        ));
+    }
     if config.fallback_on_error {
         proxy_stats().record_intercept_fallback();
-        None
+        if audit.audit.decision == "pending" {
+            audit.set_decision(
+                "fallback",
+                "Local triage could not produce a valid decision and fallback_on_error selected normal routing.",
+            );
+        }
+        InterceptionOutcome::Continue(audit)
     } else {
         proxy_stats().record_intercept_error();
-        Some(interceptor_error_response(status, request_id, message))
+        if audit.audit.decision == "pending" {
+            audit.set_decision(
+                "error",
+                "Local triage could not produce a valid decision and fallback_on_error is disabled.",
+            );
+        }
+        audit.record();
+        InterceptionOutcome::Respond(interceptor_error_response(status, request_id, message))
     }
 }
 
@@ -861,7 +1207,7 @@ pub(super) fn build_local_request(
     if let Some(name) = tools
         .iter()
         .filter_map(tool_name)
-        .find(|name| is_default_route_name(name))
+        .find(|name| is_default_route_name(name) || *name == REJECT_TOOL_NAME)
     {
         return Err(format!("request already defines a tool named {name}"));
     }
@@ -874,6 +1220,9 @@ pub(super) fn build_local_request(
                 return Err(format!("request already defines a tool named {name}"));
             }
         }
+    }
+    if config.reject_sensitive {
+        tools.push(reject_tool());
     }
     tools.push(default_route_tool(integrated));
     if integrated {
@@ -912,8 +1261,17 @@ pub(super) fn build_local_request(
             ));
         }
         dynamic_instructions.push_str(
-            "\nCall exactly one provider route, or ROUTE_DEFAULT with {} when no route fits.",
+            "\nCall exactly one provider route, or ROUTE_DEFAULT when no route fits. Include a brief audit reason in the call.",
         );
+    }
+    if config.reject_sensitive {
+        dynamic_instructions.push_str("\n\nMandatory pre-routing rule:\n");
+        dynamic_instructions.push_str(SENSITIVE_REJECTION_INSTRUCTIONS);
+        if !config.enabled && !integrated {
+            dynamic_instructions.push_str(
+                "\nThis request is rejection-screening only. When no sensitive data is present, call PASS with a brief reason. Never answer locally.",
+            );
+        }
     }
     let messages = object
         .entry("messages".to_string())
@@ -927,6 +1285,32 @@ pub(super) fn build_local_request(
 
     normalize_chat_completion_request(&mut request, proxy_config);
     Ok(request)
+}
+
+fn reject_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": REJECT_TOOL_NAME,
+            "description": "Stop before any local answer or provider route because the original request contains sensitive data. Never include the sensitive value.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "enum": [
+                            "credential or secret",
+                            "personally identifiable information",
+                            GENERIC_REJECTION_REASON
+                        ],
+                        "description": "A safe category only. Never repeat the detected value."
+                    }
+                },
+                "required": ["reason"],
+                "additionalProperties": false
+            }
+        }
+    })
 }
 
 fn default_route_tool(integrated: bool) -> Value {
@@ -948,8 +1332,14 @@ fn default_route_tool(integrated: bool) -> Value {
             "description": description,
             "parameters": {
                 "type": "object",
-                "properties": {},
-                "required": [],
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "maxLength": 240,
+                        "description": "Briefly name the observable policy condition or route hint that matched. Do not provide chain-of-thought."
+                    }
+                },
+                "required": ["reason"],
                 "additionalProperties": false
             }
         }
@@ -973,8 +1363,14 @@ fn redirect_tool(name: &str, target: &IntegratedTarget) -> Value {
             ),
             "parameters": {
                 "type": "object",
-                "properties": {},
-                "required": [],
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "maxLength": 240,
+                        "description": "Briefly name the observable policy condition or route hint that matched. Do not provide chain-of-thought."
+                    }
+                },
+                "required": ["reason"],
                 "additionalProperties": false
             }
         }
@@ -1002,12 +1398,21 @@ pub(super) fn classify_completion(completion: &Value) -> CompletionDecision {
     classify_completion_with_targets(completion, &BTreeMap::new())
 }
 
+#[cfg(test)]
 fn classify_completion_with_targets(
     completion: &Value,
     targets: &BTreeMap<String, IntegratedTarget>,
 ) -> CompletionDecision {
+    classify_completion_details(completion, targets, false).decision
+}
+
+fn classify_completion_details(
+    completion: &Value,
+    targets: &BTreeMap<String, IntegratedTarget>,
+    reject_sensitive: bool,
+) -> CompletionClassification {
     let Some(choices) = completion.get("choices").and_then(Value::as_array) else {
-        return CompletionDecision::Local;
+        return classification(CompletionDecision::Local, None);
     };
     let contains_control = choices.iter().any(|choice| {
         let Some(message) = choice.get("message") else {
@@ -1017,23 +1422,28 @@ fn classify_completion_with_targets(
             .get("tool_calls")
             .and_then(Value::as_array)
             .is_some_and(|calls| {
-                calls
-                    .iter()
-                    .any(|call| control_decision(tool_name(call), targets).is_some())
+                calls.iter().any(|call| {
+                    control_decision(tool_name(call), targets, reject_sensitive).is_some()
+                })
             })
             || message.get("content").is_some_and(|content| {
-                control_decision(Some(text_from_value(content).trim()), targets).is_some()
+                control_decision(
+                    Some(text_from_value(content).trim()),
+                    targets,
+                    reject_sensitive,
+                )
+                .is_some()
             })
     });
     if !contains_control {
-        return CompletionDecision::Local;
+        return classification(CompletionDecision::Local, None);
     }
     if choices.len() != 1 {
-        return CompletionDecision::InvalidControl;
+        return classification(CompletionDecision::InvalidControl, None);
     }
 
     let Some(message) = choices[0].get("message") else {
-        return CompletionDecision::InvalidControl;
+        return classification(CompletionDecision::InvalidControl, None);
     };
     let content = message
         .get("content")
@@ -1042,46 +1452,110 @@ fn classify_completion_with_targets(
     let tool_calls = message.get("tool_calls").and_then(Value::as_array);
     match tool_calls {
         Some(calls) if calls.len() == 1 && content.trim().is_empty() => {
-            control_tool_call_decision(&calls[0], targets)
-                .unwrap_or(CompletionDecision::InvalidControl)
+            control_tool_call_classification(&calls[0], targets, reject_sensitive)
+                .unwrap_or_else(|| classification(CompletionDecision::InvalidControl, None))
         }
-        None => control_decision(Some(content.trim()), targets)
-            .unwrap_or(CompletionDecision::InvalidControl),
-        Some(calls) if calls.is_empty() => control_decision(Some(content.trim()), targets)
-            .unwrap_or(CompletionDecision::InvalidControl),
-        _ => CompletionDecision::InvalidControl,
+        None => control_decision(Some(content.trim()), targets, reject_sensitive)
+            .map(|decision| classification(decision, None))
+            .unwrap_or_else(|| classification(CompletionDecision::InvalidControl, None)),
+        Some(calls) if calls.is_empty() => {
+            control_decision(Some(content.trim()), targets, reject_sensitive)
+                .map(|decision| classification(decision, None))
+                .unwrap_or_else(|| classification(CompletionDecision::InvalidControl, None))
+        }
+        _ => classification(CompletionDecision::InvalidControl, None),
     }
 }
 
-fn control_tool_call_decision(
-    call: &Value,
-    targets: &BTreeMap<String, IntegratedTarget>,
-) -> Option<CompletionDecision> {
-    has_zero_tool_arguments(call)
-        .then(|| control_decision(tool_name(call), targets))
-        .flatten()
+fn classification(
+    decision: CompletionDecision,
+    reason: Option<String>,
+) -> CompletionClassification {
+    let reason = if decision == CompletionDecision::Reject {
+        Some(
+            reason
+                .as_deref()
+                .and_then(safe_rejection_reason)
+                .unwrap_or(GENERIC_REJECTION_REASON)
+                .to_string(),
+        )
+    } else {
+        reason
+    };
+    CompletionClassification { decision, reason }
 }
 
-fn has_zero_tool_arguments(call: &Value) -> bool {
+fn control_tool_call_classification(
+    call: &Value,
+    targets: &BTreeMap<String, IntegratedTarget>,
+    reject_sensitive: bool,
+) -> Option<CompletionClassification> {
+    let decision = control_decision(tool_name(call), targets, reject_sensitive)?;
+    if decision == CompletionDecision::Reject {
+        let reason = control_tool_reason(call).flatten();
+        return Some(classification(decision, reason));
+    }
+    let reason = control_tool_reason(call)?;
+    Some(classification(decision, reason))
+}
+
+fn safe_rejection_reason(reason: &str) -> Option<&'static str> {
+    match reason.trim() {
+        "credential or secret" => Some("credential or secret"),
+        "personally identifiable information" => Some("personally identifiable information"),
+        GENERIC_REJECTION_REASON => Some(GENERIC_REJECTION_REASON),
+        _ => None,
+    }
+}
+
+fn control_tool_reason(call: &Value) -> Option<Option<String>> {
     let arguments = call
         .get("function")
         .and_then(|function| function.get("arguments"))
         .or_else(|| call.get("arguments"));
     match arguments {
-        None | Some(Value::Null) => true,
-        Some(Value::Object(arguments)) => arguments.is_empty(),
-        Some(Value::String(arguments)) if arguments.trim().is_empty() => true,
-        Some(Value::String(arguments)) => serde_json::from_str::<Value>(arguments)
-            .is_ok_and(|arguments| arguments.as_object().is_some_and(serde_json::Map::is_empty)),
-        _ => false,
+        None | Some(Value::Null) => Some(None),
+        Some(Value::Object(arguments)) => reason_from_argument_object(arguments),
+        Some(Value::String(arguments)) if arguments.trim().is_empty() => Some(None),
+        Some(Value::String(arguments)) => {
+            serde_json::from_str::<Value>(arguments)
+                .ok()
+                .and_then(|arguments| match arguments {
+                    Value::Null => Some(None),
+                    Value::Object(arguments) => reason_from_argument_object(&arguments),
+                    _ => None,
+                })
+        }
+        _ => None,
     }
+}
+
+fn reason_from_argument_object(
+    arguments: &serde_json::Map<String, Value>,
+) -> Option<Option<String>> {
+    if arguments.is_empty() {
+        return Some(None);
+    }
+    if arguments.len() != 1 {
+        return None;
+    }
+    arguments
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| Some(reason.to_string()))
 }
 
 fn control_decision(
     name: Option<&str>,
     targets: &BTreeMap<String, IntegratedTarget>,
+    reject_sensitive: bool,
 ) -> Option<CompletionDecision> {
     let name = name?.trim();
+    if reject_sensitive && name == REJECT_TOOL_NAME {
+        return Some(CompletionDecision::Reject);
+    }
     if is_default_route_name(name) {
         return Some(CompletionDecision::DefaultRoute);
     }
@@ -1167,7 +1641,9 @@ pub(crate) async fn test_route(
         }
     }
     let config = proxy_config.interceptor.clone();
-    let fallback_note = if config.fallback_on_error {
+    let fallback_note = if config.reject_sensitive {
+        "live traffic would fail closed without contacting an external provider"
+    } else if config.fallback_on_error {
         "live traffic would fall back to external routing on this failure"
     } else {
         "live traffic would return this error to the client (fallback_on_error = false)"
@@ -1211,6 +1687,11 @@ pub(crate) async fn test_route(
         UpstreamResponseKind::Json,
         false,
     );
+    let meta = if config.reject_sensitive {
+        meta.without_body_logging()
+    } else {
+        meta
+    };
     let started_at = std::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_millis(config.timeout_ms),
@@ -1297,11 +1778,19 @@ pub(crate) async fn test_route(
         RouteTestMode::Intercept => &BTreeMap::new(),
         RouteTestMode::Integrated => &proxy_config.integrated.targets,
     };
-    let (decision, target, note) = match classify_completion_with_targets(&completion, targets) {
+    let classification = classify_completion_details(&completion, targets, config.reject_sensitive);
+    let audit_reason = classification.reason.clone();
+    let (decision, target, note) = match classification.decision {
         CompletionDecision::Local => (
             "local",
             None,
             "the local model would answer this request itself".to_string(),
+        ),
+        CompletionDecision::Reject => (
+            "reject",
+            None,
+            "REJECT — returns a no-action response without contacting an external provider"
+                .to_string(),
         ),
         CompletionDecision::DefaultRoute => match mode {
             RouteTestMode::Intercept => (
@@ -1350,6 +1839,7 @@ pub(crate) async fn test_route(
         "mode": mode.as_str(),
         "target": target,
         "note": note,
+        "reason": audit_reason,
         "detail": detail,
         "elapsed_ms": elapsed_ms,
         "provider": provider.name,
@@ -1503,7 +1993,7 @@ fn bounded_detail(text: &str) -> String {
 
 #[path = "interceptor_render.rs"]
 mod render;
-use render::render_local_completion;
+use render::{render_local_completion, render_rejection};
 
 #[cfg(test)]
 #[path = "interceptor_tests.rs"]

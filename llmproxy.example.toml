@@ -50,6 +50,10 @@ provider = "local_interceptor"
 model = "qwen3:4b"
 timeout_ms = 60000
 fallback_on_error = true
+# Optional fail-closed screening before local answers or external routes.
+# The safe REJECT response never repeats the detected value. Pure --proxy
+# launcher sessions remain prompt-free and disable this setting for the session.
+reject_sensitive = false
 # Sampling for the local triage request. Completions that hit max_tokens fall
 # back to external routing instead of serving a clipped answer; max_tokens = 0
 # leaves the client's own limits in place.

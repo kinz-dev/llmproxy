@@ -7,7 +7,7 @@
 //! same file so the CLI and llmproxy stay in sync. Access tokens are cached in
 //! memory between requests; only a near-expiry token touches the network.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -439,13 +439,49 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 /// Write `value` to `path` via a sibling temp file + rename so a crash never
 /// leaves a half-written credentials file.
-fn write_json_atomic(path: &PathBuf, value: &Value) -> Result<()> {
+fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
     let serialized = serde_json::to_vec_pretty(value)?;
     let tmp = path.with_extension("json.llmproxy.tmp");
     std::fs::write(&tmp, &serialized)
         .with_context(|| format!("failed to write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
+    replace_file(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::{iter, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

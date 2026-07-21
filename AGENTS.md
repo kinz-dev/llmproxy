@@ -42,12 +42,23 @@ agent request -> separate local interceptor request -> local response
   external copy.
 - Routing controls are valid only as the sole tool call or exact text output.
   Mixed output is invalid. Integrated mode accepts legacy `PASS` output but
-  does not advertise it.
+  does not advertise it. Tool calls may carry only a concise `reason` audit
+  field; legacy empty arguments remain valid, and audit metadata is never
+  rendered to the caller.
+- Optional `interceptor.reject_sensitive` adds a mandatory, dynamically
+  appended `REJECT` control before local/external routing. Its reason is a safe
+  category, never the detected value. Rejection renders a native successful
+  no-action response, disables sticky bypass, and fails closed when screening
+  cannot complete. Screened request/triage bodies are omitted from TRACE, and
+  rejected audit prompts are redacted. Pure `--proxy` launcher sessions
+  disable it to remain prompt-free.
 - Caller authentication, account headers, and external credentials must never
   reach the local provider.
 - Accepted local output is rendered in the caller's native protocol. Buffered
   speculation and routing controls must never appear in the conversation.
 - Timeout or local failure follows `interceptor.fallback_on_error`.
+  Sensitive rejection overrides that fallback and never continues externally
+  after a screening failure.
 - Integrated launcher routes, including explicit-model and `ROUTE_DEFAULT`
   traffic, strip caller credentials; every external destination must have a
   proxy-owned credential.
@@ -138,6 +149,10 @@ Without a launcher, preserve these rules:
   failures, response-stream failures, and timeouts are ERROR events. Never log
   credential headers. Log files are owner-only. Startup removes only matching
   log files older than `max_logging_retention_days`; zero disables cleanup.
+- Interceptor/integrated decisions emit a structured log event with the
+  observable policy reason, requested model, triage model/latency, finalized
+  provider/model/class, and fallback error. The admin keeps a bounded 24-hour
+  decision feed with prompt previews; it never stores credential headers.
 - Proxy, interceptor, and integrated launcher sessions can safely share one
   daemon because routing mode is encoded in each loopback-only session token.
 - The admin interface is unauthenticated and must remain loopback-only.
@@ -150,23 +165,28 @@ Without a launcher, preserve these rules:
   launcher sessions, and startup output.
 - `src/backend_adapters.rs`: provider-facing Anthropic and Copilot adapters and
   cross-provider history sanitization.
-- `src/interceptor.rs`: local request construction, routing controls, failure
-  policy, and local response rendering.
+- `src/interceptor.rs`: local request construction, routing controls, decision
+  audit drafts, failure policy, and local response rendering.
 - `src/logging.rs`: bounded asynchronous trace file setup, timestamp naming,
   and retention cleanup.
 - `src/agent_launcher.rs`: shared launcher selection and lifecycle.
 - `src/*_launcher.rs`: agent-specific discovery and environment injection.
 - `src/admin.rs`: loopback admin API, UI serving, and runtime config swaps.
 - `src/stats.rs`: request classification, latency, attempted frontend/provider/
-  model routes, completed token and cumulative-time usage, and traffic logs.
+  model routes, completed token and cumulative-time usage, traffic logs, and
+  bounded routing decision audits.
 - `ui/`: task-oriented admin interface organized as Overview, Activity,
   Routing, Models, Providers, and Settings; Activity and Routing use focused
-  secondary views instead of long mixed-purpose pages.
+  secondary views, including Activity > Decisions for policy audits.
 - `llmproxy.example.toml`: public credential-free configuration reference.
 
 ## Editing And Verification
 
 - Use `rg` for searches and `apply_patch` for manual edits.
+- Normal Cargo commands build only for the current host. Do not add global
+  `target-cpu=native` flags; release artifacts must run across CPUs of the same
+  architecture. CI validates native x86_64 and ARM64 builds on Linux, macOS,
+  and Windows.
 - For routing, interceptor, daemon, admin, or launcher changes, run:
 
   ```sh

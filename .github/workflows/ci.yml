@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+            quality: true
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            quality: false
+          - name: macOS x86_64
+            runner: macos-15-intel
+            quality: false
+          - name: macOS ARM64
+            runner: macos-15
+            quality: false
+          - name: Windows x86_64
+            runner: windows-2025
+            quality: false
+          - name: Windows ARM64
+            runner: windows-11-arm
+            quality: false
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update Rust
+        run: rustup update stable --no-self-update
+      - name: Install quality components
+        if: matrix.quality
+        run: rustup component add clippy rustfmt
+      - name: Check formatting
+        if: matrix.quality
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        if: matrix.quality
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --locked
+      - name: Build release binary
+        run: cargo build --release --locked

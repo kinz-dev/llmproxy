@@ -30,7 +30,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use tracing::{error, info, warn};
 
 use crate::interceptor::{IntegratedTarget, InterceptorConfig};
-use crate::stats::{proxy_stats, route_class_for_base_url, traffic_log};
+use crate::stats::{proxy_stats, route_class_for_base_url, routing_decision_log, traffic_log};
 use crate::{
     AdminConfig, AnthropicMode, AppState, Config, ModelAlias, ModelRoutingMode, ResponsesMode,
     SharedState, build_provider_state, effective_provider_configs, finalize_config_keys,
@@ -136,6 +136,8 @@ fn router(state: AdminState) -> Router {
         .route("/api/logs/clear", post(api_logs_clear))
         .route("/api/errors", get(api_errors))
         .route("/api/errors/clear", post(api_errors_clear))
+        .route("/api/decisions", get(api_decisions))
+        .route("/api/decisions/clear", post(api_decisions_clear))
         .route("/api/launch", get(api_launch))
         .route("/api/config", get(api_config))
         .route(
@@ -358,6 +360,7 @@ async fn api_overview(State(state): State<AdminState>) -> Response {
         },
         "interceptor": {
             "enabled": config.interceptor.enabled,
+            "reject_sensitive": config.interceptor.reject_sensitive,
             "provider": config.interceptor.provider,
             "model": config.interceptor.model,
             "timeout_ms": config.interceptor.timeout_ms,
@@ -480,6 +483,15 @@ async fn api_errors(Query(query): Query<LogsQuery>) -> Response {
 
 async fn api_errors_clear() -> Response {
     crate::stats::error_log().clear();
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn api_decisions(Query(query): Query<LogsQuery>) -> Response {
+    Json(routing_decision_log().snapshot_after(query.after)).into_response()
+}
+
+async fn api_decisions_clear() -> Response {
+    routing_decision_log().clear();
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -702,6 +714,7 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
         "model_aliases": aliases,
         "interceptor": {
             "enabled": config.interceptor.enabled,
+            "reject_sensitive": config.interceptor.reject_sensitive,
             "provider": config.interceptor.provider,
             "model": config.interceptor.model,
             "timeout_ms": config.interceptor.timeout_ms,
@@ -972,6 +985,7 @@ async fn api_alias_delete(
 #[derive(Deserialize)]
 struct InterceptorPutBody {
     enabled: Option<bool>,
+    reject_sensitive: Option<bool>,
     provider: Option<String>,
     model: Option<String>,
     timeout_ms: Option<u64>,
@@ -998,6 +1012,7 @@ async fn api_interceptor_put(
     }
     let doc_body = InterceptorPutBody {
         enabled: body.enabled,
+        reject_sensitive: body.reject_sensitive,
         provider: body.provider.clone(),
         model: body.model.clone(),
         timeout_ms: body.timeout_ms,
@@ -1013,6 +1028,9 @@ async fn api_interceptor_put(
             let interceptor = &mut config.interceptor;
             if let Some(enabled) = body.enabled {
                 interceptor.enabled = enabled;
+            }
+            if let Some(reject_sensitive) = body.reject_sensitive {
+                interceptor.reject_sensitive = reject_sensitive;
             }
             if let Some(provider) = body.provider {
                 interceptor.provider = provider.trim().to_string();
@@ -1048,6 +1066,9 @@ async fn api_interceptor_put(
             let table = ensure_table(doc, "interceptor")?;
             if let Some(enabled) = doc_body.enabled {
                 table.insert("enabled", value(enabled));
+            }
+            if let Some(reject_sensitive) = doc_body.reject_sensitive {
+                table.insert("reject_sensitive", value(reject_sensitive));
             }
             if let Some(provider) = doc_body.provider {
                 table.insert("provider", value(provider.trim()));

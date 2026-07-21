@@ -4,7 +4,6 @@ use std::{
     ffi::OsString,
     fs, io,
     net::SocketAddr,
-    os::unix::process::CommandExt,
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::{
@@ -13,6 +12,11 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -56,13 +60,15 @@ use backend_adapters::{
     sanitize_copilot_chat_request, sanitize_cross_provider_chat_request,
 };
 use interceptor::{
-    IntegratedConfig, InterceptionPolicy, InterceptorConfig, InterceptorProtocol, maybe_intercept,
+    IntegratedConfig, InterceptionOutcome, InterceptionPolicy, InterceptorConfig,
+    InterceptorProtocol, maybe_intercept,
 };
 use stats::{
     RemapKind, ResponseTracking, log_request_value, proxy_stats, route_class_for_base_url,
     track_response,
 };
 
+#[cfg(unix)]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -598,6 +604,7 @@ struct UpstreamRequestMeta {
     path: String,
     response_kind: UpstreamResponseKind,
     idempotent: bool,
+    log_bodies: bool,
 }
 
 impl UpstreamRequestMeta {
@@ -616,7 +623,13 @@ impl UpstreamRequestMeta {
             path: path.to_string(),
             response_kind,
             idempotent,
+            log_bodies: true,
         }
+    }
+
+    fn without_body_logging(mut self) -> Self {
+        self.log_bodies = false;
+        self
     }
 }
 
@@ -675,7 +688,11 @@ impl UpstreamFailure {
     }
 
     fn status_with_body(meta: &UpstreamRequestMeta, status: StatusCode, bytes: &[u8]) -> Self {
-        let detail = upstream_error_detail(bytes).unwrap_or_else(|| body_prefix(bytes));
+        let detail = if meta.log_bodies {
+            upstream_error_detail(bytes).unwrap_or_else(|| body_prefix(bytes))
+        } else {
+            String::new()
+        };
         let message = if detail.is_empty() {
             format!("upstream /{} returned {status}", meta.path)
         } else {
@@ -1040,6 +1057,7 @@ async fn run_server(
     let admin_addr = if config.admin.enable {
         stats::traffic_log().set_enabled(true);
         stats::error_log().set_enabled(true);
+        stats::routing_decision_log().set_enabled(true);
         let admin_context = Arc::new(admin::AdminContext::new(
             config_path,
             launcher_name,
@@ -1328,6 +1346,16 @@ fn spawn_daemon_process(
         }
     }
 
+    configure_daemon_process(&mut command);
+
+    command
+        .spawn()
+        .context("failed to spawn background llmproxy daemon")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn configure_daemon_process(command: &mut std::process::Command) {
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -1337,11 +1365,13 @@ fn spawn_daemon_process(
             }
         });
     }
+}
 
-    command
-        .spawn()
-        .context("failed to spawn background llmproxy daemon")?;
-    Ok(())
+#[cfg(windows)]
+fn configure_daemon_process(command: &mut std::process::Command) {
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
 }
 
 async fn shutdown_daemon(addr: SocketAddr) -> Result<bool> {
@@ -1367,9 +1397,8 @@ async fn shutdown_daemon(addr: SocketAddr) -> Result<bool> {
         return Ok(false);
     }
 
-    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
+    if let Err(error) = terminate_daemon_process(pid) {
+        if !process_exists(pid) {
             let _ = fs::remove_file(&pid_path);
             let _ = fs::remove_file(daemon_info_path(addr));
             if running {
@@ -1430,7 +1459,7 @@ fn daemon_info_path(addr: SocketAddr) -> PathBuf {
     daemon_pid_path(addr).with_extension("json")
 }
 
-fn read_pid_file(path: &FsPath) -> Result<Option<i32>> {
+fn read_pid_file(path: &FsPath) -> Result<Option<u32>> {
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1440,8 +1469,11 @@ fn read_pid_file(path: &FsPath) -> Result<Option<i32>> {
     };
     let pid = raw
         .trim()
-        .parse::<i32>()
+        .parse::<u32>()
         .with_context(|| format!("invalid pid file {}", path.display()))?;
+    if pid == 0 {
+        bail!("invalid pid file {}: pid must be positive", path.display());
+    }
     Ok(Some(pid))
 }
 
@@ -1472,11 +1504,67 @@ fn remove_stale_daemon_files(addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn process_exists(pid: i32) -> bool {
+#[cfg(unix)]
+fn terminate_daemon_process(pid: u32) -> io::Result<()> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pid exceeds platform range"))?;
+    if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn terminate_daemon_process(pid: u32) -> io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess},
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let terminated = unsafe { TerminateProcess(process, 0) };
+    let error = (terminated == 0).then(io::Error::last_os_error);
+    let _ = unsafe {
+        CloseHandle(process);
+    };
+    match error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
     if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
     }
     io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_exists(pid: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_ACCESS_DENIED, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+    }
+    let mut exit_code = 0;
+    let queried = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0;
+    let _ = unsafe {
+        CloseHandle(process);
+    };
+    queried && exit_code == STILL_ACTIVE as u32
 }
 
 impl PidFileGuard {
@@ -1790,13 +1878,26 @@ fn request_state(shared: &SharedState, launcher_token: Option<&str>) -> Response
         .map_err(|error| Box::new(launcher_error_response(error.to_string())))
 }
 
-fn trace_client_request(frontend: &str, launcher_token: Option<&str>, body: &Value) {
-    trace!(
-        frontend,
-        launcher_session = launcher_token.is_some(),
-        body = %body,
-        "client request body"
-    );
+fn trace_client_request(
+    frontend: &str,
+    launcher_token: Option<&str>,
+    body: &Value,
+    redact_body: bool,
+) {
+    if redact_body {
+        trace!(
+            frontend,
+            launcher_session = launcher_token.is_some(),
+            "client request body omitted during sensitive-data screening"
+        );
+    } else {
+        trace!(
+            frontend,
+            launcher_session = launcher_token.is_some(),
+            body = %body,
+            "client request body"
+        );
+    }
 }
 
 fn provider_request_headers(
@@ -2094,7 +2195,7 @@ async fn completions_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
-    trace_client_request("completions", launcher_token, &body);
+    trace_client_request("completions", launcher_token, &body, false);
     proxy_stats().record_request();
     let started = Instant::now();
     let provider = match rewrite_proxy_request_value(&state, &headers, &mut body).await {
@@ -2149,7 +2250,7 @@ async fn embeddings_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
-    trace_client_request("embeddings", launcher_token, &body);
+    trace_client_request("embeddings", launcher_token, &body, false);
     proxy_stats().record_request();
     let started = Instant::now();
     let provider = match rewrite_proxy_request_value(&state, &headers, &mut body).await {
@@ -2205,11 +2306,19 @@ async fn chat_completions_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
-    trace_client_request("chat_completions", launcher_token, &body);
+    trace_client_request(
+        "chat_completions",
+        launcher_token,
+        &body,
+        state.config.interceptor.reject_sensitive,
+    );
     proxy_stats().record_request();
     let started = Instant::now();
-    if (state.config.interceptor.enabled || state.config.integrated.enabled)
-        && let Some(response) = maybe_intercept(
+    let routing_audit = if state.config.interceptor.enabled
+        || state.config.interceptor.reject_sensitive
+        || state.config.integrated.enabled
+    {
+        match maybe_intercept(
             &state,
             &headers,
             body.clone(),
@@ -2221,14 +2330,23 @@ async fn chat_completions_impl(
             request_is_streaming(&body),
         )
         .await
-    {
-        return response;
-    }
+        {
+            InterceptionOutcome::Continue(audit) => Some(audit),
+            InterceptionOutcome::Respond(response) => return response,
+        }
+    } else {
+        None
+    };
 
     let mut body = body;
     let provider = match rewrite_proxy_request_value(&state, &headers, &mut body).await {
         Ok(provider) => provider,
-        Err(error_response) => return *error_response,
+        Err(error_response) => {
+            if let Some(audit) = routing_audit {
+                audit.record_route_error("normal routing rejected the request");
+            }
+            return *error_response;
+        }
     };
     let provider_headers = provider_request_headers(&state, &headers, &provider);
     if state.launcher_kind != Some(LauncherKind::Copilot) {
@@ -2236,6 +2354,9 @@ async fn chat_completions_impl(
     }
     let class = route_class_for_base_url(&provider.config.base_url);
     let model = request_model(&body).to_string();
+    if let Some(audit) = routing_audit {
+        audit.record_destination(&provider, &model);
+    }
     let estimated_input_tokens = estimate_tokens(&body) as u64;
     log_request_value(class, &provider.name, &body);
     let model_started = Instant::now();
@@ -2287,7 +2408,12 @@ async fn responses_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
-    trace_client_request("responses", launcher_token, &body);
+    trace_client_request(
+        "responses",
+        launcher_token,
+        &body,
+        state.config.interceptor.reject_sensitive,
+    );
     proxy_stats().record_request();
     let started = Instant::now();
     let client_model = body
@@ -2295,10 +2421,13 @@ async fn responses_impl(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
-    if state.config.interceptor.enabled || state.config.integrated.enabled {
+    let routing_audit = if state.config.interceptor.enabled
+        || state.config.interceptor.reject_sensitive
+        || state.config.integrated.enabled
+    {
         let policy = InterceptionPolicy::for_responses(&headers, &body);
         let local_chat_request = responses_to_chat_request(&body);
-        if let Some(response) = maybe_intercept(
+        match maybe_intercept(
             &state,
             &headers,
             local_chat_request,
@@ -2309,14 +2438,22 @@ async fn responses_impl(
         )
         .await
         {
-            return response;
+            InterceptionOutcome::Continue(audit) => Some(audit),
+            InterceptionOutcome::Respond(response) => return response,
         }
-    }
+    } else {
+        None
+    };
 
     let mut rewritten = body;
     let provider = match rewrite_proxy_request_value(&state, &headers, &mut rewritten).await {
         Ok(provider) => provider,
-        Err(error_response) => return *error_response,
+        Err(error_response) => {
+            if let Some(audit) = routing_audit {
+                audit.record_route_error("normal routing rejected the request");
+            }
+            return *error_response;
+        }
     };
     let passthrough = state.config.responses.mode == ResponsesMode::Passthrough
         && matches!(
@@ -2329,6 +2466,9 @@ async fn responses_impl(
     let provider_headers = provider_request_headers(&state, &headers, &provider);
     let class = route_class_for_base_url(&provider.config.base_url);
     let model = request_model(&rewritten).to_string();
+    if let Some(audit) = routing_audit {
+        audit.record_destination(&provider, &model);
+    }
     let estimated_input_tokens = estimate_tokens(&rewritten) as u64;
     log_request_value(class, &provider.name, &rewritten);
 
@@ -2397,7 +2537,12 @@ async fn anthropic_messages_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
-    trace_client_request("anthropic_messages", launcher_token, &body);
+    trace_client_request(
+        "anthropic_messages",
+        launcher_token,
+        &body,
+        state.config.interceptor.reject_sensitive,
+    );
     proxy_stats().record_request();
     let started = Instant::now();
     let client_model = body
@@ -2405,9 +2550,12 @@ async fn anthropic_messages_impl(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
-    if state.config.interceptor.enabled || state.config.integrated.enabled {
+    let routing_audit = if state.config.interceptor.enabled
+        || state.config.interceptor.reject_sensitive
+        || state.config.integrated.enabled
+    {
         let local_chat_request = anthropic_message_to_chat_request(&body);
-        if let Some(response) = maybe_intercept(
+        match maybe_intercept(
             &state,
             &headers,
             local_chat_request,
@@ -2418,14 +2566,22 @@ async fn anthropic_messages_impl(
         )
         .await
         {
-            return response;
+            InterceptionOutcome::Continue(audit) => Some(audit),
+            InterceptionOutcome::Respond(response) => return response,
         }
-    }
+    } else {
+        None
+    };
 
     let mut rewritten = body;
     let provider = match rewrite_proxy_request_value(&state, &headers, &mut rewritten).await {
         Ok(provider) => provider,
-        Err(error_response) => return *error_response,
+        Err(error_response) => {
+            if let Some(audit) = routing_audit {
+                audit.record_route_error("normal routing rejected the request");
+            }
+            return *error_response;
+        }
     };
     let native_anthropic = provider.config.kind == ProviderKind::Anthropic
         || (provider.config.kind == ProviderKind::Copilot
@@ -2441,6 +2597,9 @@ async fn anthropic_messages_impl(
     let provider_headers = provider_request_headers(&state, &headers, &provider);
     let class = route_class_for_base_url(&provider.config.base_url);
     let model = request_model(&rewritten).to_string();
+    if let Some(audit) = routing_audit {
+        audit.record_destination(&provider, &model);
+    }
     let estimated_input_tokens = estimate_tokens(&rewritten) as u64;
     log_request_value(class, &provider.name, &rewritten);
     if passthrough {
@@ -2957,7 +3116,9 @@ async fn send_upstream_once(
         idempotent = meta.idempotent,
         "sending upstream request"
     );
-    if let Some(body) = body {
+    if meta.log_bodies
+        && let Some(body) = body
+    {
         trace!(
             provider = %meta.provider,
             request_id = %meta.request_id,
@@ -3065,41 +3226,7 @@ async fn upstream_json_once(
             .bytes()
             .await
             .map_err(|error| UpstreamFailure::from_reqwest(meta, error))?;
-        error!(
-            provider = %meta.provider,
-            request_id = %meta.request_id,
-            method = %meta.method,
-            upstream_path = %meta.path,
-            response_kind = meta.response_kind.as_str(),
-            upstream_status = status.as_u16(),
-            content_type = content_type.as_deref().unwrap_or(""),
-            body_bytes = bytes.len(),
-            body_prefix = %body_prefix(&bytes),
-            body = %String::from_utf8_lossy(&bytes),
-            "upstream returned non-success status"
-        );
-        return Err(UpstreamFailure::status_with_body(meta, status, &bytes));
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| UpstreamFailure::from_reqwest(meta, error))?;
-    trace!(
-        provider = %meta.provider,
-        request_id = %meta.request_id,
-        method = %meta.method,
-        upstream_path = %meta.path,
-        upstream_status = status.as_u16(),
-        content_type = content_type.as_deref().unwrap_or(""),
-        body_bytes = bytes.len(),
-        body = %String::from_utf8_lossy(&bytes),
-        "upstream response body"
-    );
-    match parse_upstream_json(&bytes) {
-        Ok(body) => Ok(body),
-        Err(error) => {
-            let prefix = body_prefix(&bytes);
+        if meta.log_bodies {
             error!(
                 provider = %meta.provider,
                 request_id = %meta.request_id,
@@ -3109,11 +3236,87 @@ async fn upstream_json_once(
                 upstream_status = status.as_u16(),
                 content_type = content_type.as_deref().unwrap_or(""),
                 body_bytes = bytes.len(),
-                body_prefix = %prefix,
+                body_prefix = %body_prefix(&bytes),
                 body = %String::from_utf8_lossy(&bytes),
-                error = %error,
-                "failed to decode upstream JSON response"
+                "upstream returned non-success status"
             );
+        } else {
+            error!(
+                provider = %meta.provider,
+                request_id = %meta.request_id,
+                method = %meta.method,
+                upstream_path = %meta.path,
+                response_kind = meta.response_kind.as_str(),
+                upstream_status = status.as_u16(),
+                content_type = content_type.as_deref().unwrap_or(""),
+                body_bytes = bytes.len(),
+                "upstream returned non-success status; body omitted during sensitive-data screening"
+            );
+        }
+        return Err(UpstreamFailure::status_with_body(meta, status, &bytes));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| UpstreamFailure::from_reqwest(meta, error))?;
+    if meta.log_bodies {
+        trace!(
+            provider = %meta.provider,
+            request_id = %meta.request_id,
+            method = %meta.method,
+            upstream_path = %meta.path,
+            upstream_status = status.as_u16(),
+            content_type = content_type.as_deref().unwrap_or(""),
+            body_bytes = bytes.len(),
+            body = %String::from_utf8_lossy(&bytes),
+            "upstream response body"
+        );
+    } else {
+        trace!(
+            provider = %meta.provider,
+            request_id = %meta.request_id,
+            method = %meta.method,
+            upstream_path = %meta.path,
+            upstream_status = status.as_u16(),
+            content_type = content_type.as_deref().unwrap_or(""),
+            body_bytes = bytes.len(),
+            "upstream response body omitted during sensitive-data screening"
+        );
+    }
+    match parse_upstream_json(&bytes) {
+        Ok(body) => Ok(body),
+        Err(error) => {
+            let prefix = body_prefix(&bytes);
+            if meta.log_bodies {
+                error!(
+                    provider = %meta.provider,
+                    request_id = %meta.request_id,
+                    method = %meta.method,
+                    upstream_path = %meta.path,
+                    response_kind = meta.response_kind.as_str(),
+                    upstream_status = status.as_u16(),
+                    content_type = content_type.as_deref().unwrap_or(""),
+                    body_bytes = bytes.len(),
+                    body_prefix = %prefix,
+                    body = %String::from_utf8_lossy(&bytes),
+                    error = %error,
+                    "failed to decode upstream JSON response"
+                );
+            } else {
+                error!(
+                    provider = %meta.provider,
+                    request_id = %meta.request_id,
+                    method = %meta.method,
+                    upstream_path = %meta.path,
+                    response_kind = meta.response_kind.as_str(),
+                    upstream_status = status.as_u16(),
+                    content_type = content_type.as_deref().unwrap_or(""),
+                    body_bytes = bytes.len(),
+                    error = %error,
+                    "failed to decode upstream JSON response; body omitted during sensitive-data screening"
+                );
+            }
             Err(UpstreamFailure::decode(meta, status, error))
         }
     }
@@ -3695,6 +3898,7 @@ impl AppState {
         config.model_aliases.clear();
         config.model_routing = ModelRoutingMode::Remap;
         config.interceptor.enabled = false;
+        config.interceptor.reject_sensitive = false;
         config.integrated.enabled = false;
         config.responses.mode = ResponsesMode::ChatCompletions;
         config.anthropic_mode = AnthropicMode::ChatCompletions;
@@ -6538,6 +6742,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sensitive_screening_errors_do_not_retain_upstream_body_details() {
+        let meta = UpstreamRequestMeta::new(
+            "local",
+            &HeaderMap::new(),
+            Method::POST,
+            "chat/completions",
+            UpstreamResponseKind::Json,
+            false,
+        )
+        .without_body_logging();
+        let failure = UpstreamFailure::status_with_body(
+            &meta,
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"sensitive-value"}}"#,
+        );
+        assert!(!failure.message.contains("sensitive-value"));
+        assert_eq!(
+            failure.message,
+            "upstream /chat/completions returned 400 Bad Request"
+        );
+    }
+
+    #[test]
     fn config_discovery_prefers_overrides_then_local_then_user() {
         let explicit = PathBuf::from("explicit.toml");
         let configured = PathBuf::from("configured.toml");
@@ -6567,6 +6794,21 @@ mod tests {
             Some(user)
         );
         assert_eq!(resolve_config_path(None, None, None, &|_| false), None);
+    }
+
+    #[test]
+    fn pid_files_reject_zero() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path =
+            env::temp_dir().join(format!("llmproxy-pid-test-{}-{unique}", std::process::id()));
+        fs::write(&path, "0\n").expect("write pid file");
+        assert!(read_pid_file(&path).is_err());
+        fs::write(&path, "42\n").expect("replace pid file");
+        assert_eq!(read_pid_file(&path).expect("read pid file"), Some(42));
+        fs::remove_file(path).expect("remove pid file");
     }
 
     #[test]
@@ -7010,6 +7252,21 @@ mod tests {
                 "function": {
                     "name": "ROUTE_DEFAULT",
                     "arguments": "{}"
+                }
+            }]),
+        )
+    }
+
+    fn reject_completion(reason: &str) -> Value {
+        chat_completion(
+            "local-fast",
+            Value::Null,
+            json!([{
+                "id": "call-reject",
+                "type": "function",
+                "function": {
+                    "name": "REJECT",
+                    "arguments": json!({ "reason": reason }).to_string()
                 }
             }]),
         )
@@ -7700,6 +7957,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sensitive_rejection_renders_for_all_agent_protocols_without_external_calls() {
+        let local_app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { Json(reject_completion("personally identifiable information")) }),
+        );
+        let external_calls = Arc::new(AtomicU64::new(0));
+        let external_calls_for_handler = external_calls.clone();
+        let external_app = Router::new().fallback(move || {
+            let external_calls = external_calls_for_handler.clone();
+            async move {
+                external_calls.fetch_add(1, Ordering::Relaxed);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+        let (local_base_url, local_server) = spawn_test_upstream(local_app).await;
+        let (external_base_url, external_server) = spawn_test_upstream(external_app).await;
+        let mut config = Config {
+            default_provider: "external".to_string(),
+            providers: HashMap::from([
+                (
+                    "local".to_string(),
+                    UpstreamConfig {
+                        base_url: local_base_url,
+                        ..UpstreamConfig::default()
+                    },
+                ),
+                (
+                    "external".to_string(),
+                    UpstreamConfig {
+                        base_url: external_base_url,
+                        ..UpstreamConfig::default()
+                    },
+                ),
+            ]),
+            ..Config::default()
+        };
+        config.interceptor = InterceptorConfig {
+            reject_sensitive: true,
+            ..local_interceptor_config("local", "local-fast")
+        };
+        let shared = SharedState::new(test_state_with_config(config));
+
+        let responses = [
+            chat_completions(
+                State(shared.clone()),
+                HeaderMap::new(),
+                Json(json!({
+                    "model": "agent-chat",
+                    "messages": [{ "role": "user", "content": "private input" }]
+                })),
+            )
+            .await,
+            responses(
+                State(shared.clone()),
+                HeaderMap::new(),
+                Json(json!({
+                    "model": "agent-codex",
+                    "input": "private input"
+                })),
+            )
+            .await,
+            anthropic_messages(
+                State(shared),
+                HeaderMap::new(),
+                Json(json!({
+                    "model": "agent-claude",
+                    "max_tokens": 100,
+                    "messages": [{ "role": "user", "content": "private input" }]
+                })),
+            )
+            .await,
+        ];
+
+        for response in responses {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-llmproxy-route")
+                    .and_then(|value| value.to_str().ok()),
+                Some("reject")
+            );
+            let body = collect_response_text(response).await;
+            assert!(body.contains("No action was taken"), "body: {body}");
+            assert!(body.contains("personally identifiable information"));
+        }
+        assert_eq!(external_calls.load(Ordering::Relaxed), 0);
+        local_server.abort();
+        external_server.abort();
+    }
+
+    #[tokio::test]
+    async fn sensitive_rejection_fails_closed_when_screening_is_unavailable() {
+        let local_app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let external_calls = Arc::new(AtomicU64::new(0));
+        let external_calls_for_handler = external_calls.clone();
+        let external_app = Router::new().fallback(move || {
+            let external_calls = external_calls_for_handler.clone();
+            async move {
+                external_calls.fetch_add(1, Ordering::Relaxed);
+                StatusCode::OK
+            }
+        });
+        let (local_base_url, local_server) = spawn_test_upstream(local_app).await;
+        let (external_base_url, external_server) = spawn_test_upstream(external_app).await;
+        let mut config = Config {
+            default_provider: "external".to_string(),
+            providers: HashMap::from([
+                (
+                    "local".to_string(),
+                    UpstreamConfig {
+                        base_url: local_base_url,
+                        ..UpstreamConfig::default()
+                    },
+                ),
+                (
+                    "external".to_string(),
+                    UpstreamConfig {
+                        base_url: external_base_url,
+                        ..UpstreamConfig::default()
+                    },
+                ),
+            ]),
+            ..Config::default()
+        };
+        config.interceptor = InterceptorConfig {
+            enabled: false,
+            reject_sensitive: true,
+            ..local_interceptor_config("local", "local-fast")
+        };
+        let response = chat_completions(
+            State(SharedState::new(test_state_with_config(config))),
+            HeaderMap::new(),
+            Json(json!({
+                "model": "explicit-agent-model",
+                "messages": [{ "role": "user", "content": "screen this" }]
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-llmproxy-route")
+                .and_then(|value| value.to_str().ok()),
+            Some("reject")
+        );
+        assert!(
+            collect_response_text(response)
+                .await
+                .contains("screened safely")
+        );
+        assert_eq!(external_calls.load(Ordering::Relaxed), 0);
+        local_server.abort();
+        external_server.abort();
+    }
+
+    #[tokio::test]
     async fn interceptor_local_text_streams_as_anthropic_messages() {
         let local_app = Router::new().route(
             "/v1/chat/completions",
@@ -8110,7 +8529,10 @@ mod tests {
                     },
                 ),
             ]),
-            interceptor: local_interceptor_config("local", "interceptor-model"),
+            interceptor: InterceptorConfig {
+                reject_sensitive: true,
+                ..local_interceptor_config("local", "interceptor-model")
+            },
             model_aliases: HashMap::from([(
                 "agent-model".to_string(),
                 ModelAlias::Route {

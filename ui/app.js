@@ -323,7 +323,7 @@ function flowRibbons(providers) {
       : `${name} · ${fmtCount(entry.count || 0)} calls`,
   }));
   if (!entries.length) {
-    return [{ key: " empty", count: 0, cls: "neutral", text: "no responses yet", title: "no responses yet" }];
+    return [{ key: "\u0000empty", count: 0, cls: "neutral", text: "no responses yet", title: "no responses yet" }];
   }
   // Position is an identity, not a ranking.
   const stable = (list) =>
@@ -339,7 +339,7 @@ function flowRibbons(providers) {
   return [
     ...stable(byCount.slice(0, FLOW_MAX_RIBBONS - 1)),
     {
-      key: " others",
+      key: "\u0000others",
       count: foldedCount,
       cls: "neutral",
       text: `${fmtCount(foldedCount)} +${folded.length} others`,

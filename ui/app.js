@@ -20,6 +20,19 @@ function el(tag, attrs = {}, children = []) {
   return node;
 }
 
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+/* el() builds HTML; SVG children need the namespaced constructor. */
+function svgEl(tag, attrs = {}) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, val] of Object.entries(attrs)) {
+    if (key === "class") node.setAttribute("class", val);
+    else if (key === "text") node.textContent = val;
+    else if (val !== null && val !== undefined) node.setAttribute(key, val);
+  }
+  return node;
+}
+
 async function apiGet(path) {
   const response = await fetch(path, { headers: { Accept: "application/json" } });
   const body = await response.json().catch(() => ({}));
@@ -287,6 +300,110 @@ function setLatencyRow(barId, figuresId, entry, maxP99) {
   figures.textContent = `${fmtMs(entry.p50_ms)} → ${fmtMs(entry.p99_ms)} · ${entry.samples}`;
 }
 
+/* Flow ribbons: one per provider that has served a call.
+
+   Colour stays bound to locality so the strip matches the badges, stat tiles,
+   and latency rows; identity is carried by stable position and a direct label,
+   never by colour alone. Ribbon order must not follow request count, or
+   providers swap places on every poll. Nodes are reused across polls because
+   recreating them restarts the drift animation. */
+const FLOW_MAX_RIBBONS = 6;
+const FLOW_HUB_MID = 84;
+const flowNodes = new Map();
+
+function flowRibbons(providers) {
+  const classRank = { local: 0, external: 1 };
+  const entries = Object.entries(providers).map(([name, entry]) => ({
+    key: name,
+    count: entry.count || 0,
+    cls: providerClasses[name] || "neutral",
+    text: `${fmtCount(entry.count || 0)} ${name}`,
+    title: entry.samples
+      ? `${name} · ${fmtCount(entry.count || 0)} calls · ${fmtMs(entry.p50_ms)} → ${fmtMs(entry.p99_ms)}`
+      : `${name} · ${fmtCount(entry.count || 0)} calls`,
+  }));
+  if (!entries.length) {
+    return [{ key: " empty", count: 0, cls: "neutral", text: "no responses yet", title: "no responses yet" }];
+  }
+  // Position is an identity, not a ranking.
+  const stable = (list) =>
+    list.sort((a, b) => {
+      const byClass = (classRank[a.cls] ?? 2) - (classRank[b.cls] ?? 2);
+      return byClass !== 0 ? byClass : a.key.localeCompare(b.key);
+    });
+  if (entries.length <= FLOW_MAX_RIBBONS) return stable(entries);
+  // Only fold membership is count-based, and it changes rarely.
+  const byCount = [...entries].sort((a, b) => b.count - a.count);
+  const folded = byCount.slice(FLOW_MAX_RIBBONS - 1);
+  const foldedCount = folded.reduce((sum, entry) => sum + entry.count, 0);
+  return [
+    ...stable(byCount.slice(0, FLOW_MAX_RIBBONS - 1)),
+    {
+      key: " others",
+      count: foldedCount,
+      cls: "neutral",
+      text: `${fmtCount(foldedCount)} +${folded.length} others`,
+      title: folded.map((entry) => `${entry.key} · ${fmtCount(entry.count)}`).join("\n"),
+    },
+  ];
+}
+
+function renderFlowOut(providers, totalServed) {
+  const group = $("#flow-out");
+  const ribbons = flowRibbons(providers);
+  const count = ribbons.length;
+  // 100px of vertical room, but keep two ribbons as far apart as the old
+  // hardcoded pair rather than bunching them in the middle.
+  const spacing = count > 1 ? Math.min(44, 100 / (count - 1)) : 0;
+  const fan = Math.min(10, spacing / 2.5);
+  const strokeWidth = (n) => (totalServed ? 2 + 5 * (n / totalServed) : 2).toFixed(2);
+
+  const seen = new Set();
+  let membershipChanged = false;
+  ribbons.forEach((ribbon, index) => {
+    const offset = index - (count - 1) / 2;
+    const endY = (FLOW_HUB_MID + offset * spacing).toFixed(1);
+    const startY = (FLOW_HUB_MID + offset * fan).toFixed(1);
+    let node = flowNodes.get(ribbon.key);
+    if (!node) {
+      const path = svgEl("path", { class: "flow-line drift" });
+      const title = svgEl("title");
+      path.append(title);
+      const label = svgEl("text", { class: "flow-count mono", x: 584 });
+      group.append(path, label);
+      node = { path, label, title };
+      flowNodes.set(ribbon.key, node);
+      membershipChanged = true;
+    }
+    node.path.setAttribute("d", `M 388 ${startY} C 470 ${startY} 490 ${endY} 570 ${endY}`);
+    node.path.setAttribute("class", `flow-line drift ${ribbon.cls}${ribbon.count ? "" : " idle"}`);
+    node.path.style.strokeWidth = strokeWidth(ribbon.count);
+    node.title.textContent = ribbon.title;
+    node.label.setAttribute("class", `flow-count mono ${ribbon.cls}`);
+    node.label.setAttribute("y", (Number(endY) + 5).toFixed(1));
+    node.label.textContent = ribbon.text;
+    seen.add(ribbon.key);
+  });
+
+  for (const [key, node] of flowNodes) {
+    if (seen.has(key)) continue;
+    node.path.remove();
+    node.label.remove();
+    flowNodes.delete(key);
+    membershipChanged = true;
+  }
+
+  // Align DOM order with visual order so overlapping strokes stack
+  // predictably. Only on membership change: moving a node restarts its drift
+  // animation, which would stutter on every poll.
+  if (membershipChanged) {
+    for (const ribbon of ribbons) {
+      const node = flowNodes.get(ribbon.key);
+      group.append(node.path, node.label);
+    }
+  }
+}
+
 function renderStats(stats) {
   $("#meta-uptime").textContent = fmtUptime(stats.uptime_secs);
 
@@ -315,18 +432,10 @@ function renderStats(stats) {
   renderRoutingDestinations(served.destinations || []);
   renderModelUsage(stats.model_usage || []);
 
-  // Flow strip: stroke weight follows each branch's share of responses.
+  // Flow strip: one ribbon per provider, stroke weight following its share.
   const totalServed = served.local + served.external;
   $("#flow-in-count").textContent = fmtCount(requests.total);
-  $("#flow-local-count").textContent = `${fmtCount(served.local)} local`;
-  $("#flow-ext-count").textContent = `${fmtCount(served.external)} external`;
-  const width = (n) => (totalServed ? 2 + 5 * (n / totalServed) : 2).toFixed(2);
-  const flowLocal = $("#flow-local");
-  const flowExt = $("#flow-ext");
-  flowLocal.style.strokeWidth = width(served.local);
-  flowExt.style.strokeWidth = width(served.external);
-  flowLocal.classList.toggle("idle", !served.local);
-  flowExt.classList.toggle("idle", !served.external);
+  renderFlowOut(served.providers || {}, totalServed);
   $("#flow-in").classList.toggle("idle", !requests.total);
   $("#flow-in").style.strokeWidth = requests.total ? "2.5" : "2";
 

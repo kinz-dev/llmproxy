@@ -166,7 +166,11 @@ Without a launcher, preserve these rules:
 - `src/backend_adapters.rs`: provider-facing Anthropic and Copilot adapters and
   cross-provider history sanitization.
 - `src/interceptor.rs`: local request construction, routing controls, decision
-  audit drafts, failure policy, and local response rendering.
+  audit drafts, and failure policy.
+- `src/interceptor_render.rs`: native-protocol rendering of accepted local
+  output, attached to `interceptor` via `#[path]`.
+- `src/oauth.rs`: stored CLI credential reuse for `codex-oauth` and
+  `claude-oauth` provider `auth` values.
 - `src/logging.rs`: bounded asynchronous trace file setup, timestamp naming,
   and retention cleanup.
 - `src/agent_launcher.rs`: shared launcher selection and lifecycle.
@@ -179,10 +183,16 @@ Without a launcher, preserve these rules:
   Routing, Models, Providers, and Settings; Activity and Routing use focused
   secondary views, including Activity > Decisions for policy audits.
 - `llmproxy.example.toml`: public credential-free configuration reference.
+- `ROADMAP.md`: candidate work and recorded design decisions, grouped by
+  what each item delivers. Nothing in it is committed work.
 
 ## Editing And Verification
 
 - Use `rg` for searches and `apply_patch` for manual edits.
+- Unit tests live in sibling `src/<module>_tests.rs` files attached with
+  `#[path = "<module>_tests.rs"] mod tests;`, not inline in the module. The
+  exception is `src/main.rs`, which keeps an inline `mod tests`. Add new tests
+  to the matching sibling file.
 - Normal Cargo commands build only for the current host. Do not add global
   `target-cpu=native` flags; release artifacts must run across CPUs of the same
   architecture. CI validates native x86_64 and ARM64 builds on Linux, macOS,

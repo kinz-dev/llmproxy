@@ -76,9 +76,40 @@ Design decisions, recorded because they are easy to get wrong:
 - **Update keyed, not wholesale.** The drift animation restarts if the nodes are
   rebuilt each poll, which visibly stutters. Reuse each provider's node.
 
-### Cost and spend views — `idea`
+### Per-model spend analytics — `idea`
 
-Surface for the spend meter above, once provider cost metadata exists.
+Price the existing per-model token counters so the admin UI answers "what is
+this costing me", broken down by model rather than in aggregate.
+
+Most of the data is already collected. `ModelUsage` keys requests, input tokens,
+output tokens, and total time by (provider, model); the stats API serves it as
+`model_usage`, and the UI already renders a Model usage table. What is missing
+is a price and the multiplication.
+
+- **Price metadata.** No cost information exists in config today. Rates are
+  per-provider *and* per-model, and differ between input and output, so this
+  wants a table keyed by model under each provider rather than a single number.
+  Prices change, so treat the config as the source of truth and never hardcode.
+- **Cached tokens are not recorded.** `cached_tokens` is translated through the
+  protocol layer but never reaches stats. Cache reads bill at a steep discount
+  and cache writes at a premium, so a naive input-token multiplication
+  overstates spend badly on agent traffic, which is cache-heavy by nature.
+  Recording them is a prerequisite for a number worth trusting.
+- **Estimated counts must be labelled.** `ModelUsage.estimated_requests` counts
+  requests whose tokens llmproxy estimated rather than read from the provider
+  response. Spend derived from those is an approximation and the UI should say
+  so rather than presenting a precise-looking figure.
+- **Counters do not survive a restart.** Stats are in-memory with a reset
+  action and no serialisation, so totals die with the daemon. Per-session cost
+  works today; "what did I spend this month" needs durable storage first, and
+  that is the larger half of this feature.
+- **Subscription providers are not per-token.** A provider using borrowed CLI
+  OAuth bills against a plan, not per token. Showing a dollar figure there is
+  actively misleading; those rows should read as included in the subscription
+  while still reporting token volume.
+
+Pairs with the spend meter under End-User Features, which is the same data
+aggregated per project rather than per model.
 
 ## Routing
 

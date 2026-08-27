@@ -290,3 +290,61 @@ fn codex_sse_folds_function_call() {
     assert_eq!(call["function"]["arguments"], "{\"cmd\":\"pwd\"}");
     assert!(completion["choices"][0]["message"]["content"].is_null());
 }
+
+#[test]
+fn anthropic_cache_tokens_reach_the_chat_wire_inside_prompt_tokens() {
+    let response = anthropic_to_chat_response(
+        json!({
+            "id": "msg_1",
+            "model": "claude-test",
+            "content": [{ "type": "text", "text": "ok" }],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 40,
+                "cache_read_input_tokens": 700,
+                "cache_creation_input_tokens": 200
+            }
+        }),
+        None,
+        7,
+    );
+    let usage = &response["usage"];
+    // Anthropic excludes both cache fields from input_tokens; the chat wire
+    // convention includes them.
+    assert_eq!(usage["prompt_tokens"], 1000);
+    assert_eq!(usage["completion_tokens"], 40);
+    assert_eq!(usage["total_tokens"], 1040);
+    assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 700);
+    assert_eq!(usage["prompt_tokens_details"]["cache_creation_tokens"], 200);
+}
+
+#[test]
+fn anthropic_stream_carries_cache_tokens_into_the_final_usage_chunk() {
+    let mut translator = AnthropicStreamTranslator::new(Some("client-model".to_string()), 42);
+    translator.translate(&json!({
+        "type": "message_start",
+        "message": {
+            "id": "msg_2",
+            "model": "claude-test",
+            "usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 90,
+                "cache_creation_input_tokens": 5
+            }
+        }
+    }));
+    let chunks = translator.translate(&json!({
+        "type": "message_delta",
+        "delta": { "stop_reason": "end_turn" },
+        "usage": { "output_tokens": 12 }
+    }));
+    let usage = chunks
+        .iter()
+        .find_map(|chunk| chunk.get("usage"))
+        .expect("final chunk carries usage");
+    assert_eq!(usage["prompt_tokens"], 105);
+    assert_eq!(usage["completion_tokens"], 12);
+    assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 90);
+    assert_eq!(usage["prompt_tokens_details"]["cache_creation_tokens"], 5);
+}

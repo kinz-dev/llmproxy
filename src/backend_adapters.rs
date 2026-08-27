@@ -174,6 +174,7 @@ pub(crate) fn anthropic_to_chat_response(
         Some("tool_use") => "tool_calls",
         _ => "stop",
     };
+    let cache = AnthropicCacheTokens::from_usage(anthropic.get("usage"));
     let input_tokens = anthropic
         .get("usage")
         .and_then(|usage| usage.get("input_tokens"))
@@ -195,12 +196,49 @@ pub(crate) fn anthropic_to_chat_response(
             "message": message,
             "finish_reason": finish_reason
         }],
-        "usage": {
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens
-        }
+        "usage": cache.chat_usage(input_tokens, output_tokens)
     })
+}
+
+/// Anthropic reports cache reads and cache creation outside `input_tokens`,
+/// while OpenAI's `prompt_tokens` already contains its cached share. Carrying
+/// the split through the chat wire keeps cache-aware spend possible without
+/// teaching every consumer both conventions.
+#[derive(Debug, Clone, Copy, Default)]
+struct AnthropicCacheTokens {
+    read: u64,
+    write: u64,
+}
+
+impl AnthropicCacheTokens {
+    fn from_usage(usage: Option<&Value>) -> Self {
+        let field = |name: &str| {
+            usage
+                .and_then(|usage| usage.get(name))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        Self {
+            read: field("cache_read_input_tokens"),
+            write: field("cache_creation_input_tokens"),
+        }
+    }
+
+    /// OpenAI-shaped usage whose `prompt_tokens` is the full billable prompt.
+    fn chat_usage(self, input_tokens: u64, output_tokens: u64) -> Value {
+        let prompt_tokens = input_tokens
+            .saturating_add(self.read)
+            .saturating_add(self.write);
+        json!({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": prompt_tokens.saturating_add(output_tokens),
+            "prompt_tokens_details": {
+                "cached_tokens": self.read,
+                "cache_creation_tokens": self.write,
+            },
+        })
+    }
 }
 
 pub(crate) fn sanitize_copilot_chat_request(request: &mut Value) {
@@ -262,6 +300,7 @@ pub(crate) struct AnthropicStreamTranslator {
     tool_indices: HashMap<usize, usize>,
     next_tool_index: usize,
     input_tokens: u64,
+    cache_tokens: AnthropicCacheTokens,
 }
 
 impl AnthropicStreamTranslator {
@@ -293,6 +332,7 @@ impl AnthropicStreamTranslator {
                     .and_then(|usage| usage.get("input_tokens"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
+                self.cache_tokens = AnthropicCacheTokens::from_usage(message.get("usage"));
             }
             output.push(self.role_chunk());
             self.role_emitted = true;
@@ -385,11 +425,7 @@ impl AnthropicStreamTranslator {
                         .get("output_tokens")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    json!({
-                        "prompt_tokens": self.input_tokens,
-                        "completion_tokens": output,
-                        "total_tokens": self.input_tokens + output
-                    })
+                    self.cache_tokens.chat_usage(self.input_tokens, output)
                 });
                 output.push(self.delta_chunk(json!({}), Some(finish), usage));
             }
@@ -883,10 +919,18 @@ fn codex_usage_to_chat(usage: &Value) -> Value {
         .get("output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    // Responses already counts cached tokens inside `input_tokens`, so the
+    // detail is carried through rather than added on.
+    let cached = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     json!({
         "prompt_tokens": input,
         "completion_tokens": output,
         "total_tokens": input + output,
+        "prompt_tokens_details": { "cached_tokens": cached },
     })
 }
 

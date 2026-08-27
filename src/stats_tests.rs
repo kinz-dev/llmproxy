@@ -98,6 +98,8 @@ fn sniffer_reads_usage_from_buffered_json() {
         TokenUsage {
             input_tokens: 100,
             output_tokens: 25,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             estimated: false,
         }
     );
@@ -116,6 +118,8 @@ fn sniffer_skips_null_usage_in_stream_chunks() {
         TokenUsage {
             input_tokens: 7,
             output_tokens: 3,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             estimated: false,
         }
     );
@@ -130,6 +134,8 @@ fn sniffer_estimates_when_usage_is_missing() {
         TokenUsage {
             input_tokens: 33,
             output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             estimated: true,
         }
     );
@@ -144,6 +150,8 @@ fn sniffer_does_not_invent_embedding_output_tokens() {
         TokenUsage {
             input_tokens: 12,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             estimated: true,
         }
     );
@@ -161,6 +169,8 @@ fn sniffer_survives_usage_split_across_tail_boundary() {
         TokenUsage {
             input_tokens: 11,
             output_tokens: 22,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             estimated: false,
         }
     );
@@ -176,6 +186,8 @@ fn sniffer_combines_anthropic_stream_usage_events() {
         TokenUsage {
             input_tokens: 17,
             output_tokens: 8,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             estimated: false,
         }
     );
@@ -205,6 +217,7 @@ fn stats_counters_and_snapshot_shape() {
         1,
     );
     stats.record_model_usage(
+        None,
         "local",
         "triage-model",
         Duration::from_millis(100),
@@ -226,12 +239,15 @@ fn stats_counters_and_snapshot_shape() {
         Duration::from_millis(900),
     );
     stats.record_model_usage(
+        None,
         "openai",
         "gpt-test",
         Duration::from_millis(800),
         TokenUsage {
             input_tokens: 20,
             output_tokens: 30,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             estimated: false,
         },
     );
@@ -239,7 +255,7 @@ fn stats_counters_and_snapshot_shape() {
     stats.record_routing_destination("responses", "openai", "gpt-test", true);
     stats.record_tokens_saved(0, 50, true);
 
-    let snapshot = stats.snapshot_json();
+    let snapshot = stats.snapshot_json(&crate::pricing::PricingIndex::default());
     assert_eq!(snapshot["requests"]["total"], 1);
     assert_eq!(snapshot["requests"]["remapped"], 3);
     assert_eq!(snapshot["requests"]["remap_namespace"], 1);
@@ -292,7 +308,7 @@ fn stats_counters_and_snapshot_shape() {
     assert_eq!(snapshot["tokens_saved"]["estimated"], 50);
 
     stats.reset();
-    let snapshot = stats.snapshot_json();
+    let snapshot = stats.snapshot_json(&crate::pricing::PricingIndex::default());
     assert_eq!(snapshot["requests"]["total"], 0);
     assert_eq!(snapshot["intercept"]["bypass"], 0);
     assert_eq!(snapshot["intercept"]["reject"], 0);
@@ -464,4 +480,165 @@ fn previews_are_single_line_and_truncated_to_the_budget() {
     assert_eq!(big.chars().count(), TRAFFIC_PREVIEW_CHARS + 1);
     assert!(big.starts_with(r#"{"content":"yyy"#), "got: {big}");
     assert!(big.ends_with('…'));
+}
+
+#[test]
+fn openai_cached_tokens_are_a_subset_of_the_prompt_count() {
+    let usage = TokenUsage::from_response(
+        Some(&json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 40,
+            "prompt_tokens_details": { "cached_tokens": 800 }
+        })),
+        0,
+        0,
+    );
+    assert_eq!(usage.input_tokens, 1000);
+    assert_eq!(usage.cache_read_tokens, 800);
+    assert_eq!(usage.cache_write_tokens, 0);
+    assert_eq!(usage.counters().uncached_input_tokens(), 200);
+    assert!(!usage.estimated);
+}
+
+#[test]
+fn anthropic_cache_fields_are_added_onto_the_prompt_count() {
+    let usage = TokenUsage::from_response(
+        Some(&json!({
+            "input_tokens": 100,
+            "output_tokens": 40,
+            "cache_read_input_tokens": 700,
+            "cache_creation_input_tokens": 200
+        })),
+        0,
+        0,
+    );
+    assert_eq!(usage.input_tokens, 1000);
+    assert_eq!(usage.cache_read_tokens, 700);
+    assert_eq!(usage.cache_write_tokens, 200);
+    assert_eq!(usage.counters().uncached_input_tokens(), 100);
+}
+
+#[test]
+fn inconsistent_cache_counts_never_exceed_the_prompt_count() {
+    let usage = TokenUsage::from_response(
+        Some(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 1,
+            "prompt_tokens_details": { "cached_tokens": 900, "cache_creation_tokens": 900 }
+        })),
+        0,
+        0,
+    );
+    assert_eq!(usage.cache_read_tokens, 100);
+    assert_eq!(usage.cache_write_tokens, 0);
+    assert_eq!(usage.counters().uncached_input_tokens(), 0);
+}
+
+#[test]
+fn sniffed_streaming_usage_keeps_cache_details() {
+    let mut sniffer = UsageSniffer::new(true);
+    sniffer.feed(b"data: {\"usage\":null}\n\n");
+    sniffer.feed(
+        b"data: {\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":7,\
+          \"prompt_tokens_details\":{\"cached_tokens\":450}}}\n\n",
+    );
+    let usage = sniffer.finish(0, true);
+    assert_eq!(usage.input_tokens, 500);
+    assert_eq!(usage.cache_read_tokens, 450);
+    assert!(!usage.estimated);
+}
+
+#[test]
+fn spend_snapshot_separates_priced_subscription_and_unpriced_rows() {
+    use crate::pricing::{ModelPrice, PricingConfig, PricingIndex};
+
+    let stats = ProxyStats::default();
+    stats.record_model_usage(
+        None,
+        "openai",
+        "gpt-test",
+        Duration::from_millis(10),
+        TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            estimated: false,
+        },
+    );
+    stats.record_model_usage(
+        None,
+        "claude_sub",
+        "claude-test",
+        Duration::from_millis(10),
+        TokenUsage {
+            input_tokens: 5,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            estimated: true,
+        },
+    );
+    stats.record_model_usage(
+        None,
+        "mystery",
+        "unknown",
+        Duration::from_millis(10),
+        TokenUsage {
+            input_tokens: 5,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            estimated: false,
+        },
+    );
+
+    let mut providers = std::collections::HashMap::new();
+    providers.insert(
+        "openai".to_string(),
+        PricingConfig {
+            models: [(
+                "gpt-test".to_string(),
+                ModelPrice {
+                    input: 2.0,
+                    output: 8.0,
+                    cache_read: None,
+                    cache_write: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..PricingConfig::default()
+        },
+    );
+    providers.insert(
+        "claude_sub".to_string(),
+        PricingConfig {
+            subscription: true,
+            ..PricingConfig::default()
+        },
+    );
+    let index = PricingIndex::from_providers(providers.iter());
+
+    let snapshot = stats.snapshot_json(&index);
+    let spend = &snapshot["spend"];
+    assert_eq!(spend["configured"], true);
+    assert_eq!(spend["currency"], "USD");
+    assert_eq!(spend["total"].as_f64().expect("total is a number"), 10.0);
+    assert_eq!(spend["subscription_requests"], 1);
+    assert_eq!(spend["unpriced_requests"], 1);
+
+    let rows = snapshot["model_usage"].as_array().expect("model rows");
+    let row = |provider: &str| {
+        rows.iter()
+            .find(|row| row["provider"] == provider)
+            .expect("row present")
+            .clone()
+    };
+    assert_eq!(row("openai")["pricing"], "priced");
+    assert_eq!(row("openai")["cost"]["total"].as_f64(), Some(10.0));
+    assert_eq!(row("claude_sub")["pricing"], "subscription");
+    assert!(row("claude_sub")["cost"].is_null());
+    assert_eq!(row("mystery")["pricing"], "unpriced");
+    assert!(row("mystery")["cost"].is_null());
 }

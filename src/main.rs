@@ -49,7 +49,10 @@ mod copilot_launcher;
 mod interceptor;
 mod logging;
 mod oauth;
+mod pricing;
+mod project;
 mod stats;
+mod usage_store;
 
 use agent_launcher::{
     AgentLaunch, LauncherKind, LauncherMode, LauncherSession, probe_existing_llmproxy,
@@ -146,6 +149,15 @@ struct Cli {
     #[arg(last = true, requires = "agent_launcher")]
     agent_args: Vec<OsString>,
 
+    /// Project root holding a .llmproxy.toml routing overlay. Defaults to the
+    /// nearest one at or above the current directory.
+    #[arg(long, requires = "agent_launcher")]
+    project: Option<PathBuf>,
+
+    /// Ignore any project .llmproxy.toml for this launch.
+    #[arg(long, conflicts_with = "project", requires = "agent_launcher")]
+    no_project: bool,
+
     /// Internal: keep the proxy in the foreground instead of daemonizing.
     #[arg(long, hide = true)]
     foreground: bool,
@@ -205,6 +217,11 @@ struct Config {
     model_routing: ModelRoutingMode,
     #[serde(skip)]
     anthropic_mode: AnthropicMode,
+    /// Identity of the project overlay this state was scoped to, when a
+    /// launcher session carried one. Never read from the config file: a
+    /// repository must not be able to name itself something else.
+    #[serde(skip)]
+    project: Option<String>,
 }
 
 impl Default for Config {
@@ -226,6 +243,7 @@ impl Default for Config {
             admin: AdminConfig::default(),
             model_routing: ModelRoutingMode::Remap,
             anthropic_mode: AnthropicMode::ChatCompletions,
+            project: None,
         }
     }
 }
@@ -268,7 +286,7 @@ impl ModelAlias {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 struct UpstreamConfig {
     kind: ProviderKind,
@@ -280,6 +298,9 @@ struct UpstreamConfig {
     auth: ProviderAuth,
     headers: HashMap<String, String>,
     reasoning_effort: Option<ReasoningEffort>,
+    /// Per-model rates used for spend reporting. Absent means "unpriced";
+    /// nothing is inferred, because a guessed price is worse than no price.
+    pricing: pricing::PricingConfig,
     timeout_secs: u64,
     connect_timeout_secs: u64,
     pool_max_idle_per_host: usize,
@@ -298,6 +319,7 @@ impl Default for UpstreamConfig {
             auth: ProviderAuth::None,
             headers: HashMap::new(),
             reasoning_effort: None,
+            pricing: pricing::PricingConfig::default(),
             timeout_secs: 600,
             connect_timeout_secs: 10,
             pool_max_idle_per_host: 64,
@@ -964,6 +986,22 @@ async fn main() -> Result<()> {
     }
 
     let launcher_mode = cli.launcher_mode();
+    if launcher_mode.is_some() {
+        let cwd = env::current_dir().context("failed to read the current directory")?;
+        let scope = if cli.no_project {
+            None
+        } else {
+            project::resolve(cli.project.as_deref(), &cwd)?
+        };
+        if let Some(scope) = &scope {
+            info!(
+                project = scope.name(),
+                root = %scope.root().display(),
+                "project routing overlay found"
+            );
+        }
+        agent_launcher::set_launch_project(scope.map(|scope| scope.root().to_path_buf()));
+    }
     let agent_launch = match launcher_mode {
         Some(mode) => AgentLaunch::discover(&cli, mode).await?,
         None => None,
@@ -1068,6 +1106,26 @@ async fn run_server(
     } else {
         None
     };
+    if let Some(directory) = state_dir() {
+        if let Err(error) = fs::create_dir_all(&directory) {
+            warn!(
+                path = %directory.display(),
+                error = %error,
+                "could not create the llmproxy state directory; usage history is disabled"
+            );
+        } else {
+            usage_store::usage_store().open(&directory);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(usage_store::flush_interval());
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    usage_store::usage_store().flush();
+                }
+            });
+        }
+    }
+
     let runtime_info =
         RuntimeInfo::new(bound_addr, admin_addr, config.integrated.enabled, log_file);
     let _runtime_info_file = RuntimeInfoGuard::create(bound_addr, &runtime_info)?;
@@ -1077,7 +1135,15 @@ async fn run_server(
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server failed")?;
+    // The ledger is only written on a timer, so the final interval's requests
+    // would otherwise be lost on a clean shutdown.
+    usage_store::usage_store().flush();
     Ok(())
+}
+
+/// Owner-only per-user state directory shared by logs and the usage ledger.
+fn state_dir() -> Option<PathBuf> {
+    agent_launcher::home_dir().map(|home| home.join(".llmproxy"))
 }
 
 fn build_app(shared: SharedState) -> Router {
@@ -2218,7 +2284,8 @@ async fn completions_impl(
             started,
             model_started,
             estimated_input_tokens,
-        ),
+        )
+        .for_project(state.config.project.as_deref()),
         response,
     )
 }
@@ -2274,6 +2341,7 @@ async fn embeddings_impl(
             model_started,
             estimated_input_tokens,
         )
+        .for_project(state.config.project.as_deref())
         .without_output_estimation(),
         response,
     )
@@ -2376,7 +2444,8 @@ async fn chat_completions_impl(
             started,
             model_started,
             estimated_input_tokens,
-        ),
+        )
+        .for_project(state.config.project.as_deref()),
         response,
     )
 }
@@ -2505,7 +2574,8 @@ async fn responses_impl(
             started,
             model_started,
             estimated_input_tokens,
-        ),
+        )
+        .for_project(state.config.project.as_deref()),
         response,
     )
 }
@@ -2619,7 +2689,8 @@ async fn anthropic_messages_impl(
                 started,
                 model_started,
                 estimated_input_tokens,
-            ),
+            )
+            .for_project(state.config.project.as_deref()),
             response,
         );
     }
@@ -2648,7 +2719,8 @@ async fn anthropic_messages_impl(
             started,
             model_started,
             estimated_input_tokens,
-        ),
+        )
+        .for_project(state.config.project.as_deref()),
         response,
     )
 }
@@ -3870,12 +3942,22 @@ pub(crate) async fn proxy_integrated_chat(
             started,
             model_started,
             estimated_input_tokens,
-        ),
+        )
+        .for_project(config.project.as_deref()),
         response,
     )
 }
 
 impl AppState {
+    /// Price tables for every provider this state can actually route to.
+    fn pricing_index(&self) -> pricing::PricingIndex {
+        pricing::PricingIndex::from_providers(
+            self.providers
+                .iter()
+                .map(|(name, provider)| (name, &provider.config.pricing)),
+        )
+    }
+
     fn default_provider(&self) -> &ProviderState {
         self.providers
             .get(&self.config.default_provider)
@@ -3885,11 +3967,60 @@ impl AppState {
     fn with_launcher_session(&self, session: &LauncherSession) -> Result<Self> {
         validate_launcher_runtime(&self.config, session.mode())?;
 
+        let scoped;
+        let base = match session.project_root() {
+            Some(root) => {
+                scoped = self.with_project_scope(root, session.mode())?;
+                &scoped
+            }
+            None => self,
+        };
         match session.mode() {
-            LauncherMode::Proxy => self.with_local_proxy_session(session),
-            LauncherMode::Intercept => self.with_native_interceptor_session(session),
-            LauncherMode::Integrated => self.with_integrated_session(session),
+            LauncherMode::Proxy => base.with_local_proxy_session(session),
+            LauncherMode::Intercept => base.with_native_interceptor_session(session),
+            LauncherMode::Integrated => base.with_integrated_session(session),
         }
+    }
+
+    /// Apply a project's `.llmproxy.toml` overlay.
+    ///
+    /// The token only carries a path. The file behind it is re-read here and
+    /// re-validated against this daemon's own providers, so a repository can
+    /// only ever compose routes out of providers the user already configured.
+    /// Pure-adapter and native-passthrough sessions do no integrated routing,
+    /// so they take the project identity for attribution and nothing else.
+    fn with_project_scope(&self, root: &str, mode: LauncherMode) -> Result<Self> {
+        let scope = project::cached_scope(FsPath::new(root))
+            .with_context(|| format!("project scope {root:?} could not be applied"))?;
+        let mut config = (*self.config).clone();
+        config.project = Some(scope.name().to_string());
+        if mode == LauncherMode::Integrated {
+            project::validate_overlay(
+                scope.file(),
+                |name| self.providers.contains_key(name),
+                &config.default_provider,
+            )
+            .with_context(|| format!("project config {root:?} is not usable here"))?;
+            scope.apply(&mut config);
+            let mut routing_interceptor = config.interceptor.clone();
+            routing_interceptor.enabled = true;
+            interceptor::validate_integrated_config(
+                &config.integrated,
+                &routing_interceptor,
+                &effective_provider_configs(&config)?,
+            )
+            .with_context(|| format!("project config {root:?} produced an invalid route table"))?;
+            info!(
+                project = scope.name(),
+                targets = scope.file().integrated.targets.len(),
+                aliases = scope.file().model_aliases.len(),
+                "applied project routing overlay"
+            );
+        }
+        Ok(Self {
+            config: Arc::new(config),
+            ..self.clone()
+        })
     }
 
     fn with_local_proxy_session(&self, session: &LauncherSession) -> Result<Self> {
@@ -3957,6 +4088,9 @@ impl AppState {
         external_config.api_key_env = None;
         external_config.headers.clear();
         external_config.reasoning_effort = None;
+        // The agent's own credential pays for this route, not ours, so the
+        // configured price table for the template provider does not apply.
+        external_config.pricing = pricing::PricingConfig::default();
         external_config.kind = match session.kind() {
             LauncherKind::Codex => ProviderKind::OpenAi,
             LauncherKind::Claude => ProviderKind::Anthropic,
@@ -6703,6 +6837,9 @@ fn validate_config(config: &Config) -> Result<()> {
                 "provider {name:?} reasoning_effort must be low, medium, high, xhigh, or max for Anthropic"
             );
         }
+        if let Err(error) = provider.pricing.validate(name) {
+            bail!(error);
+        }
     }
     for (alias, route) in &config.model_aliases {
         if alias == INTEGRATED_AUTO_MODEL {
@@ -7115,6 +7252,7 @@ mod tests {
                 model: "local-model".to_string(),
                 hint: "larger local work".to_string(),
                 reasoning_effort: None,
+                is_default: false,
             },
         );
         assert!(validate_launcher_runtime(&config, LauncherMode::Integrated).is_ok());
@@ -7458,6 +7596,7 @@ mod tests {
                         model: "target-model".to_string(),
                         hint: "explicitly selected work".to_string(),
                         reasoning_effort: None,
+                        is_default: false,
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -7610,6 +7749,7 @@ mod tests {
                         model: "target-model".to_string(),
                         hint: "complex work".to_string(),
                         reasoning_effort: Some(ReasoningEffort::Max),
+                        is_default: false,
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -7717,6 +7857,7 @@ mod tests {
                         model: "fallback-model".to_string(),
                         hint: "complex work".to_string(),
                         reasoning_effort: None,
+                        is_default: false,
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -7839,6 +7980,7 @@ mod tests {
                         model: "target-model".to_string(),
                         hint: "complex work".to_string(),
                         reasoning_effort: None,
+                        is_default: false,
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -10943,6 +11085,7 @@ mod tests {
                 model: "gpt-test".to_string(),
                 hint: "everything else".to_string(),
                 reasoning_effort: None,
+                is_default: false,
             },
         );
         config.integrated.targets.insert(
@@ -10952,6 +11095,7 @@ mod tests {
                 model: "ghost".to_string(),
                 hint: "unreachable".to_string(),
                 reasoning_effort: None,
+                is_default: false,
             },
         );
 

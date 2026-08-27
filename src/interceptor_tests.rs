@@ -222,6 +222,7 @@ fn integrated_redirect_must_be_the_only_local_output() {
             model: "gpt-test".to_string(),
             hint: "complex work".to_string(),
             reasoning_effort: None,
+            is_default: false,
         },
     )]);
     let redirect = json!({
@@ -268,6 +269,7 @@ fn integrated_request_adds_target_tools_and_prompt_hints() {
                     model: "gpt-test".to_string(),
                     hint: "complex coding".to_string(),
                     reasoning_effort: Some(crate::ReasoningEffort::Max),
+                    is_default: false,
                 },
             )]),
             ..IntegratedConfig::default()
@@ -330,6 +332,7 @@ fn explicit_model_in_integrated_config_uses_pass_only_prompt() {
                     model: "gpt-test".to_string(),
                     hint: "complex coding".to_string(),
                     reasoning_effort: None,
+                    is_default: false,
                 },
             )]),
             ..IntegratedConfig::default()
@@ -374,6 +377,7 @@ fn integrated_mode_swaps_in_the_routing_tier_prompt_unless_overridden() {
                     model: "gpt-test".to_string(),
                     hint: "everything else (default route)".to_string(),
                     reasoning_effort: None,
+                    is_default: false,
                 },
             )]),
             ..IntegratedConfig::default()
@@ -615,6 +619,7 @@ fn integrated_external_targets_require_proxy_credentials() {
                 model: "model".to_string(),
                 hint: "complex work".to_string(),
                 reasoning_effort: None,
+                is_default: false,
             },
         )]),
         ..IntegratedConfig::default()
@@ -650,6 +655,7 @@ fn integrated_target_names_are_generic_tool_names() {
         model: "model".to_string(),
         hint: "complex work".to_string(),
         reasoning_effort: None,
+        is_default: false,
     };
     let config_for = |name: String| IntegratedConfig {
         enabled: true,

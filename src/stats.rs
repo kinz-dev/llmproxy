@@ -16,6 +16,17 @@ use serde_json::{Value, json};
 use tracing::{error, info, trace};
 
 use crate::is_event_stream_content_type;
+use crate::pricing::{ModelRate, PricingIndex, Spend, TokenCounters};
+
+fn spend_json(spend: Spend) -> Value {
+    json!({
+        "input": spend.input,
+        "output": spend.output,
+        "cache_read": spend.cache_read,
+        "cache_write": spend.cache_write,
+        "total": spend.total(),
+    })
+}
 
 /// Whether a response was produced by a local model (loopback/LAN provider or
 /// the interceptor) or forwarded to an external provider.
@@ -120,11 +131,46 @@ impl ProviderCalls {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TokenUsage {
+    /// Full prompt count including anything served from or written to cache,
+    /// matching OpenAI's `prompt_tokens`. The cache fields are subsets of it.
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
+    pub(crate) cache_read_tokens: u64,
+    pub(crate) cache_write_tokens: u64,
     pub(crate) estimated: bool,
+}
+
+/// The token fields a provider reported, each absent when it said nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReportedUsage {
+    input: Option<u64>,
+    output: Option<u64>,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
+}
+
+impl ReportedUsage {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            input: self.input.or(other.input),
+            output: self.output.or(other.output),
+            cache_read: self.cache_read.or(other.cache_read),
+            cache_write: self.cache_write.or(other.cache_write),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.input.is_none()
+            && self.output.is_none()
+            && self.cache_read.is_none()
+            && self.cache_write.is_none()
+    }
+
+    fn has_totals(self) -> bool {
+        self.input.is_some() && self.output.is_some()
+    }
 }
 
 impl TokenUsage {
@@ -133,25 +179,38 @@ impl TokenUsage {
         estimated_input_tokens: u64,
         estimated_output_tokens: u64,
     ) -> Self {
-        let (input, output) = usage.map(usage_token_fields).unwrap_or_default();
-        Self::from_fields(
-            input,
-            output,
-            estimated_input_tokens,
-            estimated_output_tokens,
-        )
+        let reported = usage.map(usage_token_fields).unwrap_or_default();
+        Self::from_fields(reported, estimated_input_tokens, estimated_output_tokens)
     }
 
     fn from_fields(
-        input: Option<u64>,
-        output: Option<u64>,
+        reported: ReportedUsage,
         estimated_input_tokens: u64,
         estimated_output_tokens: u64,
     ) -> Self {
+        let input_tokens = reported.input.unwrap_or(estimated_input_tokens);
+        // Cache counts are subsets of the prompt count; a provider that
+        // reports them inconsistently must not inflate the billable split.
+        let cache_read_tokens = reported.cache_read.unwrap_or(0).min(input_tokens);
+        let cache_write_tokens = reported
+            .cache_write
+            .unwrap_or(0)
+            .min(input_tokens - cache_read_tokens);
         Self {
-            input_tokens: input.unwrap_or(estimated_input_tokens),
-            output_tokens: output.unwrap_or(estimated_output_tokens),
-            estimated: input.is_none() || output.is_none(),
+            input_tokens,
+            output_tokens: reported.output.unwrap_or(estimated_output_tokens),
+            cache_read_tokens,
+            cache_write_tokens,
+            estimated: !reported.has_totals(),
+        }
+    }
+
+    pub(crate) fn counters(self) -> crate::pricing::TokenCounters {
+        crate::pricing::TokenCounters {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
         }
     }
 }
@@ -161,6 +220,8 @@ struct ModelUsage {
     requests: u64,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
     total_time_ms: u64,
     estimated_requests: u64,
 }
@@ -176,6 +237,12 @@ impl ModelUsage {
         self.requests = self.requests.saturating_add(1);
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(usage.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(usage.cache_write_tokens);
         self.total_time_ms = self
             .total_time_ms
             .saturating_add(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
@@ -309,8 +376,12 @@ impl ProxyStats {
             .or_default() += 1;
     }
 
+    /// Fold one completed call into the in-memory counters and the durable
+    /// ledger together, so "right now" and "this month" can never disagree
+    /// about what was recorded.
     pub(crate) fn record_model_usage(
         &self,
+        project: Option<&str>,
         provider: &str,
         model: &str,
         elapsed: Duration,
@@ -322,6 +393,7 @@ impl ProxyStats {
             .entry((provider.to_string(), model.to_string()))
             .or_default()
             .record(elapsed, usage);
+        crate::usage_store::usage_store().record(project, provider, model, elapsed, usage);
     }
 
     fn record_routing_destination(
@@ -422,7 +494,10 @@ impl ProxyStats {
     }
 
     /// Stable snake_case keys: the admin UI treats this shape as a contract.
-    pub(crate) fn snapshot_json(&self) -> Value {
+    ///
+    /// Pricing is passed in rather than read from a global so a report prices
+    /// exactly the configuration snapshot it was generated under.
+    pub(crate) fn snapshot_json(&self, pricing: &PricingIndex) -> Value {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         let latency = |window: &LatencyWindow| {
             let (p50, p99, samples) = window.percentiles();
@@ -455,21 +530,60 @@ impl ProxyStats {
                 )
             })
             .collect::<serde_json::Map<_, _>>();
+        let mut spend_total = Spend::default();
+        let mut priced_requests = 0_u64;
+        let mut priced_estimated_requests = 0_u64;
+        let mut subscription_requests = 0_u64;
+        let mut unpriced_requests = 0_u64;
         let mut model_usage = self
             .model_usage
             .lock()
             .expect("model usage stats poisoned")
             .iter()
             .map(|((provider, model), usage)| {
+                let counters = TokenCounters {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cache_write_tokens: usage.cache_write_tokens,
+                };
+                let rate = pricing.rate(provider, model);
+                let spend = match rate {
+                    ModelRate::Priced(price) => {
+                        let spend = crate::pricing::spend_for(price, counters);
+                        spend_total.add(spend);
+                        priced_requests = priced_requests.saturating_add(usage.requests);
+                        priced_estimated_requests =
+                            priced_estimated_requests.saturating_add(usage.estimated_requests);
+                        Some(spend)
+                    }
+                    ModelRate::Subscription => {
+                        subscription_requests =
+                            subscription_requests.saturating_add(usage.requests);
+                        None
+                    }
+                    ModelRate::Unpriced => {
+                        unpriced_requests = unpriced_requests.saturating_add(usage.requests);
+                        None
+                    }
+                };
                 json!({
                     "provider": provider,
                     "model": model,
                     "requests": usage.requests,
                     "input_tokens": usage.input_tokens,
                     "output_tokens": usage.output_tokens,
+                    "cache_read_tokens": usage.cache_read_tokens,
+                    "cache_write_tokens": usage.cache_write_tokens,
+                    "uncached_input_tokens": counters.uncached_input_tokens(),
                     "total_tokens": usage.input_tokens.saturating_add(usage.output_tokens),
                     "total_time_ms": usage.total_time_ms,
                     "estimated_requests": usage.estimated_requests,
+                    // "priced" | "subscription" | "unpriced". A subscription
+                    // row bills against a plan, so its token volume is real
+                    // but a dollar figure for it would be a fiction.
+                    "pricing": rate.as_str(),
+                    "cost": spend.map(spend_json),
                 })
             })
             .collect::<Vec<_>>();
@@ -549,6 +663,19 @@ impl ProxyStats {
                 "external": latency(&self.latency_external),
             },
             "model_usage": model_usage,
+            "spend": {
+                "configured": !pricing.is_empty(),
+                "currency": pricing.currency(),
+                "total": spend_total.total(),
+                "breakdown": spend_json(spend_total),
+                "priced_requests": priced_requests,
+                // Spend derived from estimated token counts is an
+                // approximation; the UI must say so rather than present a
+                // precise-looking figure.
+                "estimated_requests": priced_estimated_requests,
+                "subscription_requests": subscription_requests,
+                "unpriced_requests": unpriced_requests,
+            },
             "tokens_saved": {
                 "prompt": saved_prompt,
                 "completion": saved_completion,
@@ -625,6 +752,7 @@ pub(crate) struct ResponseTracking<'a> {
     provider: &'a str,
     model: &'a str,
     frontend: &'a str,
+    project: Option<&'a str>,
     request_started: Instant,
     model_started: Instant,
     estimated_input_tokens: u64,
@@ -646,11 +774,19 @@ impl<'a> ResponseTracking<'a> {
             provider,
             model,
             frontend,
+            project: None,
             request_started,
             model_started,
             estimated_input_tokens,
             estimate_output_tokens: true,
         }
+    }
+
+    /// Attribute this call to a project so durable spend can be broken down
+    /// by repository rather than only in aggregate.
+    pub(crate) fn for_project(mut self, project: Option<&'a str>) -> Self {
+        self.project = project;
+        self
     }
 
     pub(crate) fn without_output_estimation(mut self) -> Self {
@@ -667,6 +803,7 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
         provider,
         model,
         frontend,
+        project,
         request_started,
         model_started,
         estimated_input_tokens,
@@ -675,6 +812,7 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
     let provider = provider.to_string();
     let model = model.to_string();
     let frontend = frontend.to_string();
+    let project = project.map(str::to_string);
     let status = response.status();
     let success = status.is_success();
     proxy_stats().record_routing_destination(&frontend, &provider, &model, !success);
@@ -771,7 +909,13 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
         if success && completed {
             let usage = sniffer.finish(estimated_input_tokens, estimate_output_tokens);
             proxy_stats().record_served(class, &provider, &frontend, request_started.elapsed());
-            proxy_stats().record_model_usage(&provider, &model, model_started.elapsed(), usage);
+            proxy_stats().record_model_usage(
+                project.as_deref(),
+                &provider,
+                &model,
+                model_started.elapsed(),
+                usage,
+            );
             if class == RouteClass::Local {
                 proxy_stats().record_tokens_saved(
                     usage.input_tokens,
@@ -825,39 +969,31 @@ impl UsageSniffer {
         } else {
             0
         };
-        let (input, output) = extract_last_usage(&self.tail).unwrap_or_default();
-        TokenUsage::from_fields(
-            input,
-            output,
-            estimated_input_tokens,
-            estimated_output_tokens,
-        )
+        let reported = extract_last_usage(&self.tail).unwrap_or_default();
+        TokenUsage::from_fields(reported, estimated_input_tokens, estimated_output_tokens)
     }
 }
 
 /// Scan backwards for the last `"usage"` key whose value is an object with
 /// token counts. Streams emit `"usage":null` chunks, so earlier matches are
 /// tried until one parses.
-fn extract_last_usage(haystack: &[u8]) -> Option<(Option<u64>, Option<u64>)> {
+fn extract_last_usage(haystack: &[u8]) -> Option<ReportedUsage> {
     const KEY: &[u8] = b"\"usage\"";
     let mut end = haystack.len();
-    let mut input = None;
-    let mut output = None;
+    let mut reported = ReportedUsage::default();
     for _ in 0..16 {
         let Some(start) = rfind(&haystack[..end], KEY) else {
             break;
         };
         if let Some(usage) = parse_usage_value(&haystack[start + KEY.len()..]) {
-            let (candidate_input, candidate_output) = usage_token_fields(&usage);
-            input = input.or(candidate_input);
-            output = output.or(candidate_output);
-            if input.is_some() && output.is_some() {
+            reported = reported.merge(usage_token_fields(&usage));
+            if reported.has_totals() {
                 break;
             }
         }
         end = start;
     }
-    (input.is_some() || output.is_some()).then_some((input, output))
+    (!reported.is_empty()).then_some(reported)
 }
 
 fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -908,23 +1044,66 @@ fn parse_usage_value(bytes: &[u8]) -> Option<Value> {
 /// (prompt, completion) from OpenAI- or Anthropic-style usage objects.
 #[cfg(test)]
 fn usage_tokens(usage: &Value) -> Option<(u64, u64)> {
-    let (input, output) = usage_token_fields(usage);
-    if input.is_none() && output.is_none() {
+    let reported = usage_token_fields(usage);
+    if reported.is_empty() {
         return None;
     }
-    Some((input.unwrap_or(0), output.unwrap_or(0)))
+    Some((reported.input.unwrap_or(0), reported.output.unwrap_or(0)))
 }
 
-fn usage_token_fields(usage: &Value) -> (Option<u64>, Option<u64>) {
-    let field = |names: [&str; 2]| {
+/// Normalize the OpenAI and Anthropic usage shapes onto one set of fields.
+///
+/// The two disagree about what the prompt count contains: OpenAI's
+/// `prompt_tokens` already includes cache reads, Anthropic's `input_tokens`
+/// excludes both cache reads and cache creation. Cache-aware spend needs one
+/// meaning, so Anthropic's parts are summed back into the prompt total.
+fn usage_token_fields(usage: &Value) -> ReportedUsage {
+    let field = |names: &[&str]| {
         names
             .iter()
-            .find_map(|name| usage.get(name).and_then(Value::as_u64))
+            .find_map(|name| usage.get(*name).and_then(Value::as_u64))
     };
-    (
-        field(["prompt_tokens", "input_tokens"]),
-        field(["completion_tokens", "output_tokens"]),
+    let details = |parent: &str, names: &[&str]| {
+        usage.get(parent).map(|details| {
+            names
+                .iter()
+                .find_map(|name| details.get(*name).and_then(Value::as_u64))
+        })?
+    };
+    let cache_read = details(
+        "prompt_tokens_details",
+        &["cached_tokens", "cache_read_tokens"],
     )
+    .or_else(|| {
+        details(
+            "input_tokens_details",
+            &["cached_tokens", "cache_read_tokens"],
+        )
+    })
+    .or_else(|| field(&["cache_read_input_tokens"]));
+    let cache_write = details(
+        "prompt_tokens_details",
+        &["cache_creation_tokens", "cache_write_tokens"],
+    )
+    .or_else(|| field(&["cache_creation_input_tokens"]));
+
+    let openai_prompt = field(&["prompt_tokens"]);
+    let anthropic_input = field(&["input_tokens"]);
+    let input = match (openai_prompt, anthropic_input) {
+        (Some(prompt), _) => Some(prompt),
+        (None, Some(input)) => Some(
+            input
+                .saturating_add(cache_read.unwrap_or(0))
+                .saturating_add(cache_write.unwrap_or(0)),
+        ),
+        (None, None) => None,
+    };
+    ReportedUsage {
+        input,
+        output: field(&["completion_tokens", "output_tokens"]),
+        cache_read,
+        cache_write,
+    }
 }
 
 // Traffic log: a bounded, expiring feed of request/response previews for the

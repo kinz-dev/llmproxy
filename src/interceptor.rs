@@ -146,7 +146,8 @@ fn integrated_routing_requested(config: &IntegratedConfig, client_model: Option<
     config.enabled && client_model == Some(INTEGRATED_AUTO_MODEL)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct IntegratedTarget {
     pub(crate) provider: String,
     pub(crate) model: String,
@@ -154,6 +155,11 @@ pub(crate) struct IntegratedTarget {
     pub(crate) hint: String,
     #[serde(default)]
     pub(crate) reasoning_effort: Option<crate::ReasoningEffort>,
+    /// The catch-all route. `ROUTE_DEFAULT` resolves here instead of falling
+    /// through to first-upstream-model discovery. At most one target may claim
+    /// it once project and user-level targets have been merged.
+    #[serde(default, rename = "default")]
+    pub(crate) is_default: bool,
 }
 
 impl Default for InterceptorConfig {
@@ -472,6 +478,17 @@ pub(crate) fn validate_integrated_config(
             );
         }
     }
+    let defaults = config
+        .targets
+        .iter()
+        .filter(|(_, target)| target.is_default)
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    if defaults.len() > 1 {
+        bail!(
+            "integrated targets {defaults:?} all set default = true; exactly one target may be the catch-all"
+        );
+    }
     for (name, target) in &config.targets {
         if !valid_target_name(name) || is_default_route_name(name) {
             bail!(
@@ -508,6 +525,15 @@ pub(crate) fn validate_integrated_config(
         }
     }
     Ok(())
+}
+
+/// The single target marked `default = true`, if the merged config has one.
+pub(crate) fn default_target(config: &IntegratedConfig) -> Option<(&str, &IntegratedTarget)> {
+    config
+        .targets
+        .iter()
+        .find(|(_, target)| target.is_default)
+        .map(|(name, target)| (name.as_str(), target))
 }
 
 fn valid_target_name(name: &str) -> bool {
@@ -836,7 +862,13 @@ pub(crate) async fn maybe_intercept(
         crate::estimate_tokens(&completion) as u64,
     );
     audit.set_triage(provider, &config.model, local_elapsed);
-    proxy_stats().record_model_usage(&provider.name, &config.model, local_elapsed, local_usage);
+    proxy_stats().record_model_usage(
+        state.config.project.as_deref(),
+        &provider.name,
+        &config.model,
+        local_elapsed,
+        local_usage,
+    );
     if !config.reject_sensitive {
         log_response_value(RouteClass::Local, &provider.name, &completion);
     }
@@ -932,6 +964,37 @@ pub(crate) async fn maybe_intercept(
             ))
         }
         CompletionDecision::DefaultRoute => {
+            // A configured catch-all target makes ROUTE_DEFAULT a real
+            // destination instead of a fall-through to first-upstream-model
+            // discovery, which is what makes a project overlay able to own
+            // "everything else".
+            if let Some((name, target)) = default_target(&state.config.integrated) {
+                audit.set_decision(
+                    "default_route",
+                    format!("{reason} Routed to the configured catch-all target."),
+                );
+                audit.set_target(name, target);
+                info!(
+                    request_id = %meta.request_id,
+                    protocol = protocol.as_str(),
+                    provider = %provider.name,
+                    target = name,
+                    elapsed_ms = local_elapsed.as_millis(),
+                    route = "default_target",
+                    "local interceptor selected the catch-all route"
+                );
+                return execute_integrated_redirect(
+                    state,
+                    name,
+                    redirect_request,
+                    protocol,
+                    client_model,
+                    client_streaming,
+                    conversation_key,
+                    audit,
+                )
+                .await;
+            }
             audit.set_decision(if integrated { "default_route" } else { "pass" }, reason);
             info!(
                 request_id = %meta.request_id,
@@ -1250,7 +1313,7 @@ pub(super) fn build_local_request(
         dynamic_instructions.push_str("\n\nIntegrated provider routes:");
         for (name, target) in &proxy_config.integrated.targets {
             dynamic_instructions.push_str(&format!(
-                "\nCall {name} when: {}. Destination: {}/{} with {} reasoning effort.",
+                "\nCall {name} when: {}. Destination: {}/{} with {} reasoning effort.{}",
                 target.hint.trim(),
                 target.provider,
                 target.model,
@@ -1258,6 +1321,11 @@ pub(super) fn build_local_request(
                     .reasoning_effort
                     .map(crate::ReasoningEffort::as_str)
                     .unwrap_or("provider-default"),
+                if target.is_default {
+                    " This is the catch-all route; ROUTE_DEFAULT lands here."
+                } else {
+                    ""
+                },
             ));
         }
         dynamic_instructions.push_str(

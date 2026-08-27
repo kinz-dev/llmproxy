@@ -2,6 +2,7 @@ use std::env;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -116,6 +117,28 @@ pub(super) struct LauncherSession {
     #[serde(default)]
     mode: LauncherMode,
     upstream_base_url: String,
+    /// Absolute path of the project root whose `.llmproxy.toml` scopes this
+    /// session, so one daemon keeps serving every project. The token is
+    /// unsigned, so the daemon re-reads that file and re-validates it against
+    /// its own providers rather than trusting the token's claim about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_root: Option<String>,
+}
+
+/// The project the launcher resolved for this process. A launcher process
+/// serves exactly one working directory, so it is set once during discovery
+/// and read when the session token is minted.
+static LAUNCH_PROJECT_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+pub(super) fn set_launch_project(root: Option<PathBuf>) {
+    let _ = LAUNCH_PROJECT_ROOT.set(root);
+}
+
+fn launch_project_root() -> Option<String> {
+    LAUNCH_PROJECT_ROOT
+        .get()
+        .and_then(Option::as_ref)
+        .map(|root| root.display().to_string())
 }
 
 impl LauncherSession {
@@ -134,10 +157,16 @@ impl LauncherSession {
         mode: LauncherMode,
         upstream_base_url: &str,
     ) -> Result<Self> {
-        match mode {
+        let session = match mode {
             LauncherMode::Intercept => Self::new(kind, upstream_base_url.to_string()),
             LauncherMode::Proxy | LauncherMode::Integrated => Self::local(kind, mode),
-        }
+        }?;
+        Ok(session.with_project_root(launch_project_root()))
+    }
+
+    pub(super) fn with_project_root(mut self, project_root: Option<String>) -> Self {
+        self.project_root = project_root;
+        self
     }
 
     fn for_mode(kind: LauncherKind, mode: LauncherMode, upstream_base_url: String) -> Result<Self> {
@@ -156,6 +185,7 @@ impl LauncherSession {
             kind,
             mode,
             upstream_base_url,
+            project_root: None,
         })
     }
 
@@ -177,7 +207,17 @@ impl LauncherSession {
                 Self::VERSION
             );
         }
-        Self::for_mode(session.kind, session.mode, session.upstream_base_url)
+        let project_root = session.project_root.clone();
+        Ok(
+            Self::for_mode(session.kind, session.mode, session.upstream_base_url)?
+                .with_project_root(project_root),
+        )
+    }
+
+    /// The project root the launcher claimed. Nothing about it is trusted: the
+    /// daemon re-reads the file at this path and re-validates its contents.
+    pub(super) fn project_root(&self) -> Option<&str> {
+        self.project_root.as_deref()
     }
 
     pub(super) fn kind(&self) -> LauncherKind {

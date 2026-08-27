@@ -132,6 +132,8 @@ fn router(state: AdminState) -> Router {
         .route("/api/model-list", get(api_model_list))
         .route("/api/stats", get(api_stats))
         .route("/api/stats/reset", post(api_stats_reset))
+        .route("/api/spend", get(api_spend))
+        .route("/api/spend/reset", post(api_spend_reset))
         .route("/api/logs", get(api_logs))
         .route("/api/logs/clear", post(api_logs_clear))
         .route("/api/errors", get(api_errors))
@@ -436,12 +438,49 @@ fn class_str(base_url: &str) -> &'static str {
     }
 }
 
-async fn api_stats() -> Response {
-    Json(proxy_stats().snapshot_json()).into_response()
+async fn api_stats(State(state): State<AdminState>) -> Response {
+    let snapshot = state.shared.snapshot();
+    let pricing = snapshot.pricing_index();
+    Json(proxy_stats().snapshot_json(&pricing)).into_response()
 }
 
 async fn api_stats_reset() -> Response {
     proxy_stats().reset();
+    Json(json!({ "ok": true })).into_response()
+}
+
+#[derive(Deserialize)]
+struct SpendQuery {
+    /// `YYYY-MM`; absent totals every retained month.
+    month: Option<String>,
+    /// Narrow to one project name.
+    project: Option<String>,
+}
+
+/// Durable spend, priced at the rates currently configured. Prices are read
+/// from config at request time rather than stored, so a rate correction
+/// re-prices history instead of leaving a stale number behind.
+async fn api_spend(State(state): State<AdminState>, Query(query): Query<SpendQuery>) -> Response {
+    let snapshot = state.shared.snapshot();
+    let pricing = snapshot.pricing_index();
+    if !crate::usage_store::usage_store().enabled() {
+        return Json(json!({
+            "available": false,
+            "reason": "no writable llmproxy state directory; usage history is not being recorded",
+        }))
+        .into_response();
+    }
+    let mut report = crate::usage_store::usage_store().report(
+        &pricing,
+        query.month.as_deref(),
+        query.project.as_deref(),
+    );
+    report["current_project"] = json!(snapshot.config.project);
+    Json(report).into_response()
+}
+
+async fn api_spend_reset() -> Response {
+    crate::usage_store::usage_store().reset();
     Json(json!({ "ok": true })).into_response()
 }
 

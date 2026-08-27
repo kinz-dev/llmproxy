@@ -198,6 +198,7 @@ fn integrated_doc_edit_writes_valid_target_tables() {
                 model: "gpt-test".to_string(),
                 hint: "tool-heavy work".to_string(),
                 reasoning_effort: Some(crate::ReasoningEffort::Max),
+                is_default: false,
             },
         )])),
     };

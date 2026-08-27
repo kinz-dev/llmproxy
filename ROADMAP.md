@@ -137,6 +137,83 @@ Open: hint overlap between a broad route and a narrower one has no tie-break
 today. Disjoint hint wording works now; an explicit `priority` field on targets
 is the structural fix if that wording grows unwieldy.
 
+### Sticky routing never expires during an active session — `idea`
+
+The sticky TTL is a sliding window, not an absolute one, so it does not bound
+how long a route stays pinned in real use.
+
+`conversation_key` prefers a session or thread header, and agent CLIs send one
+on every turn, so the key is stable for an entire session rather than per
+message. `execute_integrated_redirect` then re-inserts the sticky entry after
+every successful redirect, refreshing the TTL. The result is that the first
+message of a session chooses the route, and the choice survives for as long as
+the user keeps working — no value of `sticky_ttl_secs` changes this, because the
+TTL only ever governs idle gaps.
+
+This is the right behaviour for its original purpose, which is keeping one
+conversation coherent on one provider. It becomes wrong when routes differ in
+cost or capability: a session that opens with a trivial question is pinned to
+the cheap route even as the work turns into deep design, which defeats most of
+the value of splitting routes by complexity in the first place.
+
+Candidate directions, none of which require in-band verbs:
+
+- **Absolute rather than sliding TTL.** Keep the insertion timestamp on refresh
+  so the route is re-evaluated periodically even under continuous use.
+- **Re-triage on material change.** Re-run routing when the request diverges
+  enough from the one that set the route; the embedding work under
+  Embedding-cached routing would supply the distance measure.
+- **Bound by turns, not only by time.** Let a sticky entry serve at most N
+  turns before routing is reconsidered.
+- **Escalate but never demote.** Allow a later turn to move up to a stronger
+  route while refusing to move down, so cost control survives without pinning
+  quality to whatever the first message happened to be.
+
+Whichever is chosen, the Decisions view should distinguish a sticky reuse from a
+fresh decision so the behaviour is visible rather than inferred.
+
+### In-band routing verbs — `idea`
+
+There is no way to re-trigger triage inside an active session. `conversation_key`
+prefers a session or thread header, which agent CLIs send on every turn, so the
+key is stable for the whole session; and a successful redirect re-inserts the
+sticky entry, refreshing its TTL. An actively worked session therefore never
+falls out of stickiness, and the first message of the session decides the route
+until the user stops for longer than the TTL. Lowering `sticky_ttl_secs` does
+not address this — the TTL only governs idle gaps, never an active session.
+
+Proposal: recognise a small closed set of verb prefixes at the very start of the
+newest user message, act on them, and strip them before the request is
+forwarded. `triage: <prompt>` would bypass the sticky entry and re-run routing;
+a target name would pin that route directly and skip triage altogether, which is
+both deterministic and free of triage latency.
+
+In-band is the right channel precisely because agent CLIs give the user no way
+to set a per-message header. The response already carries `x-llmproxy-route`,
+so the mechanism for reporting what happened exists; only the inbound direction
+is missing.
+
+To settle at implementation time:
+
+- **Where detection happens.** Before the sticky lookup in `maybe_intercept`,
+  or the sticky entry short-circuits the verb.
+- **Stripping both copies.** The prefix must not reach the provider, and the
+  local copy must never mutate the external copy, so the strip has to be applied
+  deliberately to each rather than falling out of the existing clone.
+- **Stale prefixes in history.** Earlier turns keep their prefixes in the
+  conversation. Those must be stripped or ignored, or the triage model reads old
+  directives as if they were current.
+- **Collision safety.** Only at the start of the newest user message, only an
+  exact match against the closed verb list, with an escape for the case where
+  someone genuinely begins a message that way.
+- **Verb vocabulary.** `triage:` to force re-routing, a target name to pin,
+  something for "answer locally", and possibly an explicit unstick. Target names
+  are already constrained to tool-name-safe characters, so they parse
+  unambiguously, but they are verbose; short aliases would need defining.
+
+Related to retry-driven escalation under End-User Features: this is the
+explicit, user-driven form of the same need.
+
 ### Embedding-cached routing — `idea`
 
 `RoutingDecisionAudit` already records prompt, decision, target, and reason for

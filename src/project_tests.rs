@@ -7,6 +7,7 @@ fn sample_target(provider: &str) -> IntegratedTarget {
         hint: "frontend work".to_string(),
         reasoning_effort: None,
         is_default: false,
+        strength: None,
     }
 }
 

@@ -21,6 +21,7 @@ use crate::first_chat_choice_message;
 use crate::normalize_chat_completion_request;
 use crate::request_id_from_headers;
 use crate::rewrite_request_roles;
+use crate::routing_verbs::RoutingVerb;
 use crate::stats::{
     RouteClass, RoutingDecisionAudit, TokenUsage, log_request_value, log_response_text,
     log_response_value, proxy_stats, route_class_for_base_url, routing_decision_log,
@@ -116,18 +117,59 @@ pub(crate) struct InterceptorConfig {
     /// routing instead of serving a clipped answer.
     pub(crate) max_tokens: u64,
     pub(crate) parallel_tool_calls: bool,
+    /// Newest non-system messages copied into the triage request. The whole
+    /// conversation is otherwise copied, so triage input grows with the
+    /// conversation; trimming it cuts cost and reduces the noise the hints are
+    /// matched against. Zero copies everything.
+    pub(crate) triage_max_messages: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub(crate) struct IntegratedConfig {
     pub(crate) enabled: bool,
+    /// Idle-gap TTL. It slides on every successful redirect, so on its own it
+    /// bounds nothing about an actively worked session.
     pub(crate) sticky_ttl_secs: u64,
+    /// Wall-clock lifetime measured from when the route was first chosen and
+    /// *not* refreshed, so a long session is re-triaged periodically even
+    /// under continuous use. Zero leaves the route pinned indefinitely.
+    pub(crate) sticky_absolute_ttl_secs: u64,
+    /// Turns one sticky entry may serve before routing is reconsidered.
+    /// Zero is unlimited.
+    pub(crate) sticky_max_turns: u32,
+    /// What a re-triage is allowed to do to an already-pinned route.
+    pub(crate) sticky_policy: StickyPolicy,
     pub(crate) sticky_capacity: usize,
+    /// Recognise in-band routing verbs at the start of the newest user
+    /// message. Disable to pass every message through byte-for-byte.
+    pub(crate) verbs: bool,
     /// Integrated-mode routing policy override; empty uses the built-in
     /// integrated default.
     pub(crate) instructions: String,
     pub(crate) targets: BTreeMap<String, IntegratedTarget>,
+}
+
+/// How a re-triage interacts with the route a session is already pinned to.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StickyPolicy {
+    /// A re-triage may move the session anywhere, including to a weaker route.
+    Pin,
+    /// A later turn may move up to a stronger route but never back down, so
+    /// cost control survives without pinning quality to whatever the first
+    /// message of the session happened to be.
+    #[default]
+    Escalate,
+}
+
+impl StickyPolicy {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pin => "pin",
+            Self::Escalate => "escalate",
+        }
+    }
 }
 
 impl Default for IntegratedConfig {
@@ -135,10 +177,33 @@ impl Default for IntegratedConfig {
         Self {
             enabled: false,
             sticky_ttl_secs: 1800,
+            sticky_absolute_ttl_secs: 3600,
+            sticky_max_turns: 0,
+            sticky_policy: StickyPolicy::Escalate,
             sticky_capacity: 1024,
+            verbs: true,
             instructions: String::new(),
             targets: BTreeMap::new(),
         }
+    }
+}
+
+impl IntegratedConfig {
+    fn sticky_bounds(&self) -> StickyBounds {
+        StickyBounds {
+            absolute_ttl: (self.sticky_absolute_ttl_secs > 0)
+                .then(|| Duration::from_secs(self.sticky_absolute_ttl_secs)),
+            max_turns: (self.sticky_max_turns > 0).then_some(self.sticky_max_turns),
+        }
+    }
+
+    /// Routing strength of a target, defaulting to the weakest rank so an
+    /// unranked configuration can never accidentally block an escalation.
+    fn strength(&self, target: &str) -> u32 {
+        self.targets
+            .get(target)
+            .and_then(|target| target.strength)
+            .unwrap_or(0)
     }
 }
 
@@ -160,6 +225,11 @@ pub(crate) struct IntegratedTarget {
     /// it once project and user-level targets have been merged.
     #[serde(default, rename = "default")]
     pub(crate) is_default: bool,
+    /// Relative routing strength, higher being stronger. Only the ordering
+    /// matters, and only to `sticky_policy = "escalate"`, which uses it to
+    /// refuse a mid-session demotion.
+    #[serde(default)]
+    pub(crate) strength: Option<u32>,
 }
 
 impl Default for InterceptorConfig {
@@ -175,6 +245,7 @@ impl Default for InterceptorConfig {
             temperature: 0.0,
             max_tokens: 512,
             parallel_tool_calls: false,
+            triage_max_messages: 24,
         }
     }
 }
@@ -495,6 +566,16 @@ pub(crate) fn validate_integrated_config(
                 "integrated target {name:?} must be a non-reserved 1-64 character tool name containing only letters, digits, _, or -"
             );
         }
+        if config.verbs
+            && crate::routing_verbs::RESERVED_VERBS
+                .iter()
+                .any(|verb| name.eq_ignore_ascii_case(verb))
+        {
+            bail!(
+                "integrated target {name:?} collides with the in-band routing verb of the same name; \
+                 rename the target or set integrated.verbs = false"
+            );
+        }
         let Some(provider) = providers.get(&target.provider) else {
             bail!(
                 "integrated target {name:?} references unknown provider {:?}",
@@ -527,6 +608,42 @@ pub(crate) fn validate_integrated_config(
     Ok(())
 }
 
+/// The target a `<name>:` or `default:` directive names, when it resolves.
+fn forced_route_for(config: &IntegratedConfig, verb: Option<&RoutingVerb>) -> Option<String> {
+    match verb? {
+        RoutingVerb::Target(name) if config.targets.contains_key(name) => Some(name.clone()),
+        RoutingVerb::Default => default_target(config).map(|(name, _)| name.to_string()),
+        _ => None,
+    }
+}
+
+fn verb_route_reason(verb: Option<&RoutingVerb>) -> String {
+    match verb {
+        Some(RoutingVerb::Default) => {
+            "An in-band \"default\" directive took the catch-all route without triage.".to_string()
+        }
+        Some(verb) => format!(
+            "An in-band \"{}\" directive pinned this route without triage.",
+            verb.as_str()
+        ),
+        None => "An in-band directive pinned this route without triage.".to_string(),
+    }
+}
+
+/// Apply the escalate policy: a re-triage may move a session to a stronger
+/// route but never back down to a weaker one.
+fn apply_escalation_floor(
+    config: &IntegratedConfig,
+    chosen: &str,
+    floor: Option<&str>,
+) -> Option<String> {
+    let floor = floor?;
+    if floor == chosen || !config.targets.contains_key(floor) {
+        return None;
+    }
+    (config.strength(chosen) < config.strength(floor)).then(|| floor.to_string())
+}
+
 /// The single target marked `default = true`, if the merged config has one.
 pub(crate) fn default_target(config: &IntegratedConfig) -> Option<(&str, &IntegratedTarget)> {
     config
@@ -547,7 +664,33 @@ fn valid_target_name(name: &str) -> bool {
 #[derive(Clone)]
 struct StickyRoute {
     target: String,
+    /// When the route was first chosen. Deliberately *not* refreshed, so the
+    /// absolute bound measures the age of the decision rather than the age of
+    /// the last message.
+    created_at: Instant,
+    /// Sliding idle deadline, refreshed on every reuse.
     expires_at: Instant,
+    /// Turns this entry has already served.
+    turns: u32,
+}
+
+/// The limits that decide whether a pinned route may serve another turn.
+#[derive(Debug, Clone, Copy, Default)]
+struct StickyBounds {
+    absolute_ttl: Option<Duration>,
+    max_turns: Option<u32>,
+}
+
+/// What the store has to say about a conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StickyDecision {
+    /// Reuse the pinned route; it is inside every bound.
+    Reuse(String),
+    /// A bound was reached. Routing is reconsidered, but the route that was in
+    /// force is carried along so an escalate policy can refuse a demotion.
+    Retriage { previous: String },
+    /// Nothing is pinned.
+    Fresh,
 }
 
 #[derive(Default)]
@@ -556,18 +699,31 @@ struct StickyRoutes {
 }
 
 impl StickyRoutes {
-    fn lookup(&self, key: u64) -> Option<String> {
+    fn lookup(&self, key: u64, bounds: StickyBounds) -> StickyDecision {
         let now = Instant::now();
         let mut routes = self.entries.lock().expect("sticky route store poisoned");
         let (entries, _) = &mut *routes;
-        match entries.get(&key) {
-            Some(route) if route.expires_at > now => Some(route.target.clone()),
-            Some(_) => {
-                entries.remove(&key);
-                None
-            }
-            None => None,
+        let Some(route) = entries.get(&key) else {
+            return StickyDecision::Fresh;
+        };
+        if route.expires_at <= now {
+            // A real idle gap: the conversation is over as far as routing is
+            // concerned, so nothing is carried forward.
+            let target = route.target.clone();
+            entries.remove(&key);
+            let _ = target;
+            return StickyDecision::Fresh;
         }
+        let aged_out = bounds
+            .absolute_ttl
+            .is_some_and(|ttl| now.duration_since(route.created_at) >= ttl);
+        let turned_out = bounds.max_turns.is_some_and(|max| route.turns >= max);
+        if aged_out || turned_out {
+            return StickyDecision::Retriage {
+                previous: route.target.clone(),
+            };
+        }
+        StickyDecision::Reuse(route.target.clone())
     }
 
     fn insert(&self, key: u64, target: String, ttl_secs: u64, capacity: usize) {
@@ -575,7 +731,13 @@ impl StickyRoutes {
         let (entries, order) = &mut *routes;
         let now = Instant::now();
         entries.retain(|_, route| route.expires_at > now);
-        entries.remove(&key);
+        // A refresh keeps the original decision timestamp and counts the turn;
+        // re-pinning a different target starts a fresh decision.
+        let previous = entries.remove(&key);
+        let (created_at, turns) = match previous {
+            Some(route) if route.target == target => (route.created_at, route.turns + 1),
+            _ => (now, 1),
+        };
         order.retain(|existing| *existing != key);
         while entries.len() >= capacity {
             let Some(oldest) = order.pop_front() else {
@@ -587,7 +749,9 @@ impl StickyRoutes {
             key,
             StickyRoute {
                 target,
+                created_at,
                 expires_at: now + Duration::from_secs(ttl_secs),
+                turns,
             },
         );
         order.push_back(key);
@@ -599,6 +763,13 @@ impl StickyRoutes {
             .expect("sticky route store poisoned")
             .0
             .remove(&key);
+    }
+
+    #[cfg(test)]
+    fn clear(&self) {
+        let mut routes = self.entries.lock().expect("sticky route store poisoned");
+        routes.0.clear();
+        routes.1.clear();
     }
 }
 
@@ -645,6 +816,9 @@ pub(crate) async fn maybe_intercept(
     policy: InterceptionPolicy,
     client_model: Option<String>,
     client_streaming: bool,
+    // `verb` was already detected and stripped from the caller's native body
+    // by the protocol handler, so neither copy still carries it.
+    verb: Option<RoutingVerb>,
 ) -> InterceptionOutcome {
     let config = &state.config.interceptor;
     let integrated =
@@ -685,41 +859,111 @@ pub(crate) async fn maybe_intercept(
 
     let conversation_key =
         integrated.then(|| conversation_key(incoming_headers, &local_chat_request));
-    if !config.reject_sensitive
+
+    // An explicit verb is the user overruling the router, so it takes
+    // precedence over a pinned route. `unstick` also drops the pin itself.
+    if matches!(verb, Some(RoutingVerb::Unstick))
         && let Some(key) = conversation_key
-        && let Some(target) = sticky_routes().lookup(key)
-        && state.config.integrated.targets.contains_key(&target)
     {
+        sticky_routes().remove(key);
+    }
+    let verb_overrides_sticky = verb.is_some();
+
+    let mut escalation_floor: Option<String> = None;
+    if !config.reject_sensitive
+        && !verb_overrides_sticky
+        && let Some(key) = conversation_key
+    {
+        match sticky_routes().lookup(key, state.config.integrated.sticky_bounds()) {
+            StickyDecision::Reuse(target)
+                if state.config.integrated.targets.contains_key(&target) =>
+            {
+                let target_config = state
+                    .config
+                    .integrated
+                    .targets
+                    .get(&target)
+                    .expect("validated sticky route target missing");
+                audit.set_decision(
+                    "sticky",
+                    "The conversation already has a successful integrated route within the sticky bounds.",
+                );
+                audit.set_target(&target, target_config);
+                info!(
+                    request_id,
+                    protocol = protocol.as_str(),
+                    target,
+                    route = "sticky_redirect",
+                    "integrated router reused conversation route"
+                );
+                return execute_integrated_redirect(
+                    state,
+                    &target,
+                    local_chat_request,
+                    protocol,
+                    client_model,
+                    client_streaming,
+                    Some(key),
+                    audit,
+                )
+                .await;
+            }
+            StickyDecision::Retriage { previous }
+                if state.config.integrated.sticky_policy == StickyPolicy::Escalate
+                    && state.config.integrated.targets.contains_key(&previous) =>
+            {
+                // The pin aged out, so routing is reconsidered — but an
+                // escalate policy will not let the reconsideration move the
+                // session to a weaker route than it already had.
+                escalation_floor = Some(previous);
+            }
+            _ => {}
+        }
+    }
+
+    // A target or default verb is a deterministic, triage-free route. Sensitive
+    // screening is mandatory and fails closed, so when it is enabled the forced
+    // route is applied after the screening request instead of skipping it.
+    let forced_route = (!config.reject_sensitive)
+        .then(|| forced_route_for(&state.config.integrated, verb.as_ref()))
+        .flatten();
+    if let Some(name) = forced_route {
         let target_config = state
             .config
             .integrated
             .targets
-            .get(&target)
-            .expect("validated sticky route target missing");
-        audit.set_decision(
-            "sticky",
-            "The conversation already has a successful integrated route within the sticky TTL.",
-        );
-        audit.set_target(&target, target_config);
+            .get(&name)
+            .expect("forced verb route missing from config");
+        audit.set_decision("verb_route", verb_route_reason(verb.as_ref()));
+        audit.set_target(&name, target_config);
         info!(
             request_id,
             protocol = protocol.as_str(),
-            target,
-            route = "sticky_redirect",
-            "integrated router reused conversation route"
+            target = name,
+            route = "verb_route",
+            "in-band directive pinned an integrated route"
         );
         return execute_integrated_redirect(
             state,
-            &target,
+            &name,
             local_chat_request,
             protocol,
             client_model,
             client_streaming,
-            Some(key),
+            conversation_key,
             audit,
         )
         .await;
     }
+    if !config.reject_sensitive && matches!(verb, Some(RoutingVerb::Default)) {
+        audit.set_decision(
+            "default_route",
+            "An in-band \"default\" directive selected normal routing without triage.",
+        );
+        proxy_stats().record_intercept_pass();
+        return InterceptionOutcome::Continue(audit);
+    }
+    let force_local = matches!(verb, Some(RoutingVerb::Local));
 
     let redirect_request = local_chat_request.clone();
 
@@ -730,6 +974,7 @@ pub(crate) async fn maybe_intercept(
         client_model.as_deref(),
         &state.config.role_map,
         state.config.as_ref(),
+        force_local,
     ) {
         Ok(request) => request,
         Err(message) => {
@@ -949,6 +1194,33 @@ pub(crate) async fn maybe_intercept(
                     .to_string(),
         }
     });
+    // Screening ran first because it is mandatory and fails closed. Anything
+    // short of a rejection now defers to the user's explicit directive.
+    if config.reject_sensitive
+        && !matches!(classification.decision, CompletionDecision::Reject)
+        && let Some(name) = forced_route_for(&state.config.integrated, verb.as_ref())
+    {
+        let target_config = state
+            .config
+            .integrated
+            .targets
+            .get(&name)
+            .expect("forced verb route missing from config");
+        audit.set_decision("verb_route", verb_route_reason(verb.as_ref()));
+        audit.set_target(&name, target_config);
+        return execute_integrated_redirect(
+            state,
+            &name,
+            redirect_request,
+            protocol,
+            client_model,
+            client_streaming,
+            conversation_key,
+            audit,
+        )
+        .await;
+    }
+
     match classification.decision {
         CompletionDecision::Reject => {
             audit.set_decision("reject", reason.clone());
@@ -969,10 +1241,31 @@ pub(crate) async fn maybe_intercept(
             // discovery, which is what makes a project overlay able to own
             // "everything else".
             if let Some((name, target)) = default_target(&state.config.integrated) {
-                audit.set_decision(
-                    "default_route",
-                    format!("{reason} Routed to the configured catch-all target."),
-                );
+                let (name, target, reason) = match apply_escalation_floor(
+                    &state.config.integrated,
+                    name,
+                    escalation_floor.as_deref(),
+                ) {
+                    Some(floor) => {
+                        let target = state
+                            .config
+                            .integrated
+                            .targets
+                            .get(&floor)
+                            .expect("escalation floor target missing");
+                        let reason = format!(
+                            "{reason} Re-triage fell back to the catch-all route, and the escalate policy kept the stronger {floor:?} this session already had."
+                        );
+                        (floor, target, reason)
+                    }
+                    None => (
+                        name.to_string(),
+                        target,
+                        format!("{reason} Routed to the configured catch-all target."),
+                    ),
+                };
+                let name = name.as_str();
+                audit.set_decision("default_route", reason);
                 audit.set_target(name, target);
                 info!(
                     request_id = %meta.request_id,
@@ -1008,6 +1301,19 @@ pub(crate) async fn maybe_intercept(
             InterceptionOutcome::Continue(audit)
         }
         CompletionDecision::Redirect(target) => {
+            let (target, reason) = match apply_escalation_floor(
+                &state.config.integrated,
+                &target,
+                escalation_floor.as_deref(),
+            ) {
+                Some(floor) => {
+                    let reason = format!(
+                        "{reason} Re-triage selected a weaker route, and the escalate policy kept the stronger {floor:?} this session already had."
+                    );
+                    (floor, reason)
+                }
+                None => (target, reason),
+            };
             let target_config = state
                 .config
                 .integrated
@@ -1239,8 +1545,12 @@ pub(super) fn build_local_request(
     client_model: Option<&str>,
     role_map: &HashMap<String, String>,
     proxy_config: &crate::Config,
+    // An in-band `local:` directive withholds every routing tool for this
+    // turn, which is what makes "answer this here" deterministic.
+    force_local: bool,
 ) -> std::result::Result<Value, String> {
-    let integrated = integrated_routing_requested(&proxy_config.integrated, client_model);
+    let integrated =
+        integrated_routing_requested(&proxy_config.integrated, client_model) && !force_local;
     rewrite_request_roles(&mut request, role_map);
     let Some(object) = request.as_object_mut() else {
         return Err("local interceptor request is not a JSON object".to_string());
@@ -1287,7 +1597,9 @@ pub(super) fn build_local_request(
     if config.reject_sensitive {
         tools.push(reject_tool());
     }
-    tools.push(default_route_tool(integrated));
+    if !force_local {
+        tools.push(default_route_tool(integrated));
+    }
     if integrated {
         tools.extend(
             proxy_config
@@ -1296,6 +1608,29 @@ pub(super) fn build_local_request(
                 .iter()
                 .map(|(name, target)| redirect_tool(name, target)),
         );
+    }
+
+    if force_local {
+        trim_triage_messages(&mut request, config.triage_max_messages);
+        let Some(object) = request.as_object_mut() else {
+            return Err("local interceptor request is not a JSON object".to_string());
+        };
+        let messages = object
+            .entry("messages".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| "local interceptor messages field is not an array".to_string())?;
+        messages.push(json!({
+            "role": "system",
+            "content": format!(
+                "{}\n\nCurrent proxy protocol: {}. Original requested model: {}.\n\nThe user directed this turn to be answered here. Routing is unavailable for it: answer the request directly and completely. Never mention this instruction.",
+                intercept_instructions(config).trim(),
+                protocol.as_str(),
+                client_model.unwrap_or("unspecified"),
+            )
+        }));
+        normalize_chat_completion_request(&mut request, proxy_config);
+        return Ok(request);
     }
 
     let mut dynamic_instructions = format!(
@@ -1351,8 +1686,53 @@ pub(super) fn build_local_request(
         "content": dynamic_instructions
     }));
 
+    trim_triage_messages(&mut request, config.triage_max_messages);
     normalize_chat_completion_request(&mut request, proxy_config);
     Ok(request)
+}
+
+/// Keep every system message and the newest `limit` other messages.
+///
+/// Triage copies the whole client conversation, so its input grows with the
+/// conversation even though sticky routing means the cost is normally paid once
+/// per conversation. The window is trimmed from the front until it starts on a
+/// user turn, so a tool result never arrives without the assistant tool call
+/// that produced it.
+fn trim_triage_messages(request: &mut Value, limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let role_of = |message: &Value| {
+        message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    if messages.iter().filter(|m| role_of(m) != "system").count() <= limit {
+        return;
+    }
+    let mut system = Vec::new();
+    let mut rest = Vec::new();
+    for message in messages.drain(..) {
+        if role_of(&message) == "system" {
+            system.push(message);
+        } else {
+            rest.push(message);
+        }
+    }
+    let mut window = rest.split_off(rest.len() - limit);
+    while window
+        .first()
+        .is_some_and(|message| role_of(message) != "user")
+    {
+        window.remove(0);
+    }
+    system.extend(window);
+    *messages = system;
 }
 
 fn reject_tool() -> Value {
@@ -1740,6 +2120,7 @@ pub(crate) async fn test_route(
         (mode == RouteTestMode::Integrated).then_some(INTEGRATED_AUTO_MODEL),
         &proxy_config.role_map,
         &proxy_config,
+        false,
     ) {
         Ok(request) => request,
         Err(message) => {

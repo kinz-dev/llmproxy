@@ -51,6 +51,7 @@ mod logging;
 mod oauth;
 mod pricing;
 mod project;
+mod routing_verbs;
 mod stats;
 mod usage_store;
 
@@ -2347,6 +2348,18 @@ async fn embeddings_impl(
     )
 }
 
+/// Detect and strip an in-band routing verb from the caller's native body.
+///
+/// Stripping happens on the caller's own copy before the local triage copy is
+/// derived from it, so the prefix reaches neither the provider nor the triage
+/// model, and stale prefixes in earlier turns are removed at the same time.
+fn take_routing_verb(state: &AppState, body: &mut Value) -> Option<routing_verbs::RoutingVerb> {
+    if !state.config.integrated.verbs {
+        return None;
+    }
+    routing_verbs::detect_and_strip(body, &state.config.integrated.targets)
+}
+
 async fn chat_completions(
     State(shared): State<SharedState>,
     headers: HeaderMap,
@@ -2368,7 +2381,7 @@ async fn chat_completions_impl(
     shared: &SharedState,
     launcher_token: Option<&str>,
     headers: HeaderMap,
-    body: Value,
+    mut body: Value,
 ) -> Response {
     let state = match request_state(shared, launcher_token) {
         Ok(state) => state,
@@ -2386,6 +2399,7 @@ async fn chat_completions_impl(
         || state.config.interceptor.reject_sensitive
         || state.config.integrated.enabled
     {
+        let verb = take_routing_verb(&state, &mut body);
         match maybe_intercept(
             &state,
             &headers,
@@ -2396,6 +2410,7 @@ async fn chat_completions_impl(
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
             request_is_streaming(&body),
+            verb,
         )
         .await
         {
@@ -2471,7 +2486,7 @@ async fn responses_impl(
     shared: &SharedState,
     launcher_token: Option<&str>,
     headers: HeaderMap,
-    body: Value,
+    mut body: Value,
 ) -> Response {
     let state = match request_state(shared, launcher_token) {
         Ok(state) => state,
@@ -2495,6 +2510,7 @@ async fn responses_impl(
         || state.config.integrated.enabled
     {
         let policy = InterceptionPolicy::for_responses(&headers, &body);
+        let verb = take_routing_verb(&state, &mut body);
         let local_chat_request = responses_to_chat_request(&body);
         match maybe_intercept(
             &state,
@@ -2504,6 +2520,7 @@ async fn responses_impl(
             policy,
             client_model.clone(),
             request_is_streaming(&body),
+            verb,
         )
         .await
         {
@@ -2601,7 +2618,7 @@ async fn anthropic_messages_impl(
     shared: &SharedState,
     launcher_token: Option<&str>,
     headers: HeaderMap,
-    body: Value,
+    mut body: Value,
 ) -> Response {
     let state = match request_state(shared, launcher_token) {
         Ok(state) => state,
@@ -2624,6 +2641,7 @@ async fn anthropic_messages_impl(
         || state.config.interceptor.reject_sensitive
         || state.config.integrated.enabled
     {
+        let verb = take_routing_verb(&state, &mut body);
         let local_chat_request = anthropic_message_to_chat_request(&body);
         match maybe_intercept(
             &state,
@@ -2633,6 +2651,7 @@ async fn anthropic_messages_impl(
             InterceptionPolicy::Eligible,
             client_model.clone(),
             request_is_streaming(&body),
+            verb,
         )
         .await
         {
@@ -7253,6 +7272,7 @@ mod tests {
                 hint: "larger local work".to_string(),
                 reasoning_effort: None,
                 is_default: false,
+                strength: None,
             },
         );
         assert!(validate_launcher_runtime(&config, LauncherMode::Integrated).is_ok());
@@ -7597,6 +7617,7 @@ mod tests {
                         hint: "explicitly selected work".to_string(),
                         reasoning_effort: None,
                         is_default: false,
+                        strength: None,
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -7750,6 +7771,7 @@ mod tests {
                         hint: "complex work".to_string(),
                         reasoning_effort: Some(ReasoningEffort::Max),
                         is_default: false,
+                        strength: None,
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -7858,6 +7880,7 @@ mod tests {
                         hint: "complex work".to_string(),
                         reasoning_effort: None,
                         is_default: false,
+                        strength: None,
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -7981,6 +8004,7 @@ mod tests {
                         hint: "complex work".to_string(),
                         reasoning_effort: None,
                         is_default: false,
+                        strength: None,
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -11086,6 +11110,7 @@ mod tests {
                 hint: "everything else".to_string(),
                 reasoning_effort: None,
                 is_default: false,
+                strength: None,
             },
         );
         config.integrated.targets.insert(
@@ -11096,6 +11121,7 @@ mod tests {
                 hint: "unreachable".to_string(),
                 reasoning_effort: None,
                 is_default: false,
+                strength: None,
             },
         );
 

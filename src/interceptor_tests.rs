@@ -3,9 +3,12 @@ use std::collections::{BTreeMap, HashMap};
 use axum::http::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
+use std::time::Duration;
+
 use super::{
-    IntegratedConfig, IntegratedTarget, classify_completion_details,
-    classify_completion_with_targets,
+    IntegratedConfig, IntegratedTarget, StickyBounds, StickyDecision, StickyPolicy, StickyRoutes,
+    apply_escalation_floor, classify_completion_details, classify_completion_with_targets,
+    forced_route_for, trim_triage_messages, validate_integrated_config,
 };
 use crate::Config;
 use crate::INTEGRATED_AUTO_MODEL;
@@ -16,6 +19,7 @@ use crate::interceptor::InterceptorProtocol;
 use crate::interceptor::build_local_request;
 use crate::interceptor::classify_completion;
 use crate::interceptor::is_pass_tool;
+use crate::routing_verbs::RoutingVerb;
 use crate::text_from_value;
 
 #[test]
@@ -159,6 +163,7 @@ fn sensitive_rejection_is_optional_and_uses_safe_reason_categories() {
         Some("agent-model"),
         &HashMap::new(),
         &config,
+        false,
     )
     .unwrap();
     let reject = local["tools"]
@@ -223,6 +228,7 @@ fn integrated_redirect_must_be_the_only_local_output() {
             hint: "complex work".to_string(),
             reasoning_effort: None,
             is_default: false,
+            strength: None,
         },
     )]);
     let redirect = json!({
@@ -270,6 +276,7 @@ fn integrated_request_adds_target_tools_and_prompt_hints() {
                     hint: "complex coding".to_string(),
                     reasoning_effort: Some(crate::ReasoningEffort::Max),
                     is_default: false,
+                    strength: None,
                 },
             )]),
             ..IntegratedConfig::default()
@@ -286,6 +293,7 @@ fn integrated_request_adds_target_tools_and_prompt_hints() {
         Some(INTEGRATED_AUTO_MODEL),
         &HashMap::new(),
         &proxy_config,
+        false,
     )
     .unwrap();
 
@@ -333,6 +341,7 @@ fn explicit_model_in_integrated_config_uses_pass_only_prompt() {
                     hint: "complex coding".to_string(),
                     reasoning_effort: None,
                     is_default: false,
+                    strength: None,
                 },
             )]),
             ..IntegratedConfig::default()
@@ -349,6 +358,7 @@ fn explicit_model_in_integrated_config_uses_pass_only_prompt() {
         Some("openai/gpt-test"),
         &HashMap::new(),
         &proxy_config,
+        false,
     )
     .unwrap();
 
@@ -378,6 +388,7 @@ fn integrated_mode_swaps_in_the_routing_tier_prompt_unless_overridden() {
                     hint: "everything else (default route)".to_string(),
                     reasoning_effort: None,
                     is_default: false,
+                    strength: None,
                 },
             )]),
             ..IntegratedConfig::default()
@@ -393,6 +404,7 @@ fn integrated_mode_swaps_in_the_routing_tier_prompt_unless_overridden() {
             Some(INTEGRATED_AUTO_MODEL),
             &HashMap::new(),
             &proxy_config,
+            false,
         )
         .unwrap();
         local["messages"]
@@ -435,6 +447,7 @@ fn integrated_mode_swaps_in_the_routing_tier_prompt_unless_overridden() {
         Some(INTEGRATED_AUTO_MODEL),
         &HashMap::new(),
         &config_with_override,
+        false,
     )
     .unwrap();
     let overridden = overridden["messages"]
@@ -460,6 +473,7 @@ fn integrated_mode_swaps_in_the_routing_tier_prompt_unless_overridden() {
         None,
         &HashMap::new(),
         &Config::default(),
+        false,
     )
     .unwrap();
     let plain_prompt = plain["messages"]
@@ -500,6 +514,7 @@ fn local_request_is_dynamic_without_mutating_original() {
         Some("external-model"),
         &HashMap::new(),
         &Config::default(),
+        false,
     )
     .unwrap();
 
@@ -537,6 +552,7 @@ fn local_request_applies_routing_decision_params() {
         None,
         &HashMap::new(),
         &Config::default(),
+        false,
     )
     .unwrap();
 
@@ -563,6 +579,7 @@ fn zero_max_tokens_leaves_client_limits_alone() {
         None,
         &HashMap::new(),
         &Config::default(),
+        false,
     )
     .unwrap();
 
@@ -620,6 +637,7 @@ fn integrated_external_targets_require_proxy_credentials() {
                 hint: "complex work".to_string(),
                 reasoning_effort: None,
                 is_default: false,
+                strength: None,
             },
         )]),
         ..IntegratedConfig::default()
@@ -656,6 +674,7 @@ fn integrated_target_names_are_generic_tool_names() {
         hint: "complex work".to_string(),
         reasoning_effort: None,
         is_default: false,
+        strength: None,
     };
     let config_for = |name: String| IntegratedConfig {
         enabled: true,
@@ -686,4 +705,328 @@ fn integrated_target_names_are_generic_tool_names() {
             .is_err()
         );
     }
+}
+
+fn target_named(provider: &str, strength: Option<u32>) -> IntegratedTarget {
+    IntegratedTarget {
+        provider: provider.to_string(),
+        model: "model-x".to_string(),
+        hint: "work".to_string(),
+        reasoning_effort: None,
+        is_default: false,
+        strength,
+    }
+}
+
+/// Back-date a sticky entry so the absolute bound can be exercised without
+/// making the test wait for wall-clock time to pass.
+fn age_sticky_entry(routes: &StickyRoutes, key: u64, by: Duration) {
+    let mut entries = routes.entries.lock().expect("sticky store poisoned");
+    let route = entries.0.get_mut(&key).expect("entry present");
+    route.created_at -= by;
+}
+
+#[test]
+fn a_pinned_route_is_reused_while_it_is_inside_every_bound() {
+    let routes = StickyRoutes::default();
+    routes.insert(1, "backend".to_string(), 600, 16);
+    assert_eq!(
+        routes.lookup(1, StickyBounds::default()),
+        StickyDecision::Reuse("backend".to_string())
+    );
+}
+
+#[test]
+fn the_absolute_bound_survives_a_refresh_that_slides_the_idle_ttl() {
+    let routes = StickyRoutes::default();
+    let bounds = StickyBounds {
+        absolute_ttl: Some(Duration::from_secs(60)),
+        max_turns: None,
+    };
+    routes.insert(7, "cheap".to_string(), 600, 16);
+    // Continuous use: every turn refreshes the sliding TTL, which is exactly
+    // the case a sliding-only TTL never bounds.
+    for _ in 0..5 {
+        assert!(matches!(routes.lookup(7, bounds), StickyDecision::Reuse(_)));
+        routes.insert(7, "cheap".to_string(), 600, 16);
+    }
+    age_sticky_entry(&routes, 7, Duration::from_secs(61));
+    assert_eq!(
+        routes.lookup(7, bounds),
+        StickyDecision::Retriage {
+            previous: "cheap".to_string()
+        }
+    );
+}
+
+#[test]
+fn the_turn_bound_reconsiders_routing_without_dropping_the_previous_route() {
+    let routes = StickyRoutes::default();
+    let bounds = StickyBounds {
+        absolute_ttl: None,
+        max_turns: Some(3),
+    };
+    for _ in 0..3 {
+        routes.insert(9, "cheap".to_string(), 600, 16);
+    }
+    assert_eq!(
+        routes.lookup(9, bounds),
+        StickyDecision::Retriage {
+            previous: "cheap".to_string()
+        }
+    );
+}
+
+#[test]
+fn re_pinning_a_different_route_restarts_the_decision_clock() {
+    let routes = StickyRoutes::default();
+    let bounds = StickyBounds {
+        absolute_ttl: None,
+        max_turns: Some(2),
+    };
+    routes.insert(11, "cheap".to_string(), 600, 16);
+    routes.insert(11, "cheap".to_string(), 600, 16);
+    assert!(matches!(
+        routes.lookup(11, bounds),
+        StickyDecision::Retriage { .. }
+    ));
+    routes.insert(11, "strong".to_string(), 600, 16);
+    assert_eq!(
+        routes.lookup(11, bounds),
+        StickyDecision::Reuse("strong".to_string())
+    );
+}
+
+#[test]
+fn an_idle_gap_drops_the_entry_and_carries_nothing_forward() {
+    let routes = StickyRoutes::default();
+    routes.insert(13, "cheap".to_string(), 0, 16);
+    assert_eq!(
+        routes.lookup(13, StickyBounds::default()),
+        StickyDecision::Fresh
+    );
+    assert_eq!(
+        routes.lookup(13, StickyBounds::default()),
+        StickyDecision::Fresh
+    );
+}
+
+#[test]
+fn escalate_refuses_a_demotion_but_allows_an_upgrade() {
+    let config = IntegratedConfig {
+        sticky_policy: StickyPolicy::Escalate,
+        targets: BTreeMap::from([
+            ("cheap".to_string(), target_named("openai", Some(1))),
+            ("strong".to_string(), target_named("openai", Some(5))),
+        ]),
+        ..IntegratedConfig::default()
+    };
+    // A session already on the strong route must not be moved down.
+    assert_eq!(
+        apply_escalation_floor(&config, "cheap", Some("strong")),
+        Some("strong".to_string())
+    );
+    // Moving up is exactly what the policy is for.
+    assert_eq!(
+        apply_escalation_floor(&config, "strong", Some("cheap")),
+        None
+    );
+    // Same route, and an unknown floor, change nothing.
+    assert_eq!(
+        apply_escalation_floor(&config, "cheap", Some("cheap")),
+        None
+    );
+    assert_eq!(
+        apply_escalation_floor(&config, "cheap", Some("ghost")),
+        None
+    );
+    assert_eq!(apply_escalation_floor(&config, "cheap", None), None);
+}
+
+#[test]
+fn an_unranked_configuration_never_blocks_a_route_change() {
+    let config = IntegratedConfig {
+        targets: BTreeMap::from([
+            ("a".to_string(), target_named("openai", None)),
+            ("b".to_string(), target_named("openai", None)),
+        ]),
+        ..IntegratedConfig::default()
+    };
+    assert_eq!(apply_escalation_floor(&config, "a", Some("b")), None);
+}
+
+#[test]
+fn a_target_named_after_a_verb_is_rejected_while_verbs_are_on() {
+    let providers = HashMap::from([
+        ("local".to_string(), crate::UpstreamConfig::default()),
+        (
+            "openai".to_string(),
+            crate::UpstreamConfig {
+                base_url: "https://api.openai.invalid/v1".to_string(),
+                api_key: Some("k".to_string()),
+                ..crate::UpstreamConfig::default()
+            },
+        ),
+    ]);
+    let interceptor = InterceptorConfig {
+        enabled: true,
+        provider: "local".to_string(),
+        model: "triage".to_string(),
+        ..InterceptorConfig::default()
+    };
+    let mut config = IntegratedConfig {
+        enabled: true,
+        targets: BTreeMap::from([("triage".to_string(), target_named("openai", None))]),
+        ..IntegratedConfig::default()
+    };
+    let error = validate_integrated_config(&config, &interceptor, &providers)
+        .expect_err("verb collision is rejected");
+    assert!(format!("{error:#}").contains("in-band routing verb"));
+
+    config.verbs = false;
+    validate_integrated_config(&config, &interceptor, &providers)
+        .expect("turning verbs off resolves the collision");
+}
+
+#[test]
+fn exactly_one_target_may_be_the_catch_all_after_a_merge() {
+    let providers = HashMap::from([
+        ("local".to_string(), crate::UpstreamConfig::default()),
+        (
+            "openai".to_string(),
+            crate::UpstreamConfig {
+                base_url: "https://api.openai.invalid/v1".to_string(),
+                api_key: Some("k".to_string()),
+                ..crate::UpstreamConfig::default()
+            },
+        ),
+    ]);
+    let interceptor = InterceptorConfig {
+        enabled: true,
+        provider: "local".to_string(),
+        model: "triage".to_string(),
+        ..InterceptorConfig::default()
+    };
+    let mut first = target_named("openai", None);
+    first.is_default = true;
+    let mut second = target_named("openai", None);
+    second.is_default = true;
+    let config = IntegratedConfig {
+        enabled: true,
+        targets: BTreeMap::from([("one".to_string(), first), ("two".to_string(), second)]),
+        ..IntegratedConfig::default()
+    };
+    let error = validate_integrated_config(&config, &interceptor, &providers)
+        .expect_err("two catch-alls are rejected");
+    assert!(format!("{error:#}").contains("default = true"));
+}
+
+#[test]
+fn triage_trimming_keeps_system_messages_and_starts_on_a_user_turn() {
+    let mut request = json!({
+        "messages": [
+            { "role": "system", "content": "policy" },
+            { "role": "user", "content": "one" },
+            { "role": "assistant", "content": "a", "tool_calls": [] },
+            { "role": "tool", "content": "t" },
+            { "role": "user", "content": "two" },
+            { "role": "assistant", "content": "b" },
+            { "role": "user", "content": "three" }
+        ]
+    });
+    trim_triage_messages(&mut request, 3);
+    let roles = request["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|message| message["role"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    // A tool result never arrives without the assistant call that produced it.
+    assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
+    assert_eq!(request["messages"][1]["content"], "two");
+}
+
+#[test]
+fn triage_trimming_is_a_no_op_when_disabled_or_already_short() {
+    let original = json!({
+        "messages": [
+            { "role": "user", "content": "one" },
+            { "role": "assistant", "content": "a" }
+        ]
+    });
+    let mut request = original.clone();
+    trim_triage_messages(&mut request, 0);
+    assert_eq!(request, original);
+
+    let mut request = original.clone();
+    trim_triage_messages(&mut request, 10);
+    assert_eq!(request, original);
+}
+
+#[test]
+fn a_local_directive_withholds_every_routing_tool() {
+    let proxy_config = crate::Config {
+        integrated: IntegratedConfig {
+            enabled: true,
+            targets: BTreeMap::from([("backend".to_string(), target_named("openai", None))]),
+            ..IntegratedConfig::default()
+        },
+        ..crate::Config::default()
+    };
+    let interceptor = InterceptorConfig {
+        model: "triage".to_string(),
+        ..InterceptorConfig::default()
+    };
+    let local = build_local_request(
+        json!({ "messages": [{ "role": "user", "content": "answer here" }] }),
+        &interceptor,
+        InterceptorProtocol::ChatCompletions,
+        Some(crate::INTEGRATED_AUTO_MODEL),
+        &proxy_config.role_map,
+        &proxy_config,
+        true,
+    )
+    .expect("local request builds");
+
+    let tools = local["tools"].as_array().expect("tools array");
+    assert!(
+        tools.is_empty(),
+        "a forced-local turn offers no routing controls: {tools:?}"
+    );
+    let carries_directive = local["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .any(|text| text.contains("Routing is unavailable"));
+    assert!(carries_directive, "forced-local policy reaches the model");
+}
+
+#[test]
+fn a_forced_verb_route_resolves_targets_and_the_catch_all() {
+    let mut catch_all = target_named("openai", None);
+    catch_all.is_default = true;
+    let config = IntegratedConfig {
+        targets: BTreeMap::from([
+            ("backend".to_string(), target_named("openai", None)),
+            ("fallback".to_string(), catch_all),
+        ]),
+        ..IntegratedConfig::default()
+    };
+    assert_eq!(
+        forced_route_for(&config, Some(&RoutingVerb::Target("backend".to_string()))),
+        Some("backend".to_string())
+    );
+    assert_eq!(
+        forced_route_for(&config, Some(&RoutingVerb::Default)),
+        Some("fallback".to_string())
+    );
+    // Verbs that only change how routing runs are not routes themselves.
+    assert_eq!(forced_route_for(&config, Some(&RoutingVerb::Triage)), None);
+    assert_eq!(forced_route_for(&config, Some(&RoutingVerb::Local)), None);
+    assert_eq!(
+        forced_route_for(&config, Some(&RoutingVerb::Target("ghost".to_string()))),
+        None
+    );
+    assert_eq!(forced_route_for(&config, None), None);
 }

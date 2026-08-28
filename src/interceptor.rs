@@ -1835,10 +1835,10 @@ async fn build_route_context(
     // A repeat only counts when nothing happened in between: intervening tool
     // use means the agent made progress, so a similar follow-up is
     // continuation rather than dissatisfaction.
-    let Some(window) = crate::route_cache::retry_window(chat_request) else {
+    let Some(previous_turn) = crate::route_cache::previous_user_turn(chat_request) else {
         return context;
     };
-    let Some(previous) = embed_text(state, config, &window.previous).await else {
+    let Some(previous) = embed_text(state, config, &previous_turn).await else {
         return context;
     };
     let similarity = crate::route_cache::dot(&vector, &previous);

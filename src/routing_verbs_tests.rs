@@ -146,13 +146,6 @@ fn the_responses_input_array_is_handled_too() {
 }
 
 #[test]
-fn strip_all_removes_directives_without_acting_on_them() {
-    let mut body = chat(json!([{ "role": "user", "content": "triage: rewrite the parser" }]));
-    strip_all(&mut body, &targets());
-    assert_eq!(text_of(&body, 0), "rewrite the parser");
-}
-
-#[test]
 fn indentation_survives_the_strip() {
     let mut body = chat(json!([{ "role": "user", "content": "   triage:    rewrite" }]));
     assert_eq!(

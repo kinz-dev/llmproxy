@@ -126,6 +126,7 @@ fn provider_put_body_merges_only_provided_fields() {
         connect_timeout_secs: None,
         pool_max_idle_per_host: None,
         pool_idle_timeout_secs: None,
+        pricing: None,
     };
     body.apply(&mut upstream).unwrap();
     assert_eq!(upstream.base_url, "http://127.0.0.1:9000/v1");
@@ -156,6 +157,7 @@ fn provider_doc_edit_writes_section_style_tables() {
         connect_timeout_secs: Some(2),
         pool_max_idle_per_host: None,
         pool_idle_timeout_secs: None,
+        pricing: None,
     };
     let providers = ensure_table(&mut doc, "providers").unwrap();
     providers.set_implicit(true);
@@ -189,7 +191,15 @@ fn integrated_doc_edit_writes_valid_target_tables() {
     let body = IntegratedPutBody {
         enabled: Some(true),
         sticky_ttl_secs: Some(900),
+        sticky_absolute_ttl_secs: Some(7200),
+        sticky_max_turns: Some(12),
+        sticky_policy: Some(crate::interceptor::StickyPolicy::Escalate),
         sticky_capacity: Some(64),
+        verbs: Some(true),
+        speculative: None,
+        failover: None,
+        shadow: None,
+        embedding: None,
         instructions: Some("Route GUI work to the visual provider.".to_string()),
         targets: Some(BTreeMap::from([(
             "backend".to_string(),
@@ -221,4 +231,146 @@ fn integrated_doc_edit_writes_valid_target_tables() {
         config.integrated.instructions,
         "Route GUI work to the visual provider."
     );
+}
+
+#[test]
+fn integrated_doc_edit_persists_the_new_routing_controls() {
+    let mut doc: DocumentMut = "[integrated]\n".parse().unwrap();
+    let body = IntegratedPutBody {
+        enabled: Some(true),
+        sticky_ttl_secs: None,
+        sticky_absolute_ttl_secs: Some(3600),
+        sticky_max_turns: Some(8),
+        sticky_policy: Some(crate::interceptor::StickyPolicy::Escalate),
+        sticky_capacity: None,
+        verbs: Some(false),
+        speculative: Some(true),
+        failover: Some(vec!["backup".to_string()]),
+        shadow: Some(crate::comparison::ShadowConfig {
+            enabled: true,
+            target: "backup".to_string(),
+            sample_one_in: 50,
+            timeout_ms: 60_000,
+        }),
+        embedding: Some(crate::route_cache::EmbeddingConfig {
+            enabled: true,
+            provider: "embeddings".to_string(),
+            model: "embed-test".to_string(),
+            retry_escalation: true,
+            ..crate::route_cache::EmbeddingConfig::default()
+        }),
+        instructions: None,
+        targets: Some(BTreeMap::from([
+            (
+                "backend".to_string(),
+                IntegratedTarget {
+                    provider: "openai".to_string(),
+                    model: "gpt-test".to_string(),
+                    hint: "everything else".to_string(),
+                    is_default: true,
+                    strength: Some(9),
+                    failover: vec!["backup".to_string()],
+                    second_opinion: Some(crate::comparison::SecondOpinionConfig {
+                        target: "backup".to_string(),
+                        mode: crate::comparison::SecondOpinionMode::Reconcile,
+                        reconciler: Some("backup".to_string()),
+                    }),
+                    ..IntegratedTarget::default()
+                },
+            ),
+            (
+                "backup".to_string(),
+                IntegratedTarget {
+                    provider: "openai".to_string(),
+                    model: "gpt-small".to_string(),
+                    hint: "cheap work".to_string(),
+                    strength: Some(1),
+                    ..IntegratedTarget::default()
+                },
+            ),
+        ])),
+    };
+    body.apply_to_doc(&mut doc).unwrap();
+
+    let rendered = doc.to_string();
+    let config: Config = toml::from_str(&rendered).unwrap_or_else(|error| {
+        panic!("re-parsing the written config failed: {error}\n{rendered}")
+    });
+    assert_eq!(config.integrated.sticky_absolute_ttl_secs, 3600);
+    assert_eq!(config.integrated.sticky_max_turns, 8);
+    assert_eq!(
+        config.integrated.sticky_policy,
+        crate::interceptor::StickyPolicy::Escalate
+    );
+    assert!(!config.integrated.verbs);
+    assert!(config.integrated.speculative);
+    assert_eq!(config.integrated.failover, vec!["backup".to_string()]);
+    assert!(config.integrated.shadow.enabled);
+    assert_eq!(config.integrated.shadow.sample_one_in, 50);
+    assert!(config.integrated.embedding.retry_escalation);
+    assert_eq!(config.integrated.embedding.provider, "embeddings");
+
+    let backend = &config.integrated.targets["backend"];
+    assert!(backend.is_default);
+    assert_eq!(backend.strength, Some(9));
+    assert_eq!(backend.failover, vec!["backup".to_string()]);
+    let second = backend.second_opinion.as_ref().expect("second opinion");
+    assert_eq!(second.target, "backup");
+    assert_eq!(second.mode, crate::comparison::SecondOpinionMode::Reconcile);
+    assert_eq!(second.reconciler.as_deref(), Some("backup"));
+    // A target that claims none of the new controls must not gain them.
+    assert!(!config.integrated.targets["backup"].is_default);
+    assert!(config.integrated.targets["backup"].failover.is_empty());
+}
+
+#[test]
+fn provider_doc_edit_writes_a_price_table_that_parses_back() {
+    let mut doc: DocumentMut = "listen_addr = \"127.0.0.1:4000\"\n".parse().unwrap();
+    let body = ProviderPutBody {
+        kind: None,
+        base_url: Some("https://api.openai.invalid/v1".to_string()),
+        auth: None,
+        api_key: None,
+        api_key_env: None,
+        reasoning_effort: None,
+        timeout_secs: None,
+        connect_timeout_secs: None,
+        pool_max_idle_per_host: None,
+        pool_idle_timeout_secs: None,
+        pricing: Some(crate::pricing::PricingConfig {
+            subscription: false,
+            currency: "USD".to_string(),
+            models: [(
+                "gpt-test".to_string(),
+                crate::pricing::ModelPrice {
+                    input: 1.25,
+                    output: 10.0,
+                    cache_read: Some(0.125),
+                    cache_write: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }),
+    };
+    let providers = ensure_table(&mut doc, "providers").unwrap();
+    providers.set_implicit(true);
+    let item = providers
+        .entry("openai")
+        .or_insert(Item::Table(Table::new()));
+    let table = item.as_table_mut().unwrap();
+    table.set_implicit(false);
+    body.apply_to_doc(table);
+
+    let rendered = doc.to_string();
+    let config: Config = toml::from_str(&rendered).unwrap_or_else(|error| {
+        panic!("re-parsing the written config failed: {error}\n{rendered}")
+    });
+    let pricing = &config.providers["openai"].pricing;
+    assert!(pricing.is_configured());
+    let price = pricing.rate_for("gpt-test").expect("rate");
+    assert_eq!(price.input, 1.25);
+    assert_eq!(price.output, 10.0);
+    assert_eq!(price.cache_read, Some(0.125));
+    assert_eq!(price.cache_write, None);
 }

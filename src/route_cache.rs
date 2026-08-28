@@ -301,17 +301,12 @@ pub(crate) fn vector_from_response(response: &Value) -> Option<Vector> {
     normalize(values)
 }
 
-/// The newest user text and the one before it, which is all retry detection
-/// needs, plus whether any tool was used between them.
-pub(crate) struct RetryWindow {
-    pub(crate) newest: String,
-    pub(crate) previous: String,
-}
-
-/// Extract the two most recent user turns when nothing happened between them
-/// except conversation. Intervening tool use means the agent made progress, so
-/// a similar follow-up is continuation rather than dissatisfaction.
-pub(crate) fn retry_window(chat_request: &Value) -> Option<RetryWindow> {
+/// The user turn before the newest one, when nothing happened between them
+/// except conversation.
+///
+/// Intervening tool use means the agent made progress, so a similar follow-up
+/// is continuation rather than dissatisfaction and there is nothing to compare.
+pub(crate) fn previous_user_turn(chat_request: &Value) -> Option<String> {
     let messages = chat_request.get("messages")?.as_array()?;
     let mut user_indexes = messages
         .iter()
@@ -337,10 +332,8 @@ pub(crate) fn retry_window(chat_request: &Value) -> Option<RetryWindow> {
             .map(crate::text_from_value)
             .filter(|text| !text.trim().is_empty())
     };
-    Some(RetryWindow {
-        newest: text(newest)?,
-        previous: text(previous)?,
-    })
+    let _ = newest;
+    text(previous)
 }
 
 #[cfg(test)]

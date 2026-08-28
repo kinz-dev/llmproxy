@@ -270,11 +270,18 @@ impl ProviderHealth {
         let mut providers = entries
             .iter()
             .map(|(name, entry)| {
-                let retry_in = entry
-                    .rate_limited_until
-                    .filter(|until| *until > now)
-                    .or(entry.open_until.filter(|until| *until > now))
-                    .map(|until| (until - now).as_secs());
+                let availability = if entry.rate_limited_until.is_some_and(|until| until > now) {
+                    Availability::RateLimited {
+                        retry_in: entry.rate_limited_until.expect("checked") - now,
+                    }
+                } else if entry.open_until.is_some_and(|until| until > now) {
+                    Availability::Open {
+                        retry_in: entry.open_until.expect("checked") - now,
+                    }
+                } else {
+                    Availability::Available
+                };
+                let retry_in = availability.retry_in().map(|retry| retry.as_secs());
                 let status = if entry.rate_limited_until.is_some_and(|until| until > now) {
                     "rate_limited"
                 } else if entry.open_until.is_some_and(|until| until > now) {

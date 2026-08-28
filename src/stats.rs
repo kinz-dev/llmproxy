@@ -205,6 +205,7 @@ impl TokenUsage {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn counters(self) -> crate::pricing::TokenCounters {
         crate::pricing::TokenCounters {
             input_tokens: self.input_tokens,

@@ -192,7 +192,7 @@ fn the_snapshot_reports_a_hit_rate() {
 
 #[test]
 fn a_retry_window_needs_two_user_turns_and_no_tool_use_between_them() {
-    let window = retry_window(&json!({
+    let previous = previous_user_turn(&json!({
         "messages": [
             { "role": "user", "content": "why is the build slow" },
             { "role": "assistant", "content": "not sure" },
@@ -200,12 +200,11 @@ fn a_retry_window_needs_two_user_turns_and_no_tool_use_between_them() {
         ]
     }))
     .expect("a plain re-ask is a retry window");
-    assert_eq!(window.newest, "why is the build slow really");
-    assert_eq!(window.previous, "why is the build slow");
+    assert_eq!(previous, "why is the build slow");
 
     // Intervening tool use means the agent made progress.
     assert!(
-        retry_window(&json!({
+        previous_user_turn(&json!({
             "messages": [
                 { "role": "user", "content": "why is the build slow" },
                 { "role": "assistant", "content": "", "tool_calls": [{ "id": "1" }] },
@@ -218,7 +217,7 @@ fn a_retry_window_needs_two_user_turns_and_no_tool_use_between_them() {
 
     // A first turn has nothing to repeat.
     assert!(
-        retry_window(&json!({
+        previous_user_turn(&json!({
             "messages": [{ "role": "user", "content": "hello" }]
         }))
         .is_none()

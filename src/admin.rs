@@ -162,6 +162,8 @@ fn router(state: AdminState) -> Router {
         .route("/api/interceptor", put(api_interceptor_put))
         .route("/api/integrated", put(api_integrated_put))
         .route("/api/interceptor/test", post(api_interceptor_test))
+        .route("/api/route-corpus", get(api_route_corpus_export))
+        .route("/api/route-corpus/replay", post(api_route_corpus_replay))
         .route("/api/interceptor/revise", post(api_interceptor_revise))
         .route(
             "/api/providers/{name}",
@@ -754,6 +756,76 @@ async fn api_interceptor_test(
 }
 
 #[derive(Deserialize)]
+struct CorpusQuery {
+    mode: Option<String>,
+}
+
+/// Export the last 24 hours of routing decisions as a replayable corpus, so a
+/// regression suite can be seeded from real traffic rather than invented.
+async fn api_route_corpus_export(Query(query): Query<CorpusQuery>) -> Response {
+    let rows = routing_decision_log().corpus();
+    Json(json!(crate::route_corpus::from_decisions(
+        &rows,
+        query.mode.as_deref()
+    )))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct CorpusReplayBody {
+    #[serde(default)]
+    mode: Option<String>,
+    /// Unsaved editor text to test the corpus against; empty uses the saved
+    /// policy for the selected mode.
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    cases: Vec<crate::route_corpus::Case>,
+}
+
+/// Replay a corpus against the current (or edited) policy and diff the
+/// decisions. This is what makes a prompt edit falsifiable.
+async fn api_route_corpus_replay(
+    State(state): State<AdminState>,
+    Json(body): Json<CorpusReplayBody>,
+) -> Response {
+    const MAX_CASES: usize = 200;
+    if body.cases.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "the corpus has no cases");
+    }
+    if body.cases.len() > MAX_CASES {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!("a replay is limited to {MAX_CASES} cases"),
+        );
+    }
+    let mode = match crate::interceptor::RouteTestMode::parse(body.mode.as_deref()) {
+        Ok(mode) => mode,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, &message),
+    };
+    let snapshot = state.shared.snapshot();
+    let instructions = body
+        .instructions
+        .as_deref()
+        .filter(|text| !text.trim().is_empty());
+
+    let mut rows = Vec::with_capacity(body.cases.len());
+    for case in &body.cases {
+        // Replays run in sequence: the triage provider is usually one local
+        // model, and a burst of parallel requests would only queue behind it.
+        let replayed =
+            crate::interceptor::test_route(&snapshot, &case.prompt, instructions, mode).await;
+        let (_, row) = crate::route_corpus::compare(case, &replayed);
+        rows.push(row);
+    }
+    Json(crate::route_corpus::summarize(
+        rows,
+        body.mode.as_deref().unwrap_or("intercept"),
+    ))
+    .into_response()
+}
+
+#[derive(Deserialize)]
 struct InterceptorReviseBody {
     /// The requested change, e.g. "also handle git commands locally".
     request: String,
@@ -890,6 +962,19 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
                     "connect_timeout_secs": upstream.connect_timeout_secs,
                     "pool_max_idle_per_host": upstream.pool_max_idle_per_host,
                     "pool_idle_timeout_secs": upstream.pool_idle_timeout_secs,
+                    "pricing": {
+                        "configured": upstream.pricing.is_configured(),
+                        "subscription": upstream.pricing.subscription,
+                        "currency": upstream.pricing.currency,
+                        "models": upstream.pricing.models.iter().map(|(model, price)| {
+                            (model.clone(), json!({
+                                "input": price.input,
+                                "output": price.output,
+                                "cache_read": price.cache_read,
+                                "cache_write": price.cache_write,
+                            }))
+                        }).collect::<serde_json::Map<_, _>>(),
+                    },
                     "header_names": header_names,
                     "class": class_str(&upstream.base_url),
                     "is_default": *name == config.default_provider,
@@ -927,6 +1012,14 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
                     "model": target.model,
                     "hint": target.hint,
                     "reasoning_effort": target.reasoning_effort.map(crate::ReasoningEffort::as_str),
+                    "default": target.is_default,
+                    "strength": target.strength,
+                    "failover": target.failover,
+                    "second_opinion": target.second_opinion.as_ref().map(|second| json!({
+                        "target": second.target,
+                        "mode": second.mode.as_str(),
+                        "reconciler": second.reconciler,
+                    })),
                 }),
             )
         })
@@ -954,11 +1047,42 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
             "temperature": config.interceptor.temperature,
             "max_tokens": config.interceptor.max_tokens,
             "parallel_tool_calls": config.interceptor.parallel_tool_calls,
+            "triage_max_messages": config.interceptor.triage_max_messages,
+            "redact": {
+                "enabled": config.interceptor.redact.enabled,
+                "rehydrate": config.interceptor.redact.rehydrate,
+                "extra_literals": config.interceptor.redact.extra_literals,
+            },
         },
         "integrated": {
             "enabled": config.integrated.enabled,
             "sticky_ttl_secs": config.integrated.sticky_ttl_secs,
+            "sticky_absolute_ttl_secs": config.integrated.sticky_absolute_ttl_secs,
+            "sticky_max_turns": config.integrated.sticky_max_turns,
+            "sticky_policy": config.integrated.sticky_policy.as_str(),
             "sticky_capacity": config.integrated.sticky_capacity,
+            "verbs": config.integrated.verbs,
+            "verb_vocabulary": crate::routing_verbs::RESERVED_VERBS,
+            "speculative": config.integrated.speculative,
+            "failover": config.integrated.failover,
+            "shadow": {
+                "enabled": config.integrated.shadow.enabled,
+                "target": config.integrated.shadow.target,
+                "sample_one_in": config.integrated.shadow.sample_one_in,
+                "timeout_ms": config.integrated.shadow.timeout_ms,
+            },
+            "embedding": {
+                "enabled": config.integrated.embedding.enabled,
+                "provider": config.integrated.embedding.provider,
+                "model": config.integrated.embedding.model,
+                "threshold": config.integrated.embedding.threshold,
+                "capacity": config.integrated.embedding.capacity,
+                "ttl_secs": config.integrated.embedding.ttl_secs,
+                "retriage_below": config.integrated.embedding.retriage_below,
+                "retry_escalation": config.integrated.embedding.retry_escalation,
+                "retry_threshold": config.integrated.embedding.retry_threshold,
+                "timeout_ms": config.integrated.embedding.timeout_ms,
+            },
             "instructions": crate::interceptor::integrated_instructions(&config.integrated),
             "instructions_are_default": crate::interceptor::integrated_instructions_are_default(
                 &config.integrated,
@@ -981,6 +1105,25 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
         "admin": {
             "enable": config.admin.enable,
             "listen_address": config.admin.listen_address,
+        },
+        "health": {
+            "enabled": config.health.enabled,
+            "failure_threshold": config.health.failure_threshold,
+            "open_secs": config.health.open_secs,
+            "max_open_secs": config.health.max_open_secs,
+            "max_rate_limit_secs": config.health.max_rate_limit_secs,
+        },
+        "memory": {
+            "enabled": config.memory.enabled,
+            "inject": config.memory.inject,
+            "max_notes": config.memory.max_notes,
+            "max_note_chars": config.memory.max_note_chars,
+            "max_injected_chars": config.memory.max_injected_chars,
+            "available": crate::memory::project_memory().enabled(),
+        },
+        "project": {
+            "name": config.project,
+            "file_name": crate::project::PROJECT_FILE_NAME,
         },
     })
 }
@@ -1126,6 +1269,13 @@ fn persist_change(state: &AdminState, persist: Persist) -> (bool, Option<String>
 }
 
 /// Fetch a mutable `[section]` table, creating it as an explicit table.
+fn string_array(values: &[String]) -> toml_edit::Array {
+    values
+        .iter()
+        .map(|entry| entry.as_str())
+        .collect::<toml_edit::Array>()
+}
+
 fn ensure_table<'a>(doc: &'a mut DocumentMut, section: &str) -> Result<&'a mut Table, String> {
     let item = doc.entry(section).or_insert(Item::Table(Table::new()));
     let table = item
@@ -1232,6 +1382,9 @@ struct InterceptorPutBody {
     /// 0 removes the cap (client limits apply).
     max_tokens: Option<u64>,
     parallel_tool_calls: Option<bool>,
+    /// 0 copies the whole conversation into the triage request.
+    triage_max_messages: Option<usize>,
+    redact: Option<crate::redact::RedactConfig>,
 }
 
 async fn api_interceptor_put(
@@ -1257,6 +1410,8 @@ async fn api_interceptor_put(
         temperature: body.temperature,
         max_tokens: body.max_tokens,
         parallel_tool_calls: body.parallel_tool_calls,
+        triage_max_messages: body.triage_max_messages,
+        redact: body.redact.clone(),
     };
     apply_config_change(
         &state,
@@ -1295,6 +1450,12 @@ async fn api_interceptor_put(
             }
             if let Some(parallel_tool_calls) = body.parallel_tool_calls {
                 interceptor.parallel_tool_calls = parallel_tool_calls;
+            }
+            if let Some(limit) = body.triage_max_messages {
+                interceptor.triage_max_messages = limit;
+            }
+            if let Some(redact) = body.redact {
+                interceptor.redact = redact;
             }
             Ok(())
         },
@@ -1336,6 +1497,19 @@ async fn api_interceptor_put(
             if let Some(parallel_tool_calls) = doc_body.parallel_tool_calls {
                 table.insert("parallel_tool_calls", value(parallel_tool_calls));
             }
+            if let Some(limit) = doc_body.triage_max_messages {
+                table.insert("triage_max_messages", value(limit as i64));
+            }
+            if let Some(redact) = doc_body.redact {
+                let mut entry = Table::new();
+                entry.insert("enabled", value(redact.enabled));
+                entry.insert("rehydrate", value(redact.rehydrate));
+                entry.insert(
+                    "extra_literals",
+                    value(string_array(&redact.extra_literals)),
+                );
+                table.insert("redact", Item::Table(entry));
+            }
             Ok(())
         })),
     )
@@ -1346,7 +1520,17 @@ async fn api_interceptor_put(
 struct IntegratedPutBody {
     enabled: Option<bool>,
     sticky_ttl_secs: Option<u64>,
+    /// Wall-clock bound measured from the decision, not from the last message.
+    sticky_absolute_ttl_secs: Option<u64>,
+    sticky_max_turns: Option<u32>,
+    /// "pin" or "escalate".
+    sticky_policy: Option<crate::interceptor::StickyPolicy>,
     sticky_capacity: Option<usize>,
+    verbs: Option<bool>,
+    speculative: Option<bool>,
+    failover: Option<Vec<String>>,
+    shadow: Option<crate::comparison::ShadowConfig>,
+    embedding: Option<crate::route_cache::EmbeddingConfig>,
     /// Empty string resets to the built-in integrated routing policy.
     instructions: Option<String>,
     targets: Option<BTreeMap<String, IntegratedTarget>>,
@@ -1360,8 +1544,32 @@ impl IntegratedPutBody {
         if let Some(ttl) = self.sticky_ttl_secs {
             config.integrated.sticky_ttl_secs = ttl;
         }
+        if let Some(ttl) = self.sticky_absolute_ttl_secs {
+            config.integrated.sticky_absolute_ttl_secs = ttl;
+        }
+        if let Some(turns) = self.sticky_max_turns {
+            config.integrated.sticky_max_turns = turns;
+        }
+        if let Some(policy) = self.sticky_policy {
+            config.integrated.sticky_policy = policy;
+        }
         if let Some(capacity) = self.sticky_capacity {
             config.integrated.sticky_capacity = capacity;
+        }
+        if let Some(verbs) = self.verbs {
+            config.integrated.verbs = verbs;
+        }
+        if let Some(speculative) = self.speculative {
+            config.integrated.speculative = speculative;
+        }
+        if let Some(failover) = &self.failover {
+            config.integrated.failover = failover.clone();
+        }
+        if let Some(shadow) = &self.shadow {
+            config.integrated.shadow = shadow.clone();
+        }
+        if let Some(embedding) = &self.embedding {
+            config.integrated.embedding = embedding.clone();
         }
         if let Some(instructions) = &self.instructions {
             config.integrated.instructions = if instructions.trim().is_empty() {
@@ -1384,8 +1592,51 @@ impl IntegratedPutBody {
         if let Some(ttl) = self.sticky_ttl_secs {
             table.insert("sticky_ttl_secs", value(ttl as i64));
         }
+        if let Some(ttl) = self.sticky_absolute_ttl_secs {
+            table.insert("sticky_absolute_ttl_secs", value(ttl as i64));
+        }
+        if let Some(turns) = self.sticky_max_turns {
+            table.insert("sticky_max_turns", value(turns as i64));
+        }
+        if let Some(policy) = self.sticky_policy {
+            table.insert("sticky_policy", value(policy.as_str()));
+        }
         if let Some(capacity) = self.sticky_capacity {
             table.insert("sticky_capacity", value(capacity as i64));
+        }
+        if let Some(verbs) = self.verbs {
+            table.insert("verbs", value(verbs));
+        }
+        if let Some(speculative) = self.speculative {
+            table.insert("speculative", value(speculative));
+        }
+        if let Some(failover) = &self.failover {
+            table.insert("failover", value(string_array(failover)));
+        }
+        if let Some(shadow) = &self.shadow {
+            let mut entry = Table::new();
+            entry.insert("enabled", value(shadow.enabled));
+            entry.insert("target", value(shadow.target.as_str()));
+            entry.insert("sample_one_in", value(shadow.sample_one_in as i64));
+            entry.insert("timeout_ms", value(shadow.timeout_ms as i64));
+            table.insert("shadow", Item::Table(entry));
+        }
+        if let Some(embedding) = &self.embedding {
+            let mut entry = Table::new();
+            entry.insert("enabled", value(embedding.enabled));
+            entry.insert("provider", value(embedding.provider.as_str()));
+            entry.insert("model", value(embedding.model.as_str()));
+            entry.insert("threshold", value(f64::from(embedding.threshold)));
+            entry.insert("capacity", value(embedding.capacity as i64));
+            entry.insert("ttl_secs", value(embedding.ttl_secs as i64));
+            entry.insert("retriage_below", value(f64::from(embedding.retriage_below)));
+            entry.insert("retry_escalation", value(embedding.retry_escalation));
+            entry.insert(
+                "retry_threshold",
+                value(f64::from(embedding.retry_threshold)),
+            );
+            entry.insert("timeout_ms", value(embedding.timeout_ms as i64));
+            table.insert("embedding", Item::Table(entry));
         }
         match self.instructions.as_deref() {
             Some(instructions) if instructions.trim().is_empty() => {
@@ -1406,6 +1657,24 @@ impl IntegratedPutBody {
                 entry.insert("hint", value(target.hint.as_str()));
                 if let Some(effort) = target.reasoning_effort {
                     entry.insert("reasoning_effort", value(effort.as_str()));
+                }
+                if target.is_default {
+                    entry.insert("default", value(true));
+                }
+                if let Some(strength) = target.strength {
+                    entry.insert("strength", value(i64::from(strength)));
+                }
+                if !target.failover.is_empty() {
+                    entry.insert("failover", value(string_array(&target.failover)));
+                }
+                if let Some(second) = &target.second_opinion {
+                    let mut opinion = toml_edit::InlineTable::new();
+                    opinion.insert("target", second.target.as_str().into());
+                    opinion.insert("mode", second.mode.as_str().into());
+                    if let Some(reconciler) = &second.reconciler {
+                        opinion.insert("reconciler", reconciler.as_str().into());
+                    }
+                    entry.insert("second_opinion", value(opinion));
                 }
                 target_table.insert(name, Item::Table(entry));
             }
@@ -1447,6 +1716,9 @@ struct ProviderPutBody {
     connect_timeout_secs: Option<u64>,
     pool_max_idle_per_host: Option<usize>,
     pool_idle_timeout_secs: Option<u64>,
+    /// Replaces the provider's whole price table. Rates are per million
+    /// tokens, matching how vendors publish them.
+    pricing: Option<crate::pricing::PricingConfig>,
 }
 
 impl ProviderPutBody {
@@ -1488,6 +1760,9 @@ impl ProviderPutBody {
         }
         if let Some(pool_idle_timeout_secs) = self.pool_idle_timeout_secs {
             upstream.pool_idle_timeout_secs = pool_idle_timeout_secs;
+        }
+        if let Some(pricing) = &self.pricing {
+            upstream.pricing = pricing.clone();
         }
         Ok(())
     }
@@ -1550,6 +1825,27 @@ impl ProviderPutBody {
                 "pool_idle_timeout_secs",
                 value(pool_idle_timeout_secs as i64),
             );
+        }
+        if let Some(pricing) = &self.pricing {
+            let mut entry = Table::new();
+            entry.insert("subscription", value(pricing.subscription));
+            entry.insert("currency", value(pricing.currency.as_str()));
+            let mut models = Table::new();
+            models.set_implicit(true);
+            for (model, price) in &pricing.models {
+                let mut rates = Table::new();
+                rates.insert("input", value(price.input));
+                rates.insert("output", value(price.output));
+                if let Some(cache_read) = price.cache_read {
+                    rates.insert("cache_read", value(cache_read));
+                }
+                if let Some(cache_write) = price.cache_write {
+                    rates.insert("cache_write", value(cache_write));
+                }
+                models.insert(model, Item::Table(rates));
+            }
+            entry.insert("models", Item::Table(models));
+            table.insert("pricing", Item::Table(entry));
         }
     }
 }
@@ -1642,6 +1938,8 @@ struct SettingsPutBody {
     /// Negative clears the TTL (cache indefinitely).
     models_cache_ttl_secs: Option<i64>,
     role_map: Option<HashMap<String, String>>,
+    health: Option<crate::health::HealthConfig>,
+    memory: Option<crate::memory::MemoryConfig>,
 }
 
 async fn api_settings_put(
@@ -1696,6 +1994,12 @@ async fn api_settings_put(
             if let Some(role_map) = body.role_map {
                 config.role_map = role_map;
             }
+            if let Some(health) = body.health {
+                config.health = health;
+            }
+            if let Some(memory) = body.memory {
+                config.memory = memory;
+            }
             Ok(())
         },
         Persist::Edit(Box::new(move |doc| {
@@ -1739,6 +2043,31 @@ async fn api_settings_put(
                 for (from, to) in roles {
                     table.insert(&from, value(to));
                 }
+            }
+            if let Some(health) = doc_body.health {
+                let table = ensure_table(doc, "health")?;
+                table.insert("enabled", value(health.enabled));
+                table.insert(
+                    "failure_threshold",
+                    value(i64::from(health.failure_threshold)),
+                );
+                table.insert("open_secs", value(health.open_secs as i64));
+                table.insert("max_open_secs", value(health.max_open_secs as i64));
+                table.insert(
+                    "max_rate_limit_secs",
+                    value(health.max_rate_limit_secs as i64),
+                );
+            }
+            if let Some(memory) = doc_body.memory {
+                let table = ensure_table(doc, "memory")?;
+                table.insert("enabled", value(memory.enabled));
+                table.insert("inject", value(memory.inject));
+                table.insert("max_notes", value(memory.max_notes as i64));
+                table.insert("max_note_chars", value(memory.max_note_chars as i64));
+                table.insert(
+                    "max_injected_chars",
+                    value(memory.max_injected_chars as i64),
+                );
             }
             Ok(())
         })),

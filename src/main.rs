@@ -57,6 +57,7 @@ mod pricing;
 mod project;
 mod redact;
 mod route_cache;
+mod route_corpus;
 mod routing_verbs;
 mod stats;
 mod usage_store;
@@ -164,6 +165,15 @@ struct Cli {
     /// Ignore any project .llmproxy.toml for this launch.
     #[arg(long, conflicts_with = "project", requires = "agent_launcher")]
     no_project: bool,
+
+    /// Replay a routing corpus against this configuration, print the diff, and
+    /// exit non-zero when a decision moved. Makes a policy edit falsifiable.
+    #[arg(long, conflicts_with_all = ["agent_launcher", "shutdown", "restart"])]
+    route_corpus: Option<PathBuf>,
+
+    /// Routing mode for --route-corpus: "intercept" or "integrated".
+    #[arg(long, requires = "route_corpus")]
+    route_corpus_mode: Option<String>,
 
     /// Internal: keep the proxy in the foreground instead of daemonizing.
     #[arg(long, hide = true)]
@@ -996,6 +1006,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(path) = cli.route_corpus.clone() {
+        return replay_route_corpus(config, &path, cli.route_corpus_mode.as_deref()).await;
+    }
+
     let launcher_mode = cli.launcher_mode();
     if launcher_mode.is_some() {
         let cwd = env::current_dir().context("failed to read the current directory")?;
@@ -1154,6 +1168,79 @@ async fn run_server(
     // The ledger is only written on a timer, so the final interval's requests
     // would otherwise be lost on a clean shutdown.
     usage_store::usage_store().flush();
+    Ok(())
+}
+
+/// Replay a routing corpus against this configuration and report the diff.
+///
+/// Runs in-process against the configured triage provider without binding a
+/// listener or touching the daemon, so it is usable from CI: a moved decision
+/// exits non-zero.
+async fn replay_route_corpus(config: Config, path: &FsPath, mode: Option<&str>) -> Result<()> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read route corpus {}", path.display()))?;
+    let corpus = route_corpus::Corpus::parse(&raw).map_err(anyhow::Error::msg)?;
+    if corpus.cases.is_empty() {
+        bail!("route corpus {} has no cases", path.display());
+    }
+    let mode_name = mode
+        .or(corpus.mode.as_deref())
+        .unwrap_or("intercept")
+        .to_string();
+    let test_mode =
+        interceptor::RouteTestMode::parse(Some(&mode_name)).map_err(anyhow::Error::msg)?;
+
+    let config = Arc::new(config);
+    let mut providers = HashMap::new();
+    for (name, upstream) in effective_provider_configs(&config)? {
+        providers.insert(name.clone(), build_provider_state(name, upstream)?);
+    }
+    let state = AppState {
+        config,
+        providers: Arc::new(providers),
+        launcher_kind: None,
+        launcher_mode: None,
+        forward_caller_credentials: false,
+    };
+
+    let mut rows = Vec::with_capacity(corpus.cases.len());
+    for (index, case) in corpus.cases.iter().enumerate() {
+        let replayed = interceptor::test_route(&state, &case.prompt, None, test_mode).await;
+        let (verdict, row) = route_corpus::compare(case, &replayed);
+        println!(
+            "{:>4}/{}  {:<8} {}",
+            index + 1,
+            corpus.cases.len(),
+            verdict.as_str(),
+            case.prompt.chars().take(72).collect::<String>()
+        );
+        rows.push(row);
+    }
+    let summary = route_corpus::summarize(rows, &mode_name);
+    println!(
+        "\n{} cases: {} same, {} changed, {} new, {} errors",
+        summary["cases"], summary["same"], summary["changed"], summary["new"], summary["errors"]
+    );
+    for row in summary["results"].as_array().into_iter().flatten() {
+        if row["verdict"] == "same" || row["verdict"] == "new" {
+            continue;
+        }
+        println!(
+            "  {} -> {} (was {} -> {}): {}",
+            row["actual"]["decision"],
+            row["actual"]["target"],
+            row["expected"]["decision"],
+            row["expected"]["target"],
+            row["prompt"].as_str().unwrap_or_default()
+        );
+    }
+    if summary["regressions"].as_u64().unwrap_or(0) > 0 {
+        bail!(
+            "{} routing regression(s) against {}",
+            summary["regressions"],
+            path.display()
+        );
+    }
     Ok(())
 }
 

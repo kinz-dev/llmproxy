@@ -106,17 +106,6 @@ pub(crate) fn detect_and_strip(
     strip_at(body, newest, targets)
 }
 
-/// Strip recognised prefixes without acting on any of them. Used where a verb
-/// must not survive but cannot be honoured either.
-pub(crate) fn strip_all(body: &mut Value, targets: &BTreeMap<String, IntegratedTarget>) {
-    let Some(items) = user_message_indexes(body) else {
-        return;
-    };
-    for index in items {
-        strip_at(body, index, targets);
-    }
-}
-
 /// Indexes into whichever array holds the conversation: `messages` for Chat
 /// Completions and Anthropic Messages, `input` for Responses.
 fn user_message_indexes(body: &Value) -> Option<Vec<usize>> {

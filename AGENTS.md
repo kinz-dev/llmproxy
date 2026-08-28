@@ -59,6 +59,18 @@ agent request -> separate local interceptor request -> local response
 - Timeout or local failure follows `interceptor.fallback_on_error`.
   Sensitive rejection overrides that fallback and never continues externally
   after a screening failure.
+- Optional `interceptor.redact` is the permissive counterpart to
+  `reject_sensitive`: detected secrets become stable placeholders on the
+  caller's own body before the local copy is derived from it, and the originals
+  are restored as the response streams. Only values needing no JSON escaping
+  are ever restored; anything else stays redacted rather than corrupting a
+  body. Redaction never suppresses `reject_sensitive`.
+- In-band routing verbs are recognised only at the very start of the newest
+  user message, only against the closed set (`triage`, `unstick`, `local`,
+  `default`, `remember`, `recall`, `forget`, and configured target names), and
+  are stripped from every user turn before either copy exists. A leading
+  backslash escapes one. A target may not be named after a verb while
+  `integrated.verbs` is on.
 - Integrated launcher routes, including explicit-model and `ROUTE_DEFAULT`
   traffic, strip caller credentials; every external destination must have a
   proxy-owned credential.
@@ -79,6 +91,11 @@ Without a launcher, preserve these rules:
   is preserved on the default provider. It is locally checked only when the
   standalone interceptor is also enabled.
 - Alias-covered requests skip model discovery.
+- Exactly one integrated target may set `default = true`. `ROUTE_DEFAULT`
+  resolves to it instead of falling through to first-upstream-model discovery;
+  validation rejects a second one after a project overlay merges.
+- Control tool names are matched case-insensitively with `-` and `_` treated
+  alike, against the configured names rather than one forced spelling.
 - Provider selection, role rewriting, and protocol adapters remain active.
 - A configured provider `reasoning_effort` is an enforced outbound policy:
   Chat Completions uses `reasoning_effort`, Responses uses `reasoning.effort`,
@@ -86,6 +103,23 @@ Without a launcher, preserve these rules:
 - An integrated target's `reasoning_effort` overrides its provider default and
   is included in the dynamic routing prompt and admin route editor.
 - `--intercept` alone keeps normal external remapping after `PASS`.
+- Sticky routing is bounded by `sticky_absolute_ttl_secs` (measured from the
+  decision and never refreshed) and `sticky_max_turns`, not only by the sliding
+  idle TTL. `sticky_policy = "escalate"` lets a re-triage move up the `strength`
+  ordering but never down.
+- A target's `failover` chain is tried only after a non-success status, which
+  means the provider generated nothing; a target whose provider is
+  rate-limited or circuit-open is skipped while another candidate remains, and
+  is withheld from the triage tool list unless withholding would leave none.
+- Second opinions and shadow requests buffer both answers and render through
+  the local-completion path. Either side asking for a tool call cancels the
+  comparison, and a shadow copy never reaches the caller.
+- Speculative triage requires a `default = true` target, never runs with
+  `reject_sensitive` or an in-band verb, and its buffered output is discarded
+  unless triage agrees with it.
+- `[integrated.embedding]` computes one vector per request for the routing
+  cache, sticky drift, and retry escalation. All three are disabled by
+  `reject_sensitive`, and every embedding failure is soft.
 - Provider `kind` selects OpenAI-compatible, OpenAI, Anthropic, or Copilot
   upstream adaptation. OpenAI Chat Completions remains the canonical format.
 
@@ -133,6 +167,13 @@ Without a launcher, preserve these rules:
   never forward caller-generated credentials.
 - Launcher modes are mutually exclusive, loopback-only, and protected against
   upstream loops.
+- A launcher resolves the nearest project `.llmproxy.toml` at or above the
+  working directory (`--project` overrides, `--no-project` disables) and carries
+  its path in the session token. The token is unsigned, so the daemon re-reads
+  that file and re-validates it against its own providers; a project may define
+  only `[integrated.targets.*]` and `[model_aliases]`, and only integrated
+  sessions apply the overlay. Every mode records the project identity so
+  traffic is attributed to it.
 - Interactive launchers resume only when their native session behavior permits;
   explicit prompt, session, management, help, and version arguments are kept.
 
@@ -158,6 +199,20 @@ Without a launcher, preserve these rules:
 - The admin interface is unauthenticated and must remain loopback-only.
 - Runtime config updates must validate and build replacement providers before
   atomically swapping shared state; persist edits without discarding comments.
+  A swap also reconfigures provider health and prunes routing-cache entries
+  naming a target the edit removed.
+- Durable per-project usage lives in `~/.llmproxy/usage.json`, month-bucketed
+  and bounded, flushed on a timer and once more at graceful shutdown. It stores
+  token counters only, never prices: a report prices them at read time, so a
+  rate correction re-prices history instead of leaving a stale number behind.
+- Project memory lives in `~/.llmproxy/memory/<project>.json`, owner-only, and
+  is written and read by explicit direction only. Memory writes are refused
+  while `reject_sensitive` is on, because a note outlives the request that
+  carried it.
+- Spend, leaderboard, and shadow reporting must keep their caveats attached: a
+  subscription provider has no dollar figure, spend derived from estimated
+  token counts is an approximation, and a rank below the sample-size floor is
+  reported but never ranked.
 
 ## Source Map
 
@@ -177,11 +232,30 @@ Without a launcher, preserve these rules:
 - `src/*_launcher.rs`: agent-specific discovery and environment injection.
 - `src/admin.rs`: loopback admin API, UI serving, and runtime config swaps.
 - `src/stats.rs`: request classification, latency, attempted frontend/provider/
-  model routes, completed token and cumulative-time usage, traffic logs, and
-  bounded routing decision audits.
+  model routes, completed token and cumulative-time usage, traffic logs,
+  bounded routing decision audits, and shadow comparisons.
+- `src/pricing.rs`: per-provider price metadata and cache-aware spend
+  arithmetic. Config is the only source of rates; nothing is hardcoded.
+- `src/usage_store.rs`: durable month-bucketed per-project usage and outcome
+  counters.
+- `src/leaderboard.rs`: per-project model ranking, proposed hints from observed
+  clusters, and the cost insight built on both.
+- `src/health.rs`: per-provider health, circuit breaking, and quota tracking.
+- `src/project.rs`: project `.llmproxy.toml` discovery, parsing, and overlay
+  validation.
+- `src/routing_verbs.rs`: in-band verb detection and stripping.
+- `src/route_cache.rs`: embedding-cached routing, sticky drift, and retry
+  detection.
+- `src/route_corpus.rs`: routing corpus capture, replay comparison, and the
+  regression summary behind `--route-corpus`.
+- `src/comparison.rs`: second opinions and shadow-request sampling.
+- `src/redact.rs`: secret detection, placeholder substitution, and streaming
+  rehydration.
+- `src/memory.rs`: cross-agent shared project memory.
 - `ui/`: task-oriented admin interface organized as Overview, Activity,
   Routing, Models, Providers, and Settings; Activity and Routing use focused
-  secondary views, including Activity > Decisions for policy audits.
+  secondary views — Activity > Usage, Spend, Decisions, Shadow, and Event log,
+  and Routing > Triage setup, Policy & test, and Project memory.
 - `llmproxy.example.toml`: public credential-free configuration reference.
 - `ROADMAP.md`: candidate work and recorded design decisions, grouped by
   what each item delivers. Nothing in it is committed work.

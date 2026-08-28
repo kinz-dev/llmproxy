@@ -1,9 +1,14 @@
 # llmproxy Roadmap
 
-Candidate work, grouped by what it delivers. Nothing here is committed; the
-ordering inside each group is a rough preference, not a schedule.
+Candidate work, grouped by what it delivers. The ordering inside each group is
+a rough preference, not a schedule.
 
 Status: `idea` · `designed` · `building` · `done`
+
+Everything below is currently `done`. What is recorded here is why each item
+was built the way it was, and what is left open — not what remains to build.
+Configuration for all of it is documented in `llmproxy.example.toml`; the
+invariants each feature must keep are in `AGENTS.md`.
 
 ## End-User Features
 
@@ -11,58 +16,105 @@ These exploit llmproxy's position: it is the only component that sits across
 every agent, every provider, and every session, and it sees complete requests
 and responses locally.
 
-### Cross-agent shared project memory — `idea`
+### Cross-agent shared project memory — `done`
 
 Each agent CLI keeps its own history and shares nothing with the others. The
-proxy sees all of them. A project-scoped store of prior findings, decisions,
-and dead ends, injected into whichever agent is running, gives continuity that
-is impossible at any other layer because each vendor sees only its own client.
+proxy sees all of them, so a project-scoped store of prior findings, decisions,
+and dead ends is injected into whichever agent is running.
 
-### Retry-driven escalation — `idea`
+Two limits are deliberate and worth keeping. The store is written and read by
+explicit direction only — the `remember:`, `recall:`, and `forget:` verbs, or
+the admin API — because nothing else can be undone: a wrong inference would be
+silently prepended to every later request in the project. And the injected
+block is hard-bounded and labelled as prior context rather than instructions,
+because it is paid for on every turn and read by a model that will otherwise
+treat it as a directive.
+
+Memory writes are refused while `reject_sensitive` is on. A note outlives the
+request that carried it, so an unscreened one would turn a single exposure into
+a standing one.
+
+Open: nothing captures memory automatically. Automatic extraction is the
+obvious next step and the obvious way to poison the store; it wants an explicit
+review step before anything reaches injection.
+
+### Retry-driven escalation — `done`
 
 Re-asking the same question a different way is a dissatisfaction signal, and it
-is visible to the proxy: same conversation, near-identical embedding, no
-intervening tool use. Answer first on the cheap route; silently escalate the
-retry to a stronger provider. No new setting, no model picker — routing driven
-by observed feedback rather than hand-written hints.
+is visible here: same conversation, near-identical embedding, no intervening
+tool use. The retry moves the request up one rank in the `strength` ordering,
+silently, with no new setting to reason about at the call site.
 
-### Transparent quota and outage failover — `idea`
+The "no intervening tool use" condition is what keeps it honest. A similar
+follow-up after the agent has run tools is continuation, not dissatisfaction,
+and treating it as the latter would escalate ordinary iteration.
 
-Rate-limit exhaustion mid-task is the sharpest failure in agent-assisted work.
-The proxy owns every provider credential and can absorb it: exhausted on A,
-continue on B, report it in the admin UI rather than to the caller. The same
-machinery covers network loss by falling back to a local provider.
+Requires `[integrated.embedding]`, since the comparison is an embedding
+distance. The same signal is recorded as an outcome for the leaderboard.
 
-### Second opinion on consequential requests — `idea`
+### Transparent quota and outage failover — `done`
 
-Opt in per target (for example on a route hinted at design decisions): ask two
-providers, present both answers, or have a third reconcile them. Agreement is
-signal; divergence is a stronger signal, and nothing surfaces it today.
+Rate-limit exhaustion mid-task is the sharpest failure in agent-assisted work,
+and the proxy owns every provider credential, so it can absorb it: exhausted on
+A, continue on B, reported in the admin interface rather than to the caller.
 
-### Personal model leaderboard — `idea`
+Failover runs only on a non-success status, which means the provider rejected
+the request before generating anything — so nothing is billed or produced
+twice. Quota exhaustion and outages are tracked separately because they need
+different recoveries: a 429 carries a duration the provider tells us about,
+while an outage gets exponential backoff behind a single half-open probe.
 
-Public benchmarks rank models on generic tasks. The proxy observes the request,
-the response, and the aftermath — accepted, reverted, immediately re-asked — on
-real work in a real repository. That is free implicit labelling, and it yields a
-per-project ranking plus proposed hints derived from observed clusters rather
-than guessed at by hand.
+### Second opinion on consequential requests — `done`
 
-### Spend meter and cost insight — `idea`
+Opt in per target: two providers answer the same request and both are shown, or
+a third reconciles them while being told to name the disagreements rather than
+smooth them over. Agreement is signal; divergence is the stronger one.
 
-Live per-project spend, and the insight built on it: what share went to an
-expensive route for work a cheaper route answers correctly, with a one-click
-routing change. Depends on per-provider cost metadata in provider config.
+A tool call on either side cancels the comparison and the request is sent
+normally, because a composed answer is text and would silently drop the call.
+The agreement score shown beside the answers is a word overlap, not a semantic
+judgement, and is labelled as such.
+
+Open: it costs two answers and gives up streaming for the requests it touches.
+That is the right trade for a design decision and the wrong one for everything
+else, which is why it is per-target rather than global.
+
+### Personal model leaderboard — `done`
+
+Public benchmarks rank models on generic tasks. This ranks them on real work in
+a real repository, using the aftermath the proxy can see: an immediate re-ask
+with no intervening tool use, an error, a broken stream. That is free implicit
+labelling, and it yields a per-project ranking rather than an average one.
+
+Rows below a sample-size floor are shown but never ranked — a rank derived from
+four requests is noise wearing a number's clothes. Cost breaks ties rather than
+driving the order, because a cheap route that gets re-asked is not cheap.
+
+Proposed hints come from the terms that distinguish one target's observed
+prompts from the rest. It is a frequency contrast, not a topic model, and it is
+offered for a human to edit rather than applied.
+
+Open: the signal set is small. Whether an edit was reverted is the strongest
+label available and the proxy cannot see it without watching the repository.
+
+### Spend meter and cost insight — `done`
+
+Live per-project spend, priced from `[providers.*.pricing]`, plus the insight
+built on it: a routing change is proposed only when the cheaper route has
+enough evidence behind it and is not observably worse, and the suggestion
+carries the exact payload the routing editor takes.
+
+Cost alone is never a reason to move. Pairing the spend figure with observed
+satisfaction is what stops the insight from recommending its way into a worse
+outcome.
 
 ## Admin UI
 
-### Per-provider flow ribbons — `building`
+### Per-provider flow ribbons — `done`
 
-The overview flow diagram is hardcoded to two paths, local and external, with
-literal SVG coordinates. `served_by_provider` already carries count and latency
-percentiles per provider and is already served by the stats API, so this is a UI
-change only.
-
-Design decisions, recorded because they are easy to get wrong:
+The overview flow diagram derives its ribbons from `served_by_provider` instead
+of two hardcoded paths. The design decisions, recorded because they are easy to
+get wrong:
 
 - **Colour stays bound to locality, not provider identity.** The whole UI
   encodes local/external through `--local` and `--external`; per-provider hues
@@ -72,194 +124,194 @@ Design decisions, recorded because they are easy to get wrong:
   makes providers swap position on every poll. Group by locality, then sort
   alphabetically; only thickness varies.
 - **Cap the fan-out.** Vertical room allows roughly six ribbons before labels
-  collide. Beyond that, fold the tail into one aggregate ribbon.
+  collide. Beyond that, the tail folds into one aggregate ribbon.
 - **Update keyed, not wholesale.** The drift animation restarts if the nodes are
-  rebuilt each poll, which visibly stutters. Reuse each provider's node.
+  rebuilt each poll, which visibly stutters. Each provider's node is reused.
 
-### Per-model spend analytics — `idea`
+### Per-model spend analytics — `done`
 
-Price the existing per-model token counters so the admin UI answers "what is
-this costing me", broken down by model rather than in aggregate.
+The per-model token counters are priced, and each of the four things that would
+have made the number untrustworthy is handled explicitly:
 
-Most of the data is already collected. `ModelUsage` keys requests, input tokens,
-output tokens, and total time by (provider, model); the stats API serves it as
-`model_usage`, and the UI already renders a Model usage table. What is missing
-is a price and the multiplication.
-
-- **Price metadata.** No cost information exists in config today. Rates are
-  per-provider *and* per-model, and differ between input and output, so this
-  wants a table keyed by model under each provider rather than a single number.
-  Prices change, so treat the config as the source of truth and never hardcode.
-- **Cached tokens are not recorded.** `cached_tokens` is translated through the
-  protocol layer but never reaches stats. Cache reads bill at a steep discount
-  and cache writes at a premium, so a naive input-token multiplication
-  overstates spend badly on agent traffic, which is cache-heavy by nature.
-  Recording them is a prerequisite for a number worth trusting.
-- **Estimated counts must be labelled.** `ModelUsage.estimated_requests` counts
-  requests whose tokens llmproxy estimated rather than read from the provider
-  response. Spend derived from those is an approximation and the UI should say
-  so rather than presenting a precise-looking figure.
-- **Counters do not survive a restart.** Stats are in-memory with a reset
-  action and no serialisation, so totals die with the daemon. Per-session cost
-  works today; "what did I spend this month" needs durable storage first, and
-  that is the larger half of this feature.
-- **Subscription providers are not per-token.** A provider using borrowed CLI
-  OAuth bills against a plan, not per token. Showing a dollar figure there is
-  actively misleading; those rows should read as included in the subscription
-  while still reporting token volume.
-
-Pairs with the spend meter under End-User Features, which is the same data
-aggregated per project rather than per model.
+- **Price metadata.** `[providers.*.pricing]` is keyed by model under each
+  provider, with separate input, output, cache-read, and cache-write rates, per
+  million tokens. Rates change, so config is the only source of truth and
+  nothing is hardcoded. An exact model id wins, then the longest configured
+  prefix, then `*`.
+- **Cached tokens.** `cached_tokens` and cache creation now reach stats through
+  every protocol adapter, normalised onto one convention: the prompt count
+  includes its cached share, as OpenAI reports it, with Anthropic's separate
+  fields summed back in. Cache reads bill at a steep discount and writes at a
+  premium, so a naive input-token multiplication overstated agent traffic badly.
+- **Estimated counts are labelled.** Spend derived from `estimated_requests` is
+  reported as an approximation rather than presented as a precise figure.
+- **Counters survive a restart.** A month-bucketed ledger under `~/.llmproxy`
+  keeps token counters durably and bounded. It stores counters, never prices, so
+  a rate correction re-prices history instead of leaving a stale number behind.
+- **Subscription providers are not per-token.** `subscription = true` reports
+  token volume and no dollar figure, because a figure there would be a fiction.
 
 ## Routing
 
-### Project-scoped routing overlay — `designed`
+### Project-scoped routing overlay — `done`
 
 Per-project semantic route tables, so a project can send development work to one
 provider, front-end work to another, and everything else to a third, without any
 project identity reaching the triage model.
 
-- A project file may define `[integrated.targets.*]` and `[model_aliases]`
-  only. Every provider it names must already exist in the user-level config.
-  Providers, base URLs, and credentials stay user-level: a project file lives in
-  a repository, and cloning an untrusted repository must not be able to define
-  where prompts are sent.
+- A project file defines `[integrated.targets.*]` and `[model_aliases]` only,
+  and every provider it names must already exist in the user-level config.
+  Anything else is rejected by name. Providers, base URLs, and credentials stay
+  user-level: a project file lives in a repository, and cloning an untrusted
+  repository must not be able to define where prompts are sent.
 - Project targets **merge** with user-level targets; the project wins on a name
-  collision.
+  collision, and nothing user-level is removed.
 - A `default = true` field marks the catch-all target. Validation rejects more
   than one after merge, and `ROUTE_DEFAULT` resolves to it in code instead of
   falling through to first-upstream-model discovery.
-- The scope reaches the daemon through the launcher session token, so one daemon
-  continues to serve every project. The token is unsigned, so the daemon
-  re-validates the scope rather than trusting it.
+- The scope reaches the daemon as a path inside the launcher session token, so
+  one daemon continues to serve every project. The token is unsigned, so the
+  daemon re-reads the file at that path and re-validates it against its own
+  providers rather than trusting anything the token asserted.
 
-Open: hint overlap between a broad route and a narrower one has no tie-break
-today. Disjoint hint wording works now; an explicit `priority` field on targets
-is the structural fix if that wording grows unwieldy.
+Open: hint overlap between a broad route and a narrower one still has no
+tie-break. Disjoint hint wording works; an explicit `priority` field on targets
+remains the structural fix if that wording grows unwieldy.
 
-### Sticky routing never expires during an active session — `idea`
+### Sticky routing bounds — `done`
 
-The sticky TTL is a sliding window, not an absolute one, so it does not bound
-how long a route stays pinned in real use.
+The sticky TTL was a sliding window: `conversation_key` prefers a session header
+that agent CLIs send on every turn, and a successful redirect re-inserted the
+entry, so the first message of a session chose the route and the choice survived
+for as long as the user kept working. No value of `sticky_ttl_secs` changed
+that, because the TTL only ever governed idle gaps.
 
-`conversation_key` prefers a session or thread header, and agent CLIs send one
-on every turn, so the key is stable for an entire session rather than per
-message. `execute_integrated_redirect` then re-inserts the sticky entry after
-every successful redirect, refreshing the TTL. The result is that the first
-message of a session chooses the route, and the choice survives for as long as
-the user keeps working — no value of `sticky_ttl_secs` changes this, because the
-TTL only ever governs idle gaps.
+All four candidate directions were built, because they bound different things:
 
-This is the right behaviour for its original purpose, which is keeping one
-conversation coherent on one provider. It becomes wrong when routes differ in
-cost or capability: a session that opens with a trivial question is pinned to
-the cheap route even as the work turns into deep design, which defeats most of
-the value of splitting routes by complexity in the first place.
+- **Absolute TTL.** The insertion timestamp survives a refresh, so a long
+  session is re-triaged periodically even under continuous use.
+- **Turn bound.** A sticky entry serves at most N turns before routing is
+  reconsidered.
+- **Re-triage on material change.** When the embedding cache is on, a request
+  far enough from the one that pinned the route reconsiders it.
+- **Escalate but never demote.** A later turn may move up the `strength`
+  ordering but not down, so cost control survives without pinning quality to
+  whatever the first message happened to be.
 
-Candidate directions, none of which require in-band verbs:
+The Decisions view distinguishes a sticky reuse from a fresh decision, and names
+the bound that expired.
 
-- **Absolute rather than sliding TTL.** Keep the insertion timestamp on refresh
-  so the route is re-evaluated periodically even under continuous use.
-- **Re-triage on material change.** Re-run routing when the request diverges
-  enough from the one that set the route; the embedding work under
-  Embedding-cached routing would supply the distance measure.
-- **Bound by turns, not only by time.** Let a sticky entry serve at most N
-  turns before routing is reconsidered.
-- **Escalate but never demote.** Allow a later turn to move up to a stronger
-  route while refusing to move down, so cost control survives without pinning
-  quality to whatever the first message happened to be.
+### In-band routing verbs — `done`
 
-Whichever is chosen, the Decisions view should distinguish a sticky reuse from a
-fresh decision so the behaviour is visible rather than inferred.
+Agent CLIs give the user no way to set a per-message header, so the message text
+is the only channel back into routing. A closed verb set is recognised at the
+very start of the newest user message: `triage:` re-runs routing, `unstick:`
+drops the pin, `local:` answers here with the routing tools withheld,
+`default:` takes the catch-all, and a target name pins that route directly —
+deterministic and free of triage latency.
 
-### In-band routing verbs — `idea`
+Everything that had to be settled at implementation time, and how:
 
-There is no way to re-trigger triage inside an active session. `conversation_key`
-prefers a session or thread header, which agent CLIs send on every turn, so the
-key is stable for the whole session; and a successful redirect re-inserts the
-sticky entry, refreshing its TTL. An actively worked session therefore never
-falls out of stickiness, and the first message of the session decides the route
-until the user stops for longer than the TTL. Lowering `sticky_ttl_secs` does
-not address this — the TTL only governs idle gaps, never an active session.
-
-Proposal: recognise a small closed set of verb prefixes at the very start of the
-newest user message, act on them, and strip them before the request is
-forwarded. `triage: <prompt>` would bypass the sticky entry and re-run routing;
-a target name would pin that route directly and skip triage altogether, which is
-both deterministic and free of triage latency.
-
-In-band is the right channel precisely because agent CLIs give the user no way
-to set a per-message header. The response already carries `x-llmproxy-route`,
-so the mechanism for reporting what happened exists; only the inbound direction
-is missing.
-
-To settle at implementation time:
-
-- **Where detection happens.** Before the sticky lookup in `maybe_intercept`,
-  or the sticky entry short-circuits the verb.
-- **Stripping both copies.** The prefix must not reach the provider, and the
-  local copy must never mutate the external copy, so the strip has to be applied
-  deliberately to each rather than falling out of the existing clone.
-- **Stale prefixes in history.** Earlier turns keep their prefixes in the
-  conversation. Those must be stripped or ignored, or the triage model reads old
-  directives as if they were current.
+- **Where detection happens.** In the protocol handler, on the caller's native
+  body, before the sticky lookup and before the local copy is derived. A sticky
+  entry can therefore never short-circuit a verb.
+- **Stripping both copies.** The strip is applied to the caller's own body, and
+  the local copy is built from the stripped result, so the prefix reaches
+  neither the provider nor the triage model.
+- **Stale prefixes in history.** Recognised prefixes are stripped from every
+  user turn, not only the newest, so the triage model cannot read an old
+  directive as if it were current.
 - **Collision safety.** Only at the start of the newest user message, only an
-  exact match against the closed verb list, with an escape for the case where
-  someone genuinely begins a message that way.
-- **Verb vocabulary.** `triage:` to force re-routing, a target name to pin,
-  something for "answer locally", and possibly an explicit unstick. Target names
-  are already constrained to tool-name-safe characters, so they parse
-  unambiguously, but they are verbose; short aliases would need defining.
+  exact match against the closed list, with a leading backslash as the escape.
+  A target may not be named after a verb while verbs are on.
+- **Verb vocabulary.** The four routing verbs above, plus `remember:`,
+  `recall:`, and `forget:` for project memory. Target names are already
+  constrained to tool-name-safe characters, so they parse unambiguously.
 
-Related to retry-driven escalation under End-User Features: this is the
-explicit, user-driven form of the same need.
+### Embedding-cached routing — `done`
 
-### Embedding-cached routing — `idea`
+`RoutingDecisionAudit` records prompt, decision, target, and reason for every
+request. Embedding the request and matching it against past decisions turns that
+into a routing cache: triage cost drops, the hit path costs one local embedding,
+and identical requests route identically by construction.
 
-`RoutingDecisionAudit` already records prompt, decision, target, and reason for
-every request, then discards it after 24 hours. Embedding the request and
-matching against past decisions turns that into a routing cache: triage cost
-drops, hit-path latency approaches zero, and identical requests route
-identically by construction. Sticky routing generalised from one conversation to
-all similar requests. The end state is distillation, with the LLM tier as the
-fallback rather than the default.
+Only replayable outcomes are stored. A rejection or a malformed control is
+always re-derived, and a cached decision naming a target a config edit removed
+is pruned rather than replayed. Sensitive screening disables the cache
+entirely, since a cached decision would skip screening that must fail closed.
 
-### Redact and route — `idea`
+Open: the end state is distillation, with the LLM tier as the fallback rather
+than the default. The cache is the first half of that; nothing yet trains on
+what it accumulates.
 
-`reject_sensitive` is binary today: detect and refuse. Substituting placeholders,
-routing to a strong external provider, and rehydrating in the response converts
-"cannot use a good external model on this code" into "can". Hardest part is
-rehydration across streaming and tool-call arguments.
+### Redact and route — `done`
 
-### Speculative triage — `idea`
+`reject_sensitive` was binary: detect and refuse, which turns "there is a
+credential in this file" into "you cannot use a good external model on this code
+at all". Substituting stable placeholders, routing normally, and rehydrating on
+the way back converts that into "you can".
 
-Triage is a serial round trip ahead of each new conversation. Issuing the triage
-call and the presumed-default route concurrently, cancelling the loser, removes
-it from the critical path at the cost of some wasted tokens. Buffered
-speculation must not reach the conversation.
+The hard part was rehydration, and it is handled by narrowing rather than by
+cleverness. Only values that need no JSON escaping are ever spliced back, so a
+placeholder inside a tool-call argument string is safe; a private-key block is
+redacted and stays redacted rather than corrupting a body. The streaming
+rehydrator holds back a chunk tail so a split placeholder is still matched, and
+hands the text layer only complete UTF-8.
 
-### Provider failover and circuit breaking — `idea`
+Detection is prefix- and context-driven rather than entropy-scored. A false
+positive silently damages a prompt, which is worse than a miss.
 
-`fallback_on_error` is one-dimensional: local to external. Health tracking and
-failover between external providers is the missing axis.
+### Speculative triage — `done`
+
+The triage call and the presumed-default route are issued concurrently and the
+loser is cancelled, which takes the triage round trip off the critical path at
+the cost of some wasted tokens. Buffered speculation never reaches the
+conversation: the task is aborted and its output dropped unless triage agrees.
+
+It never runs with sensitive screening on — that would put the prompt in front
+of a provider before it had been screened — and never when an in-band verb has
+already decided the route.
+
+### Provider failover and circuit breaking — `done`
+
+`fallback_on_error` was one-dimensional: local to external. Per-provider health
+is the missing axis. A provider that is rate-limited or circuit-open is routed
+around, and is withheld from the triage tool list so the model picks a working
+route instead of one that would only fail over afterwards — unless withholding
+would leave nothing, since an empty route list is worse than an optimistic one.
 
 ## Platform
 
-### Routing regression suite — `idea`
+### Routing regression suite — `done`
 
-Single-shot route testing exists (`RouteTestMode`). A corpus version — capture
-real requests, replay against an edited prompt or target set, diff the
-decisions — makes prompt edits falsifiable instead of a matter of taste, and
-makes every routing change above safer to attempt.
+Single-shot route testing answers "where would this one prompt go". The corpus
+version answers the question that matters when a policy is edited: "what did
+this change move". Real requests are captured from the decision audit, replayed
+against an edited prompt or target set, and diffed.
 
-### Shadow requests — `idea`
+Decisions that mean the same destination compare as one — a sticky reuse and a
+cached replay are both "it went to that target" — and a new case is not a
+regression. `llmproxy --route-corpus corpus.json` exits non-zero when a decision
+moved, so a prompt edit is falsifiable in CI rather than a matter of taste.
 
-Send a sampled share of requests to two providers, return one, log both, and
-diff them in the admin UI. Turns provider choice into evidence.
+### Shadow requests — `done`
 
-### Triage payload trimming — `idea`
+A sampled share of requests goes to a second provider; one answer is returned,
+both are logged, and the admin interface diffs them. Sampling is a counter
+rather than a random draw, so the observed rate is exact and a replay is
+reproducible.
 
-The whole client conversation is copied into the triage request, so triage input
-grows with conversation length. Sticky routing means the cost is paid once per
-conversation rather than per turn. Trimming the copy to the system prompt plus
-recent turns would cut cost and likely improve hint matching by reducing noise.
+Sampled requests are buffered rather than streamed, because a diff needs both
+complete answers. That is the reason to keep the rate low, and it is stated
+next to the setting.
+
+### Triage payload trimming — `done`
+
+The whole client conversation was copied into the triage request, so triage
+input grew with conversation length. The copy now keeps every system message
+and the newest window of turns, trimmed from the front until it starts on a
+user turn so a tool result never arrives without the assistant call that
+produced it.
+
+Open: the window is a message count. Trimming by token budget would track the
+actual cost more closely, at the price of a tokenizer the proxy does not have.

@@ -47,6 +47,58 @@ integrated targets can override it per model, for example
 `reasoning_effort = "max"` on a research route. Stored CLI logins can be reused
 with `auth = "codex-oauth"` or `auth = "claude-oauth"`.
 
+## Routing Controls
+
+Sticky routing keeps one conversation on one provider. The idle TTL slides on
+every turn, so `sticky_absolute_ttl_secs` and `sticky_max_turns` are what
+reconsider a route during an active session; `sticky_policy = "escalate"` then
+lets a re-triage move a session up to a stronger route but never back down.
+
+Agent CLIs give no way to set a per-message header, so a small closed set of
+in-band verbs is recognised at the very start of the newest user message and
+stripped before anything is forwarded: `triage:` re-runs routing, `unstick:`
+drops the pin, `local:` answers here, `default:` takes the catch-all, and any
+target name pins that route with no triage latency at all. `remember:`,
+`recall:`, and `forget:` manage the shared project memory. A leading backslash
+sends one literally.
+
+Each target may name a `failover` chain, so quota exhaustion and outages are
+absorbed and reported in the admin interface rather than to the caller;
+per-provider health tracking routes around a provider that is rate-limited or
+down. A target may also ask for a `second_opinion`, where two providers answer
+and both are shown or a third reconciles them.
+
+With an embeddings provider configured, `[integrated.embedding]` adds a routing
+cache that replays a near-identical past decision without calling the triage
+model, re-triage when a conversation drifts from the request that pinned its
+route, and escalation when the user re-asks the same question.
+
+## Projects, Spend, and Evidence
+
+A repository may carry a `.llmproxy.toml` defining `[integrated.targets.*]` and
+`[model_aliases]` — and nothing else. Providers and credentials stay
+user-level, so cloning an untrusted repository cannot decide where prompts are
+sent. A launcher finds the nearest one at or above the working directory and
+the daemon re-reads and re-validates it, so one daemon still serves every
+project.
+
+`[providers.*.pricing]` gives each model a per-million-token rate, including
+cache reads and writes, and token counters are kept in a durable month-bucketed
+ledger under `~/.llmproxy`, so spend survives a restart and breaks down by
+project. A provider that bills against a plan reports token volume and never a
+dollar figure. The admin interface adds a per-project model leaderboard scored
+on observed aftermath — immediate re-asks and failures — plus sampled shadow
+requests that record two providers' answers side by side.
+
+`llmproxy --route-corpus corpus.json` replays a captured corpus of real
+requests against the current policy and exits non-zero when a decision moved,
+which makes a policy edit falsifiable in CI. Capture one from the admin
+interface or from `GET /api/route-corpus`.
+
+`[interceptor.redact]` is the permissive counterpart to `reject_sensitive`:
+detected secrets become stable placeholders, the request routes normally, and
+the originals are put back as the response streams.
+
 Each daemon writes full request/response TRACE diagnostics to
 `~/.llmproxy/llmproxy-yyyymmddhhmmss.log`; HTTP errors and timeouts are ERROR
 events. `max_logging_retention_days = 7` controls cleanup at startup, while `0`

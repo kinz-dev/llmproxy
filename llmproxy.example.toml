@@ -31,6 +31,27 @@ connect_timeout_secs = 10
 pool_max_idle_per_host = 64
 pool_idle_timeout_secs = 90
 
+# Optional per-provider price metadata, used for spend reporting. Rates are per
+# million tokens, matching how vendors publish them, so an entry can be copied
+# straight off a price page. Nothing is ever inferred: a provider without a
+# pricing table simply reads as "unpriced" everywhere rather than as zero, and
+# published rates change, so this file is the only source of truth for them.
+#
+# [providers.openai.pricing]
+# currency = "USD"
+# # Set this instead of rates when a provider bills against a plan (a borrowed
+# # CLI login, a seat licence). Those rows report token volume and never a
+# # dollar figure, because a dollar figure there would be a fiction.
+# # subscription = true
+#
+# # An exact model id wins; otherwise the longest configured prefix matches, so
+# # a dated id inherits its family rate. "*" is the last resort.
+# [providers.openai.pricing.models."gpt-5.4"]
+# input = 1.25
+# output = 10.0
+# cache_read = 0.125   # defaults to the input rate when unset
+# cache_write = 1.5625 # defaults to the input rate when unset
+
 # Optional local-first agent interceptor. The local provider receives a dynamic
 # Chat Completions copy of /chat/completions, /responses, or /messages requests.
 # A normal completion is returned to the client; a sole PASS function call sends
@@ -61,6 +82,21 @@ reject_sensitive = false
 # max_tokens = 512
 # parallel_tool_calls = false
 # instructions = """Override the default local routing instructions here."""
+# The whole client conversation is otherwise copied into the triage request, so
+# triage input grows with the conversation. Keeping the newest window cuts cost
+# and reduces the noise the route hints are matched against. 0 copies all of it.
+# triage_max_messages = 24
+
+# Redact and route: the permissive counterpart to reject_sensitive. Detected
+# secrets become stable placeholders, the request routes normally, and the
+# originals are put back as the response streams. Detection is prefix- and
+# context-driven rather than entropy-scored, because a false positive silently
+# damages a prompt. A value that would need JSON escaping — a private-key block
+# — is redacted and stays redacted rather than corrupting a response body.
+# [interceptor.redact]
+# enabled = false
+# rehydrate = true
+# extra_literals = ["build01.internal.invalid"]
 # Native launchers borrow only the matching CLI provider login:
 # llmproxy --config llmproxy.example.toml --intercept --codex
 # llmproxy --config llmproxy.example.toml --intercept --claude
@@ -120,14 +156,81 @@ reject_sensitive = false
 # TTL; no message or session text is kept.
 [integrated]
 enabled = true
+# The idle-gap TTL. It slides on every successful redirect, so on its own it
+# bounds nothing about an actively worked session: the first message would
+# choose the route and keep it for as long as you kept working.
 sticky_ttl_secs = 1800
+# The bounds that do govern an active session. The absolute TTL is measured
+# from when the route was chosen and is never refreshed; the turn bound counts
+# turns served. Either reaching zero disables that bound.
+sticky_absolute_ttl_secs = 3600
+sticky_max_turns = 0
+# "escalate" lets a re-triage move a session up to a stronger route but never
+# back down to a weaker one, so cost control survives without pinning quality
+# to whatever the first message happened to be. "pin" allows either direction.
+# Strength comes from the optional `strength` field on each target below.
+sticky_policy = "escalate"
 sticky_capacity = 1024
+
+# In-band routing verbs, recognised only at the very start of the newest user
+# message and stripped before either copy is forwarded, since agent CLIs give
+# no way to set a per-message header. The closed set is triage:, unstick:,
+# local:, default:, remember:, recall:, forget:, and any configured target
+# name. Prefix with a backslash to send one literally. Stale prefixes in
+# earlier turns are stripped too, so the triage model never reads an old
+# directive as if it were current.
+verbs = true
+
+# Ordered fallback used by targets that define no chain of their own. Quota
+# exhaustion and outages are absorbed here and reported in the admin interface
+# rather than to the caller. Failover only happens on a non-success status,
+# which means the provider generated nothing, so no work is billed twice.
+# failover = ["PROVIDER_DEFAULT"]
+
+# Issue the catch-all route concurrently with triage and cancel the loser,
+# taking the triage round trip off the critical path at the cost of some wasted
+# tokens when they disagree. Requires exactly one target with default = true,
+# and never runs while sensitive screening is on.
+speculative = false
+
 # instructions = """Override the integrated routing policy here; empty uses the built-in default."""
+
+# Embedding-cached routing. One local embedding per request buys three things:
+# a cache that replays a near-identical past decision without calling the
+# triage model at all, a drift check that reconsiders a pinned route when the
+# conversation changes subject, and retry detection that treats a near-identical
+# re-ask with no intervening tool use as dissatisfaction and moves the request
+# up one route rank. Every embedding failure is soft: routing never depends on
+# the cache being reachable, and sensitive screening disables all three.
+# [integrated.embedding]
+# enabled = false
+# provider = "embeddings"
+# model = "Qwen/Qwen3-Embedding-0.6B"
+# threshold = 0.94        # similarity at or above which a decision is replayed
+# capacity = 2048
+# ttl_secs = 86400
+# retriage_below = 0.0    # 0 disables the drift check
+# retry_escalation = false
+# retry_threshold = 0.93
+# timeout_ms = 2000
+
+# Shadow requests: send a sampled copy to a second target, return the primary
+# answer, and record both in the admin interface so provider choice can be
+# argued from evidence. Sampled requests are buffered rather than streamed,
+# because a diff needs both complete answers, so keep the rate low.
+# [integrated.shadow]
+# enabled = false
+# target = "PROVIDER_DEFAULT"
+# sample_one_in = 20
+# timeout_ms = 120000
 #
 [integrated.targets.PROVIDER_DEFAULT]
 provider = "default"
 model = "Qwen/Qwen2.5-Coder-32B-Instruct"
 hint = "all non-routine work not claimed by a more specific route (default route)"
+# The catch-all. ROUTE_DEFAULT resolves here instead of falling through to
+# first-upstream-model discovery. At most one target may claim it.
+default = true
 
 # [integrated.targets.backend]
 # provider = "openai"
@@ -144,6 +247,45 @@ hint = "all non-routine work not claimed by a more specific route (default route
 # provider = "copilot"
 # model = "gpt-5.4"
 # hint = "routine external work assigned to the Copilot backend"
+# strength = 1                  # higher is stronger; only the ordering matters
+# failover = ["backend"]        # tried when this route is unavailable or fails
+#
+# Ask a second provider the same question on the routes that carry consequential
+# work. "present" shows both answers, because agreement is signal and divergence
+# is a stronger one; "reconcile" has a third provider produce one answer while
+# being told to name the disagreements rather than smooth them over. A tool call
+# on either side skips the comparison, since a composed answer is text.
+# [integrated.targets.design.second_opinion]
+# target = "frontend"
+# mode = "present"
+# reconciler = "backend"   # required for mode = "reconcile"
+
+# Project-scoped routing overlay
+# ------------------------------
+# A repository may carry a `.llmproxy.toml` beside its code. It may define only
+# `[integrated.targets.*]` and `[model_aliases]`, and every provider it names
+# must already exist here: providers, base URLs, and credentials stay
+# user-level, because a project file lives in a repository and cloning an
+# untrusted repository must never decide where prompts are sent or which key
+# pays for them. Anything else in it is rejected by name.
+#
+# Project entries merge with the ones below and win on a name collision.
+# A launcher picks up the nearest project file at or above the working
+# directory (`--project <dir>` overrides, `--no-project` disables), and the
+# scope travels to the daemon as a path inside the session token, so one daemon
+# still serves every project. The token is unsigned, so the daemon re-reads
+# that file and re-validates it against its own providers rather than trusting
+# the token's claim about it. Spend and project memory are keyed by the
+# project's directory name.
+#
+#   # <repo>/.llmproxy.toml
+#   [integrated.targets.docs]
+#   provider = "anthropic"          # must already exist in this file
+#   model = "claude-sonnet-4-5"
+#   hint = "documentation and prose work in this repository"
+#
+#   [model_aliases]
+#   project-fast = { provider = "openai", model = "gpt-5.4-mini" }
 
 # Optional manual overrides. Without these, every incoming model is mapped to
 # the first id returned by the default upstream /v1/models. Inline route tables
@@ -173,3 +315,27 @@ mode = "chat_completions"
 expose_aliases = true
 expose_upstream = true
 # cache_ttl_secs = 300 # optional; unset caches /v1/models indefinitely, 0 disables
+
+# Provider health and circuit breaking. A provider that is rate-limited or down
+# is routed around rather than retried into the ground. Quota exhaustion has a
+# duration the provider tells us about; an outage does not, so it gets
+# exponential backoff behind a single half-open probe.
+[health]
+enabled = true
+failure_threshold = 4
+open_secs = 30
+max_open_secs = 600
+max_rate_limit_secs = 900
+
+# Cross-agent shared project memory. Each agent CLI keeps its own history and
+# shares nothing with the others; this store is keyed by project and injected
+# into whichever agent is running. Notes are written and read by explicit
+# direction only — the in-band remember:/recall:/forget: verbs, or the admin
+# API — because a wrong inference would be silently injected into every later
+# request in the project.
+[memory]
+enabled = false
+inject = true
+max_notes = 64
+max_note_chars = 2000
+max_injected_chars = 6000

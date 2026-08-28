@@ -12,6 +12,7 @@ fn targets() -> BTreeMap<String, IntegratedTarget> {
             reasoning_effort: None,
             is_default: false,
             strength: None,
+            failover: Vec::new(),
         },
     )])
 }

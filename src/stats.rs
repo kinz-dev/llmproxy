@@ -265,6 +265,9 @@ pub(crate) struct ProxyStats {
     intercept_reject: AtomicU64,
     intercept_pass: AtomicU64,
     intercept_redirect: AtomicU64,
+    intercept_failover: AtomicU64,
+    speculation_used: AtomicU64,
+    speculation_discarded: AtomicU64,
     intercept_fallback: AtomicU64,
     intercept_errors: AtomicU64,
     served_local: AtomicU64,
@@ -341,6 +344,24 @@ impl ProxyStats {
             .lock()
             .expect("redirect stats poisoned");
         *redirects.entry(target.to_string()).or_default() += 1;
+    }
+
+    /// A speculative default-route request was already in flight when triage
+    /// agreed with it, so the triage round trip cost nothing.
+    pub(crate) fn record_speculation_used(&self) {
+        self.speculation_used.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Triage disagreed with the speculation, so its tokens were wasted. This
+    /// is the price of the feature and must stay visible.
+    pub(crate) fn record_speculation_discarded(&self) {
+        self.speculation_discarded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A configured route was unavailable or failed and the next candidate in
+    /// its failover chain was used instead.
+    pub(crate) fn record_intercept_failover(&self) {
+        self.intercept_failover.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_intercept_fallback(&self) {
@@ -458,6 +479,9 @@ impl ProxyStats {
             &self.intercept_reject,
             &self.intercept_pass,
             &self.intercept_redirect,
+            &self.intercept_failover,
+            &self.speculation_used,
+            &self.speculation_discarded,
             &self.intercept_fallback,
             &self.intercept_errors,
             &self.served_local,
@@ -647,6 +671,9 @@ impl ProxyStats {
                 "reject": load(&self.intercept_reject),
                 "pass": load(&self.intercept_pass),
                 "redirect": load(&self.intercept_redirect),
+                "failover": load(&self.intercept_failover),
+                "speculation_used": load(&self.speculation_used),
+                "speculation_discarded": load(&self.speculation_discarded),
                 "fallback": load(&self.intercept_fallback),
                 "errors": load(&self.intercept_errors),
                 "redirects": redirects,
@@ -817,6 +844,19 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
     let success = status.is_success();
     proxy_stats().record_routing_destination(&frontend, &provider, &model, !success);
     if !success {
+        // Health is recorded from the status alone: at this point no body has
+        // streamed, so a retryable status means nothing was generated.
+        if crate::health::status_is_rate_limit(status.as_u16()) {
+            let retry_after = crate::health::retry_after_duration(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+            );
+            crate::health::provider_health().record_rate_limit(&provider, retry_after);
+        } else {
+            crate::health::provider_health().record_failure(&provider, format!("HTTP {status}"));
+        }
         error!(
             route_class = class.as_str(),
             provider,
@@ -888,6 +928,8 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
                     if success {
                         proxy_stats().record_routing_error(&frontend, &provider, &model);
                     }
+                    crate::health::provider_health()
+                        .record_failure(&provider, stream_error.to_string());
                     error!(
                         route_class = class.as_str(),
                         provider,
@@ -907,6 +949,7 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
             yield chunk;
         }
         if success && completed {
+            crate::health::provider_health().record_success(&provider);
             let usage = sniffer.finish(estimated_input_tokens, estimate_output_tokens);
             proxy_stats().record_served(class, &provider, &frontend, request_started.elapsed());
             proxy_stats().record_model_usage(

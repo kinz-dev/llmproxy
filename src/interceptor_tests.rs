@@ -8,7 +8,8 @@ use std::time::Duration;
 use super::{
     IntegratedConfig, IntegratedTarget, StickyBounds, StickyDecision, StickyPolicy, StickyRoutes,
     apply_escalation_floor, classify_completion_details, classify_completion_with_targets,
-    forced_route_for, trim_triage_messages, validate_integrated_config,
+    failover_chain, forced_route_for, routable_targets, trim_triage_messages,
+    validate_integrated_config,
 };
 use crate::Config;
 use crate::INTEGRATED_AUTO_MODEL;
@@ -229,6 +230,7 @@ fn integrated_redirect_must_be_the_only_local_output() {
             reasoning_effort: None,
             is_default: false,
             strength: None,
+            failover: Vec::new(),
         },
     )]);
     let redirect = json!({
@@ -277,6 +279,7 @@ fn integrated_request_adds_target_tools_and_prompt_hints() {
                     reasoning_effort: Some(crate::ReasoningEffort::Max),
                     is_default: false,
                     strength: None,
+                    failover: Vec::new(),
                 },
             )]),
             ..IntegratedConfig::default()
@@ -342,6 +345,7 @@ fn explicit_model_in_integrated_config_uses_pass_only_prompt() {
                     reasoning_effort: None,
                     is_default: false,
                     strength: None,
+                    failover: Vec::new(),
                 },
             )]),
             ..IntegratedConfig::default()
@@ -389,6 +393,7 @@ fn integrated_mode_swaps_in_the_routing_tier_prompt_unless_overridden() {
                     reasoning_effort: None,
                     is_default: false,
                     strength: None,
+                    failover: Vec::new(),
                 },
             )]),
             ..IntegratedConfig::default()
@@ -638,6 +643,7 @@ fn integrated_external_targets_require_proxy_credentials() {
                 reasoning_effort: None,
                 is_default: false,
                 strength: None,
+                failover: Vec::new(),
             },
         )]),
         ..IntegratedConfig::default()
@@ -675,6 +681,7 @@ fn integrated_target_names_are_generic_tool_names() {
         reasoning_effort: None,
         is_default: false,
         strength: None,
+        failover: Vec::new(),
     };
     let config_for = |name: String| IntegratedConfig {
         enabled: true,
@@ -715,6 +722,7 @@ fn target_named(provider: &str, strength: Option<u32>) -> IntegratedTarget {
         reasoning_effort: None,
         is_default: false,
         strength,
+        failover: Vec::new(),
     }
 }
 
@@ -1029,4 +1037,142 @@ fn a_forced_verb_route_resolves_targets_and_the_catch_all() {
         None
     );
     assert_eq!(forced_route_for(&config, None), None);
+}
+
+fn failover_config(entries: &[(&str, &[&str])], shared: &[&str]) -> IntegratedConfig {
+    IntegratedConfig {
+        failover: shared.iter().map(|name| (*name).to_string()).collect(),
+        targets: entries
+            .iter()
+            .map(|(name, failover)| {
+                let mut target = target_named("openai", None);
+                target.failover = failover.iter().map(|name| (*name).to_string()).collect();
+                ((*name).to_string(), target)
+            })
+            .collect(),
+        ..IntegratedConfig::default()
+    }
+}
+
+#[test]
+fn a_target_chain_wins_over_the_shared_chain() {
+    let config = failover_config(&[("a", &["b"]), ("b", &[]), ("c", &[])], &["c"]);
+    assert_eq!(failover_chain(&config, "a"), vec!["a", "b"]);
+    // A target with no chain of its own inherits the shared one.
+    assert_eq!(failover_chain(&config, "b"), vec!["b", "c"]);
+}
+
+#[test]
+fn the_failover_chain_is_deduplicated_and_bounded() {
+    let config = failover_config(
+        &[
+            ("a", &["b", "b", "a", "c", "d", "e", "f"]),
+            ("b", &[]),
+            ("c", &[]),
+            ("d", &[]),
+            ("e", &[]),
+            ("f", &[]),
+        ],
+        &[],
+    );
+    let chain = failover_chain(&config, "a");
+    assert_eq!(chain, vec!["a", "b", "c", "d"]);
+}
+
+#[test]
+fn an_unknown_failover_candidate_is_dropped_from_the_chain() {
+    let config = failover_config(&[("a", &["ghost", "b"]), ("b", &[])], &[]);
+    assert_eq!(failover_chain(&config, "a"), vec!["a", "b"]);
+}
+
+#[test]
+fn failover_validation_rejects_self_reference_and_unknown_targets() {
+    let providers = HashMap::from([
+        ("local".to_string(), crate::UpstreamConfig::default()),
+        (
+            "openai".to_string(),
+            crate::UpstreamConfig {
+                base_url: "https://api.openai.invalid/v1".to_string(),
+                api_key: Some("k".to_string()),
+                ..crate::UpstreamConfig::default()
+            },
+        ),
+    ]);
+    let interceptor = InterceptorConfig {
+        enabled: true,
+        provider: "local".to_string(),
+        model: "triage".to_string(),
+        ..InterceptorConfig::default()
+    };
+
+    let mut config = failover_config(&[("a", &["a"]), ("b", &[])], &[]);
+    config.enabled = true;
+    let error = validate_integrated_config(&config, &interceptor, &providers)
+        .expect_err("self-reference is rejected");
+    assert!(format!("{error:#}").contains("itself"));
+
+    let mut config = failover_config(&[("a", &["ghost"])], &[]);
+    config.enabled = true;
+    let error = validate_integrated_config(&config, &interceptor, &providers)
+        .expect_err("unknown target is rejected");
+    assert!(format!("{error:#}").contains("unknown target"));
+
+    let mut config = failover_config(&[("a", &["b"]), ("b", &[])], &[]);
+    config.enabled = true;
+    validate_integrated_config(&config, &interceptor, &providers)
+        .expect("a valid chain is accepted");
+}
+
+#[test]
+fn speculation_requires_a_catch_all_to_speculate_on() {
+    let providers = HashMap::from([
+        ("local".to_string(), crate::UpstreamConfig::default()),
+        (
+            "openai".to_string(),
+            crate::UpstreamConfig {
+                base_url: "https://api.openai.invalid/v1".to_string(),
+                api_key: Some("k".to_string()),
+                ..crate::UpstreamConfig::default()
+            },
+        ),
+    ]);
+    let interceptor = InterceptorConfig {
+        enabled: true,
+        provider: "local".to_string(),
+        model: "triage".to_string(),
+        ..InterceptorConfig::default()
+    };
+    let mut config = IntegratedConfig {
+        enabled: true,
+        speculative: true,
+        targets: BTreeMap::from([("a".to_string(), target_named("openai", None))]),
+        ..IntegratedConfig::default()
+    };
+    let error = validate_integrated_config(&config, &interceptor, &providers)
+        .expect_err("speculation needs a catch-all");
+    assert!(format!("{error:#}").contains("default = true"));
+
+    config.targets.get_mut("a").expect("target").is_default = true;
+    validate_integrated_config(&config, &interceptor, &providers)
+        .expect("a catch-all makes speculation valid");
+}
+
+#[test]
+fn unhealthy_routes_are_withheld_from_triage_but_never_all_of_them() {
+    let health = crate::health::ProviderHealth::default();
+    let config = IntegratedConfig {
+        targets: BTreeMap::from([
+            ("good".to_string(), target_named("healthy", None)),
+            ("bad".to_string(), target_named("broken", None)),
+        ]),
+        ..IntegratedConfig::default()
+    };
+    assert_eq!(routable_targets(&config, &health), vec!["bad", "good"]);
+
+    health.record_rate_limit("broken", Some(Duration::from_secs(60)));
+    assert_eq!(routable_targets(&config, &health), vec!["good"]);
+
+    // With nothing healthy left, an optimistic list beats an empty one.
+    health.record_rate_limit("healthy", Some(Duration::from_secs(60)));
+    assert_eq!(routable_targets(&config, &health), vec!["bad", "good"]);
 }

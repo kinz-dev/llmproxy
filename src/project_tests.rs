@@ -8,6 +8,7 @@ fn sample_target(provider: &str) -> IntegratedTarget {
         reasoning_effort: None,
         is_default: false,
         strength: None,
+        failover: Vec::new(),
     }
 }
 

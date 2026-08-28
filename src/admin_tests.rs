@@ -200,6 +200,7 @@ fn integrated_doc_edit_writes_valid_target_tables() {
                 reasoning_effort: Some(crate::ReasoningEffort::Max),
                 is_default: false,
                 strength: None,
+                failover: Vec::new(),
             },
         )])),
     };

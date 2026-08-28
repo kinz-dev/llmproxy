@@ -46,6 +46,7 @@ mod backend_adapters;
 mod claude_launcher;
 mod codex_launcher;
 mod copilot_launcher;
+mod health;
 mod interceptor;
 mod logging;
 mod oauth;
@@ -214,6 +215,7 @@ struct Config {
     responses: ResponsesConfig,
     models: ModelsConfig,
     admin: AdminConfig,
+    health: health::HealthConfig,
     #[serde(skip)]
     model_routing: ModelRoutingMode,
     #[serde(skip)]
@@ -242,6 +244,7 @@ impl Default for Config {
             responses: ResponsesConfig::default(),
             models: ModelsConfig::default(),
             admin: AdminConfig::default(),
+            health: health::HealthConfig::default(),
             model_routing: ModelRoutingMode::Remap,
             anthropic_mode: AnthropicMode::ChatCompletions,
             project: None,
@@ -1042,6 +1045,7 @@ async fn run_server(
     launcher_name: Option<&'static str>,
     log_file: Option<String>,
 ) -> Result<()> {
+    health::provider_health().configure(config.health);
     let config = Arc::new(config);
     let mut providers = HashMap::new();
     for (name, upstream) in effective_provider_configs(&config)? {
@@ -6872,6 +6876,9 @@ fn validate_config(config: &Config) -> Result<()> {
             bail!("model alias {alias:?} has an empty upstream model");
         }
     }
+    if let Err(error) = config.health.validate() {
+        bail!(error);
+    }
     let mut routing_interceptor = config.interceptor.clone();
     if config.integrated.enabled {
         routing_interceptor.enabled = true;
@@ -7273,6 +7280,7 @@ mod tests {
                 reasoning_effort: None,
                 is_default: false,
                 strength: None,
+                failover: Vec::new(),
             },
         );
         assert!(validate_launcher_runtime(&config, LauncherMode::Integrated).is_ok());
@@ -7618,6 +7626,7 @@ mod tests {
                         reasoning_effort: None,
                         is_default: false,
                         strength: None,
+                        failover: Vec::new(),
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -7772,6 +7781,7 @@ mod tests {
                         reasoning_effort: Some(ReasoningEffort::Max),
                         is_default: false,
                         strength: None,
+                        failover: Vec::new(),
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -7881,6 +7891,7 @@ mod tests {
                         reasoning_effort: None,
                         is_default: false,
                         strength: None,
+                        failover: Vec::new(),
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -8005,6 +8016,7 @@ mod tests {
                         reasoning_effort: None,
                         is_default: false,
                         strength: None,
+                        failover: Vec::new(),
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -11111,6 +11123,7 @@ mod tests {
                 reasoning_effort: None,
                 is_default: false,
                 strength: None,
+                failover: Vec::new(),
             },
         );
         config.integrated.targets.insert(
@@ -11122,6 +11135,7 @@ mod tests {
                 reasoning_effort: None,
                 is_default: false,
                 strength: None,
+                failover: Vec::new(),
             },
         );
 

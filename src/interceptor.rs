@@ -144,6 +144,14 @@ pub(crate) struct IntegratedConfig {
     /// Recognise in-band routing verbs at the start of the newest user
     /// message. Disable to pass every message through byte-for-byte.
     pub(crate) verbs: bool,
+    /// Default failover chain for targets that do not define their own.
+    /// Quota exhaustion and outages are absorbed here rather than reported to
+    /// the caller mid-task.
+    pub(crate) failover: Vec<String>,
+    /// Issue the presumed-default route concurrently with triage and cancel
+    /// the loser, taking the triage round trip off the critical path at the
+    /// cost of some wasted tokens.
+    pub(crate) speculative: bool,
     /// Integrated-mode routing policy override; empty uses the built-in
     /// integrated default.
     pub(crate) instructions: String,
@@ -182,6 +190,8 @@ impl Default for IntegratedConfig {
             sticky_policy: StickyPolicy::Escalate,
             sticky_capacity: 1024,
             verbs: true,
+            failover: Vec::new(),
+            speculative: false,
             instructions: String::new(),
             targets: BTreeMap::new(),
         }
@@ -230,6 +240,11 @@ pub(crate) struct IntegratedTarget {
     /// refuse a mid-session demotion.
     #[serde(default)]
     pub(crate) strength: Option<u32>,
+    /// Other targets to try, in order, when this one is unavailable or
+    /// answers with a retryable failure. Empty inherits
+    /// `integrated.failover`.
+    #[serde(default)]
+    pub(crate) failover: Vec<String>,
 }
 
 impl Default for InterceptorConfig {
@@ -435,6 +450,30 @@ impl RoutingAuditDraft {
             .map(str::to_string);
     }
 
+    /// Record what the failover chain did, so the admin Decisions view shows
+    /// an absorbed outage rather than an unexplained provider change.
+    fn note_failover(&mut self, skipped: &[String], failed: &[String]) {
+        let mut notes = Vec::new();
+        if !skipped.is_empty() {
+            notes.push(format!(
+                "skipped unavailable routes: {}",
+                skipped.join(", ")
+            ));
+        }
+        if !failed.is_empty() {
+            notes.push(format!("failed routes: {}", failed.join(", ")));
+        }
+        if notes.is_empty() {
+            return;
+        }
+        let note = notes.join("; ");
+        if self.audit.reason.is_empty() {
+            self.audit.reason = note;
+        } else {
+            self.audit.reason = format!("{} Failover {note}.", self.audit.reason);
+        }
+    }
+
     fn set_error(&mut self, error: impl Into<String>) {
         self.audit.error = Some(error.into());
     }
@@ -549,6 +588,28 @@ pub(crate) fn validate_integrated_config(
             );
         }
     }
+    for candidate in &config.failover {
+        if !config.targets.contains_key(candidate) {
+            bail!("integrated.failover references unknown target {candidate:?}");
+        }
+    }
+    for (name, target) in &config.targets {
+        for candidate in &target.failover {
+            if candidate == name {
+                bail!("integrated target {name:?} lists itself in its failover chain");
+            }
+            if !config.targets.contains_key(candidate) {
+                bail!(
+                    "integrated target {name:?} failover references unknown target {candidate:?}"
+                );
+            }
+        }
+    }
+    if config.speculative && default_target(config).is_none() {
+        bail!(
+            "integrated.speculative requires exactly one target with default = true to speculate on"
+        );
+    }
     let defaults = config
         .targets
         .iter()
@@ -606,6 +667,28 @@ pub(crate) fn validate_integrated_config(
         }
     }
     Ok(())
+}
+
+/// Targets worth advertising to the triage model right now.
+///
+/// A route whose provider is rate-limited or circuit-open is withheld, so
+/// triage picks a working route instead of choosing one that would only fail
+/// over afterwards. If that would leave nothing, every target is advertised:
+/// an empty route list is worse than an optimistic one.
+fn routable_targets(
+    config: &IntegratedConfig,
+    health: &crate::health::ProviderHealth,
+) -> Vec<String> {
+    let available = config
+        .targets
+        .iter()
+        .filter(|(_, target)| health.peek(&target.provider).is_available())
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        return config.targets.keys().cloned().collect();
+    }
+    available
 }
 
 /// The target a `<name>:` or `default:` directive names, when it resolves.
@@ -967,6 +1050,25 @@ pub(crate) async fn maybe_intercept(
 
     let redirect_request = local_chat_request.clone();
 
+    // Speculative triage: issue the presumed-default route concurrently with
+    // the triage call and cancel the loser. Never with sensitive screening on,
+    // because that would put the prompt in front of a provider before it has
+    // been screened, and never when a verb already decided the route.
+    let speculation = (integrated
+        && state.config.integrated.speculative
+        && !config.reject_sensitive
+        && verb.is_none())
+    .then(|| {
+        start_speculation(
+            state,
+            redirect_request.clone(),
+            protocol,
+            &client_model,
+            client_streaming,
+        )
+    })
+    .flatten();
+
     let local_request = match build_local_request(
         local_chat_request,
         config,
@@ -1194,6 +1296,50 @@ pub(crate) async fn maybe_intercept(
                     .to_string(),
         }
     });
+    if let Some(speculation) = speculation {
+        let wanted = match &classification.decision {
+            CompletionDecision::Redirect(target) => target == &speculation.target,
+            CompletionDecision::DefaultRoute => default_target(&state.config.integrated)
+                .is_some_and(|(name, _)| name == speculation.target),
+            _ => false,
+        };
+        if wanted {
+            // The route was already in flight, so triage cost nothing.
+            match speculation.handle.await {
+                Ok(response) if response.status().is_success() => {
+                    proxy_stats().record_speculation_used();
+                    proxy_stats().record_intercept_redirect(&speculation.target);
+                    if let Some(key) = conversation_key {
+                        sticky_routes().insert(
+                            key,
+                            speculation.target.clone(),
+                            state.config.integrated.sticky_ttl_secs,
+                            state.config.integrated.sticky_capacity,
+                        );
+                    }
+                    let target = &state.config.integrated.targets[&speculation.target];
+                    let provider = state
+                        .providers
+                        .get(&target.provider)
+                        .expect("validated integrated provider missing");
+                    audit.set_decision(
+                        "redirect",
+                        format!("{reason} The route was speculated on concurrently with triage."),
+                    );
+                    audit.set_target(&speculation.target, target);
+                    audit.record_destination(provider, &target.model);
+                    return InterceptionOutcome::Respond(response);
+                }
+                // A failed or cancelled speculation falls through to the
+                // normal path, which retries with the full failover chain.
+                _ => proxy_stats().record_speculation_discarded(),
+            }
+        } else {
+            speculation.handle.abort();
+            proxy_stats().record_speculation_discarded();
+        }
+    }
+
     // Screening ran first because it is mandatory and fails closed. Anything
     // short of a rejection now defers to the user's explicit directive.
     if config.reject_sensitive
@@ -1392,80 +1538,233 @@ pub(crate) async fn maybe_intercept(
     }
 }
 
+/// A default-route request already in flight while triage runs.
+///
+/// Nothing here ever reaches the conversation unless triage agrees with it;
+/// otherwise the task is aborted and its buffered output is dropped.
+struct Speculation {
+    target: String,
+    handle: tokio::task::JoinHandle<Response>,
+}
+
+fn start_speculation(
+    state: &AppState,
+    chat_request: Value,
+    protocol: InterceptorProtocol,
+    client_model: &Option<String>,
+    client_streaming: bool,
+) -> Option<Speculation> {
+    let (name, target) = default_target(&state.config.integrated)?;
+    let provider = state.providers.get(&target.provider)?;
+    if !crate::health::provider_health()
+        .peek(&provider.name)
+        .is_available()
+    {
+        // Speculating into a provider that is already failing spends tokens
+        // to produce an error.
+        return None;
+    }
+    let name = name.to_string();
+    let state = state.clone();
+    let client_model = client_model.clone();
+    let speculated = name.clone();
+    let handle = tokio::spawn(async move {
+        let target = &state.config.integrated.targets[&speculated];
+        let provider = state
+            .providers
+            .get(&target.provider)
+            .expect("validated integrated provider missing");
+        proxy_integrated_chat(
+            provider,
+            chat_request,
+            target,
+            protocol,
+            client_model,
+            client_streaming,
+            state.config.as_ref(),
+        )
+        .await
+    });
+    Some(Speculation {
+        target: name,
+        handle,
+    })
+}
+
+/// The ordered list of targets to try: the chosen one, then its failover
+/// chain, then the shared default chain. Deduplicated and bounded so a
+/// mis-configured cycle cannot loop.
+fn failover_chain(config: &IntegratedConfig, target_name: &str) -> Vec<String> {
+    const MAX_ATTEMPTS: usize = 4;
+    let mut chain = vec![target_name.to_string()];
+    let configured = config
+        .targets
+        .get(target_name)
+        .map(|target| &target.failover)
+        .filter(|failover| !failover.is_empty())
+        .unwrap_or(&config.failover);
+    for candidate in configured {
+        if chain.len() >= MAX_ATTEMPTS {
+            break;
+        }
+        if chain.iter().any(|existing| existing == candidate) {
+            continue;
+        }
+        if config.targets.contains_key(candidate) {
+            chain.push(candidate.clone());
+        }
+    }
+    chain
+}
+
+/// Send an integrated route, absorbing quota exhaustion and outages by
+/// continuing down the failover chain instead of reporting them to the caller.
+///
+/// Failover is safe here because it only happens on a non-success status,
+/// which means the provider rejected the request before generating anything:
+/// no work is duplicated and nothing is billed twice.
 async fn execute_integrated_redirect(
     state: &AppState,
     target_name: &str,
-    chat_request: Value,
+    mut chat_request: Value,
     protocol: InterceptorProtocol,
     client_model: Option<String>,
     client_streaming: bool,
     conversation_key: Option<u64>,
     mut audit: RoutingAuditDraft,
 ) -> InterceptionOutcome {
-    let target = state
-        .config
-        .integrated
-        .targets
-        .get(target_name)
-        .expect("validated integrated target missing");
-    let provider: &ProviderState = state
-        .providers
-        .get(&target.provider)
-        .expect("validated integrated provider missing");
-    info!(
-        target = target_name,
-        provider = target.provider,
-        model = target.model,
-        reasoning_effort = target.reasoning_effort.map(crate::ReasoningEffort::as_str),
-        protocol = protocol.as_str(),
-        "sending integrated route"
-    );
-    let response = proxy_integrated_chat(
-        provider,
-        chat_request,
-        target,
-        protocol,
-        client_model,
-        client_streaming,
-        state.config.as_ref(),
-    )
-    .await;
-    if response.status().is_success() {
-        proxy_stats().record_intercept_redirect(target_name);
-        if let Some(key) = conversation_key {
-            sticky_routes().insert(
-                key,
-                target_name.to_string(),
-                state.config.integrated.sticky_ttl_secs,
-                state.config.integrated.sticky_capacity,
+    let chain = failover_chain(&state.config.integrated, target_name);
+    let mut skipped: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    let mut last: Option<(String, Response)> = None;
+
+    for (attempt, name) in chain.iter().enumerate() {
+        let target = state
+            .config
+            .integrated
+            .targets
+            .get(name)
+            .expect("validated integrated target missing");
+        let provider: &ProviderState = state
+            .providers
+            .get(&target.provider)
+            .expect("validated integrated provider missing");
+        let more_candidates = attempt + 1 < chain.len();
+
+        let availability = crate::health::provider_health().availability(&provider.name);
+        if !availability.is_available() && more_candidates {
+            info!(
+                target = name,
+                provider = provider.name,
+                reason = availability.reason(),
+                "skipping an unavailable integrated route"
             );
+            skipped.push(format!("{name}: {}", availability.reason()));
+            continue;
         }
-        audit.record_destination(provider, &target.model);
-        InterceptionOutcome::Respond(response)
-    } else {
-        if let Some(key) = conversation_key {
-            sticky_routes().remove(key);
+
+        if attempt > 0 {
+            proxy_stats().record_intercept_failover();
+            audit.set_target(name, target);
         }
-        error!(
-            target = target_name,
+        info!(
+            target = name,
             provider = target.provider,
             model = target.model,
+            attempt,
             reasoning_effort = target.reasoning_effort.map(crate::ReasoningEffort::as_str),
-            status = %response.status(),
-            "integrated redirect failed; preserving the first upstream result"
+            protocol = protocol.as_str(),
+            "sending integrated route"
+        );
+        // Only the final attempt can consume the request outright.
+        let request = if more_candidates {
+            chat_request.clone()
+        } else {
+            std::mem::take(&mut chat_request)
+        };
+        let response = proxy_integrated_chat(
+            provider,
+            request,
+            target,
+            protocol,
+            client_model.clone(),
+            client_streaming,
+            state.config.as_ref(),
+        )
+        .await;
+
+        if response.status().is_success() {
+            proxy_stats().record_intercept_redirect(name);
+            if let Some(key) = conversation_key {
+                sticky_routes().insert(
+                    key,
+                    name.clone(),
+                    state.config.integrated.sticky_ttl_secs,
+                    state.config.integrated.sticky_capacity,
+                );
+            }
+            if !skipped.is_empty() || !failed.is_empty() {
+                audit.note_failover(&skipped, &failed);
+            }
+            audit.record_destination(provider, &target.model);
+            return InterceptionOutcome::Respond(response);
+        }
+
+        let status = response.status();
+        error!(
+            target = name,
+            provider = target.provider,
+            model = target.model,
+            status = %status,
+            "integrated redirect failed"
         );
         crate::stats::error_log().record(
             &target.provider,
             "integrated redirect",
-            format!("{target_name} failed with HTTP {}", response.status()),
+            format!("{name} failed with HTTP {status}"),
         );
-        // The request reached a generation endpoint, so a fall-through could
-        // duplicate work or spend. Surface the original failure instead.
-        proxy_stats().record_intercept_error();
-        audit.set_error(format!("HTTP {}", response.status()));
-        audit.record_destination(provider, &target.model);
-        InterceptionOutcome::Respond(response)
+        failed.push(format!("{name}: HTTP {status}"));
+        last = Some((name.clone(), response));
+        if !crate::health::status_is_failover_worthy(status.as_u16()) {
+            break;
+        }
     }
+
+    if let Some(key) = conversation_key {
+        sticky_routes().remove(key);
+    }
+    // The request reached a generation endpoint, so a fall-through to normal
+    // routing could duplicate work or spend. Surface the upstream failure.
+    proxy_stats().record_intercept_error();
+    audit.note_failover(&skipped, &failed);
+    let Some((name, response)) = last else {
+        // Every candidate was skipped as unavailable, so nothing was sent.
+        let message = format!(
+            "every integrated route for {target_name:?} is unavailable ({})",
+            skipped.join(", ")
+        );
+        let request_id = audit.audit.request_id.clone();
+        audit.set_error(message.clone());
+        audit.record();
+        return InterceptionOutcome::Respond(interceptor_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &request_id,
+            message,
+        ));
+    };
+    let target = state
+        .config
+        .integrated
+        .targets
+        .get(&name)
+        .expect("failed integrated target missing");
+    let provider = state
+        .providers
+        .get(&target.provider)
+        .expect("failed integrated provider missing");
+    audit.set_error(format!("HTTP {}", response.status()));
+    audit.record_destination(provider, &target.model);
+    InterceptionOutcome::Respond(response)
 }
 
 fn fallback_or_error(
@@ -1584,6 +1883,7 @@ pub(super) fn build_local_request(
     {
         return Err(format!("request already defines a tool named {name}"));
     }
+    let routable = routable_targets(&proxy_config.integrated, crate::health::provider_health());
     if integrated {
         for name in proxy_config.integrated.targets.keys() {
             if tools
@@ -1602,11 +1902,13 @@ pub(super) fn build_local_request(
     }
     if integrated {
         tools.extend(
-            proxy_config
-                .integrated
-                .targets
+            routable
                 .iter()
-                .map(|(name, target)| redirect_tool(name, target)),
+                .map(|name| {
+                    let target = &proxy_config.integrated.targets[name];
+                    redirect_tool(name, target)
+                })
+                .collect::<Vec<_>>(),
         );
     }
 
@@ -1646,7 +1948,8 @@ pub(super) fn build_local_request(
     );
     if integrated {
         dynamic_instructions.push_str("\n\nIntegrated provider routes:");
-        for (name, target) in &proxy_config.integrated.targets {
+        for name in &routable {
+            let target = &proxy_config.integrated.targets[name];
             dynamic_instructions.push_str(&format!(
                 "\nCall {name} when: {}. Destination: {}/{} with {} reasoning effort.{}",
                 target.hint.trim(),

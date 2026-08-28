@@ -134,6 +134,8 @@ fn router(state: AdminState) -> Router {
         .route("/api/stats/reset", post(api_stats_reset))
         .route("/api/spend", get(api_spend))
         .route("/api/spend/reset", post(api_spend_reset))
+        .route("/api/health", get(api_health))
+        .route("/api/health/reset", post(api_health_reset))
         .route("/api/logs", get(api_logs))
         .route("/api/logs/clear", post(api_logs_clear))
         .route("/api/errors", get(api_errors))
@@ -446,6 +448,17 @@ async fn api_stats(State(state): State<AdminState>) -> Response {
 
 async fn api_stats_reset() -> Response {
     proxy_stats().reset();
+    Json(json!({ "ok": true })).into_response()
+}
+
+/// Provider health, so an absorbed outage is reported here rather than to the
+/// caller mid-task.
+async fn api_health() -> Response {
+    Json(crate::health::provider_health().snapshot_json()).into_response()
+}
+
+async fn api_health_reset() -> Response {
+    crate::health::provider_health().reset();
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -852,6 +865,7 @@ async fn apply_config_change(
     }
 
     let auto_mapping = config.model_routing == ModelRoutingMode::Remap;
+    crate::health::provider_health().configure(config.health);
     let new_state = AppState {
         forward_caller_credentials: !config.integrated.enabled,
         config: Arc::new(config),

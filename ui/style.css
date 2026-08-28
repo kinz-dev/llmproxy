@@ -106,6 +106,28 @@ code.mono { font-size: 0.85em; color: var(--muted); }
 
 .meta-item { display: inline-flex; align-items: center; gap: 7px; }
 
+/* Masthead action — the Help link on every admin page, and the way back from
+   the guide. It reads as an action rather than as another readout, so it is
+   bordered; it stays in the neutral chrome range because it carries no
+   local/external meaning. */
+
+.masthead-action {
+  color: var(--muted);
+  text-decoration: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  padding: 5px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.masthead-action:hover { color: var(--ink); border-color: var(--muted); }
+.masthead-action .action-glyph { color: var(--focus); font-weight: 600; }
+
 .lamp {
   width: 8px; height: 8px; border-radius: 50%;
   background: var(--faint);

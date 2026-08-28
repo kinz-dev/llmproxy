@@ -1,0 +1,1253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llmproxy · help</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1 15 8 8 15 1 8Z' fill='%230F1517'/%3E%3Cpath d='M8 3.5 12.5 8 8 12.5Z' fill='%23E8A33D'/%3E%3Cpath d='M8 3.5 3.5 8 8 12.5Z' fill='%233ECF8E'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/help.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M8 1 15 8 8 15 1 8Z" fill="none" stroke="currentColor" stroke-width="1"/>
+        <path d="M8 3.5 12.5 8 8 12.5Z" fill="var(--external)"/>
+        <path d="M8 3.5 3.5 8 8 12.5Z" fill="var(--local)"/>
+      </svg>
+      <h1 class="brand-name">llmproxy <span class="brand-sub">help</span></h1>
+    </div>
+    <div class="masthead-meta mono">
+      <a class="masthead-action" href="/#/overview">
+        <span class="action-glyph" aria-hidden="true">&larr;</span>Back to admin</a>
+    </div>
+  </div>
+</header>
+
+<div class="app-shell">
+  <aside class="rail">
+    <nav class="help-toc" aria-label="Guide contents">
+      <div class="toc-search">
+        <input class="input mono" id="help-filter" type="search"
+          placeholder="filter — press /" aria-label="Filter the guide">
+      </div>
+      <div class="toc-group">
+        <span class="toc-label">Start</span>
+        <a class="toc-link" href="#start">Getting started</a>
+        <a class="toc-link" href="#concepts">Core concepts</a>
+      </div>
+      <div class="toc-group">
+        <span class="toc-label">Routing</span>
+        <a class="toc-link" href="#verbs">In-band verbs</a>
+        <a class="toc-link" href="#sticky">Sticky bounds</a>
+        <a class="toc-link" href="#embedding">Embedding cache</a>
+        <a class="toc-link" href="#speculative">Speculative triage</a>
+        <a class="toc-link" href="#project-overlay">Project overlay</a>
+        <a class="toc-link" href="#failover">Failover and health</a>
+      </div>
+      <div class="toc-group">
+        <span class="toc-label">Evidence</span>
+        <a class="toc-link" href="#spend">Spend and insight</a>
+        <a class="toc-link" href="#leaderboard">Model leaderboard</a>
+        <a class="toc-link" href="#shadow">Shadow requests</a>
+        <a class="toc-link" href="#second-opinion">Second opinion</a>
+      </div>
+      <div class="toc-group">
+        <span class="toc-label">Safety</span>
+        <a class="toc-link" href="#reject">Reject sensitive</a>
+        <a class="toc-link" href="#redact">Redact and route</a>
+      </div>
+      <div class="toc-group">
+        <span class="toc-label">Memory</span>
+        <a class="toc-link" href="#project-memory">Shared project memory</a>
+      </div>
+      <div class="toc-group">
+        <span class="toc-label">Platform</span>
+        <a class="toc-link" href="#corpus">Regression suite</a>
+        <a class="toc-link" href="#ribbons">Flow ribbons</a>
+        <a class="toc-link" href="#trimming">Triage trimming</a>
+        <a class="toc-link" href="#diagnostics">Logs and diagnostics</a>
+      </div>
+      <div class="toc-group">
+        <span class="toc-label">Reference</span>
+        <a class="toc-link" href="#ui-map">Where things live</a>
+        <a class="toc-link" href="#cli">Command line</a>
+        <a class="toc-link" href="#interactions">What disables what</a>
+        <a class="toc-link" href="#troubleshooting">Troubleshooting</a>
+        <a class="toc-link" href="#further">Further reading</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main class="content help-content">
+    <header class="page-head">
+      <div>
+        <p class="page-kicker mono">Reference / User guide</p>
+        <h2>Everything llmproxy does, and why</h2>
+        <p class="help-lede">Each feature below answers the same six questions in the same
+          order: what it is, why it was built, how to switch it on, how to drive it, where
+          to watch it work, and what it costs you. Press <code>/</code> to filter.</p>
+      </div>
+    </header>
+
+    <p class="filter-empty" id="filter-empty" hidden>Nothing in the guide matches that filter.</p>
+
+    <!-- ============================== START ============================== -->
+
+    <section class="help-section" id="start">
+      <h2>Getting started</h2>
+      <p class="section-intro">llmproxy is a local-first proxy that sits between your agent
+        CLIs — Codex, Claude Code, Copilot CLI — and every model provider you use. Because
+        it is the only component that sees all of them, it can do things none of them can do
+        for themselves: route each request to the model that suits it, absorb an outage,
+        remember what an earlier session learned, and price the whole thing.</p>
+
+      <article class="panel feature" id="install" data-terms="install start stop restart daemon config.toml discovery LLMPROXY_CONFIG shutdown">
+        <p class="panel-label">01</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Starting and stopping</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">basics</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>One background daemon per listen address. Starting again reuses the running
+            one rather than launching a second, so every agent session shares a single
+            router, a single decision audit, and a single spend ledger.</p></dd>
+
+          <dt>Use it</dt>
+          <dd>
+            <pre class="command mono">cargo build --release
+cp llmproxy.example.toml config.toml   # then edit it
+./target/release/llmproxy              # start or reuse
+llmproxy --restart                     # replace the running daemon
+llmproxy --shutdown                    # stop it</pre>
+            <p>Startup prints the proxy address, the admin address, and the log file path.</p>
+          </dd>
+
+          <dt>Config</dt>
+          <dd><p>Discovery order is <code>--config</code>, then <code>LLMPROXY_CONFIG</code>,
+            then <code>./config.toml</code>, then <code>~/.llmproxy/config.toml</code>. Your
+            local <code>config.toml</code> is git-ignored because it holds credentials;
+            <code>llmproxy.example.toml</code> is the documented, credential-free reference.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p class="callout">Editing the config file does not make the change live on its
+            own. Either restart, or make the edit through this admin interface, which
+            validates and swaps the running state atomically.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="admin-ui" data-terms="admin ui enable loopback port 11180 web interface">
+        <p class="panel-label">02</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Turning on this interface</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">basics</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>A loopback-only web interface for watching and editing the running proxy.
+            Nothing else in this guide is visible without it.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[admin]
+enable = true
+# listen_address = "127.0.0.1:11180"   # omit for a random port</pre>
+            <p>Then <code>llmproxy --restart</code>. The URL is printed at startup and
+              repeated in the footer of the admin pages.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p class="callout">The admin interface is <strong>unauthenticated by
+            design</strong> and must stay bound to loopback. Do not expose it on a routable
+            address or put it behind a tunnel.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="modes" data-terms="proxy intercept integrated mode auto launcher codex claude copilot agent">
+        <p class="panel-label">03</p>
+        <div class="feature-head">
+          <h3 class="feature-title">The three modes, and launching an agent</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">basics</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>Every launcher runs in one of three modes. The mode decides how much say the
+            proxy has over where a request goes.</p>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead><tr><th>mode</th><th>what happens</th><th>use it when</th></tr></thead>
+                <tbody>
+                  <tr><td class="mono">--proxy</td><td>pure protocol adapter: every generation goes to the default provider, no routing prompt, no extra tools</td><td>you want the adapter and nothing else</td></tr>
+                  <tr><td class="mono">--intercept</td><td>a local model is asked first; it either answers, or emits <code>PASS</code> and the untouched original goes external</td><td>you want cheap local answers for the easy turns</td></tr>
+                  <tr><td class="mono">--integrated</td><td>the agent's model becomes <code>Auto</code> and a local triage model picks one of your <code>[integrated.targets.*]</code></td><td>the default, and what the rest of this guide assumes</td></tr>
+                </tbody>
+              </table>
+            </div></dd>
+
+          <dt>Use it</dt>
+          <dd><pre class="command mono">llmproxy --codex                    # integrated is the default mode
+llmproxy --claude
+llmproxy --copilot
+
+llmproxy --proxy --claude           # explicit overrides
+llmproxy --intercept --codex
+llmproxy --integrated --copilot
+
+llmproxy --claude -- --model sonnet # arguments after -- go to the agent</pre></dd>
+
+          <dt>See it</dt>
+          <dd><p><span class="where">Overview &rsaquo; Start an agent</span> builds the exact
+            command for the agent and mode you pick, ready to copy.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>An explicit model bypasses integrated triage. Only <code>Auto</code> — which
+            the integrated launchers set for you — reaches the router. A named alias or a
+            <code>provider/model</code> pair always wins outright.</p></dd>
+        </dl>
+      </article>
+    </section>
+
+    <!-- ============================= CONCEPTS ============================ -->
+
+    <section class="help-section" id="concepts">
+      <h2>Core concepts</h2>
+      <p class="section-intro">Five nouns carry the whole system. Everything after this
+        section is built out of them.</p>
+
+      <article class="panel feature" id="concept-list" data-terms="provider target hint strength triage alias project ROUTE_DEFAULT default catch-all">
+        <p class="panel-label">04</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Providers, targets, triage, aliases, projects</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">vocabulary</span></div>
+        </div>
+        <dl class="spec">
+          <dt>Provider</dt>
+          <dd><p>An upstream connection: a <code>kind</code> that selects the wire protocol
+            (<code>openai-compatible</code>, <code>openai</code>, <code>anthropic</code>,
+            <code>copilot</code>), a base URL, and a credential. Credentials are either
+            proxy-owned (<code>api_key_env</code>) or a borrowed CLI login
+            (<code>auth = "codex-oauth"</code> / <code>"claude-oauth"</code>), which bills
+            against your plan instead of per token.</p>
+            <p><span class="where">Providers</span> edits these one at a time; saving
+              rebuilds only that connection.</p></dd>
+
+          <dt>Target</dt>
+          <dd><p>A named destination the router can choose: a provider, a model, and a
+            <code>hint</code> in plain English describing the work it owns. The hint is what
+            the triage model actually reads, so it is the highest-leverage string in your
+            config. Optional extras: <code>reasoning_effort</code>,
+            <code>strength</code> (higher is stronger; only the ordering matters),
+            <code>failover</code>, <code>second_opinion</code>, and <code>default</code>.</p>
+            <p>Exactly one target may set <code>default = true</code>. That is the catch-all
+              — <code>ROUTE_DEFAULT</code> resolves to it instead of falling through to
+              first-upstream-model discovery.</p>
+            <p><span class="where">Routing &rsaquo; Triage setup &rsaquo; Integrated targets</span></p></dd>
+
+          <dt>Triage</dt>
+          <dd><p>A separate request to a small local model, carrying a copy of the
+            conversation and one zero-argument tool per target. Whichever tool it calls is
+            the route. The copy never mutates the request that goes upstream, and caller
+            credentials never reach the local provider.</p>
+            <p><span class="where">Routing &rsaquo; Policy &amp; test</span> is where you
+              edit the routing policy and test a single prompt against it.</p></dd>
+
+          <dt>Alias</dt>
+          <dd><p>A stable client-facing model name pinned to one provider and model, so a
+            tool that hardcodes <code>gpt-5.4</code> can be pointed anywhere. Any configured
+            provider can also be addressed directly as <code>provider/model</code> without
+            declaring an alias first.</p>
+            <p><span class="where">Models</span></p></dd>
+
+          <dt>Project</dt>
+          <dd><p>The repository a session is working in, identified by the nearest
+            <code>.llmproxy.toml</code> at or above the working directory. It scopes routing
+            overlays, spend attribution, and shared memory. See
+            <a class="panel-link" href="#project-overlay">Project overlay</a>.</p></dd>
+        </dl>
+      </article>
+    </section>
+
+    <!-- ============================== ROUTING ============================= -->
+
+    <section class="help-section" id="routing">
+      <h2>Routing</h2>
+      <p class="section-intro">Six features shape where a request ends up. They compose: a
+        verb beats a sticky pin, a sticky pin beats the cache, the cache beats triage, and
+        health beats all of them by removing a provider from consideration entirely.</p>
+
+      <article class="panel feature" id="verbs" data-terms="verbs triage: unstick: local: default: remember: recall: forget: prefix in-band message header escape backslash">
+        <p class="panel-label">05</p>
+        <div class="feature-head">
+          <h3 class="feature-title">In-band routing verbs</h3>
+          <div class="feature-tags">
+            <span class="badge badge-neutral mono">routing</span>
+            <span class="badge badge-local mono">on by default</span>
+          </div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>A small closed set of words recognised at the very start of your newest
+            message, which override routing for that turn and are stripped before anything
+            is forwarded.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>Agent CLIs give you no way to set a per-message header. The message text is
+            the only channel back into the router, so it had to become one — but only
+            narrowly. The set is closed, matched exactly, and only at the start of the newest
+            message, because a loose match would silently eat a sentence you meant to send.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[integrated]
+verbs = true</pre>
+            <p><span class="where">Routing &rsaquo; Triage setup &rsaquo; Recognise routing verbs</span></p></dd>
+
+          <dt>Use it</dt>
+          <dd>
+            <ul class="help-list">
+              <li><span class="verb">triage:</span> re-run routing for this message, ignoring the pin</li>
+              <li><span class="verb">unstick:</span> drop the conversation's pin entirely</li>
+              <li><span class="verb">local:</span> answer here, with the routing tools withheld</li>
+              <li><span class="verb">default:</span> take the catch-all target</li>
+              <li><span class="verb">backend:</span> — any target name — pin that route directly, with no triage latency at all</li>
+              <li><span class="verb">remember:</span> <span class="verb">recall:</span> <span class="verb">forget:</span> manage <a class="panel-link" href="#project-memory">project memory</a></li>
+              <li><span class="verb">\local:</span> a leading backslash sends the word literally</li>
+            </ul></dd>
+
+          <dt>See it</dt>
+          <dd><p><span class="where">Activity &rsaquo; Decisions</span> — the card's reason
+            names the verb that decided the route.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>Recognised prefixes are stripped from <em>every</em> user turn, not only the
+            newest, so the triage model can never read a stale directive as if it were
+            current. While verbs are on, a target may not be named after one.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="sticky" data-terms="sticky ttl conversation pin absolute turns escalate demote strength drift retriage session">
+        <p class="panel-label">06</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Sticky routing and its bounds</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">routing</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>One conversation stays on one provider, so a multi-turn task does not
+            wander between models mid-thought. Four independent bounds decide when that
+            choice is reconsidered.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>The TTL alone was a sliding window: agent CLIs send a session header on
+            every turn, and each successful redirect re-inserted the entry, so the
+            <em>first</em> message of a session chose the route and kept it for as long as
+            you kept working. No value of <code>sticky_ttl_secs</code> changed that, because
+            it only ever governed idle gaps. The other three bounds exist because they each
+            bound something the TTL does not.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[integrated]
+sticky_ttl_secs = 1800           # idle gap only — slides on every turn
+sticky_absolute_ttl_secs = 3600  # from the decision, never refreshed
+sticky_max_turns = 0             # N turns then reconsider; 0 disables
+sticky_policy = "escalate"       # or "pin"
+sticky_capacity = 1024</pre>
+            <p><span class="where">Routing &rsaquo; Triage setup &rsaquo; Sticky routing</span></p></dd>
+
+          <dt>Use it</dt>
+          <dd>
+            <ul class="help-list">
+              <li><strong>Absolute TTL</strong> — measured from when the route was chosen and
+                never refreshed, so a long session is periodically re-triaged even under
+                continuous use. <em>This is the setting that actually bounds active work.</em></li>
+              <li><strong>Turn bound</strong> — a pin serves at most N turns.</li>
+              <li><strong>Drift</strong> — with embeddings on, a request far enough from the
+                one that pinned the route reconsiders it. Set
+                <code>[integrated.embedding] retriage_below</code>.</li>
+              <li><strong>Escalate, never demote</strong> — under
+                <code>sticky_policy = "escalate"</code> a re-triage may move the session up
+                the <code>strength</code> ordering but never back down, so cost control
+                survives without pinning quality to whatever the first message happened to be.</li>
+            </ul></dd>
+
+          <dt>See it</dt>
+          <dd><p><span class="where">Activity &rsaquo; Decisions</span> distinguishes a
+            <code>sticky</code> reuse from a fresh decision and names the bound that expired.
+            When the escalate policy blocks a demotion the reason says so explicitly.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="embedding" data-terms="embedding cache vector similarity cosine threshold retry escalation re-ask dissatisfaction drift distillation">
+        <p class="panel-label">07</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Embedding-cached routing and retry escalation</h3>
+          <div class="feature-tags">
+            <span class="badge badge-neutral mono">routing</span>
+            <span class="badge badge-external mono">needs an embeddings provider</span>
+          </div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>One local embedding per request buys three things at once: a cache that
+            replays a near-identical past decision without calling the triage model at all,
+            the drift check that reconsiders a pinned route, and retry detection that treats
+            a re-ask as dissatisfaction and moves the request up one rank.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>Every routing decision is already audited with its prompt, so embedding the
+            request and matching it against that audit turns the audit into a cache for free:
+            triage cost drops, and identical requests route identically by construction
+            rather than by luck.</p>
+            <p>Retry escalation exploits a signal only the proxy can see. Re-asking the same
+            question a different way is dissatisfaction, and it is visible here: same
+            conversation, near-identical embedding, <em>no intervening tool use</em>. That
+            last condition is what keeps it honest — a similar follow-up after the agent has
+            run tools is ordinary iteration, and escalating that would just cost money.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[providers.embeddings]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:18000/v1"
+
+[integrated.embedding]
+enabled = true
+provider = "embeddings"
+model = "Qwen/Qwen3-Embedding-0.6B"
+threshold = 0.94        # replay a past decision at or above this
+retriage_below = 0.0    # drift check; 0 disables
+retry_escalation = true
+retry_threshold = 0.93
+capacity = 2048
+ttl_secs = 86400
+timeout_ms = 2000</pre>
+            <p><span class="where">Routing &rsaquo; Triage setup &rsaquo; Embedding-cached routing</span></p></dd>
+
+          <dt>Use it</dt>
+          <dd><p>Nothing to drive — all three are automatic. Retry escalation is the one you
+            will feel: ask again in different words and the next answer comes from a stronger
+            route, silently, with no setting to reason about at the call site.</p></dd>
+
+          <dt>See it</dt>
+          <dd><p>Live cache statistics sit directly under that block. Escalations appear in
+            <span class="where">Activity &rsaquo; Decisions</span> as <em>"the request
+            repeated a recent one with no intervening tool use, so it was escalated"</em>.
+            The same signal feeds the <a class="panel-link" href="#leaderboard">leaderboard</a>.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>Only replayable outcomes are cached: a rejection or a malformed control is
+            always re-derived, and a cached decision naming a target you have since deleted
+            is pruned rather than replayed. Every embedding failure is soft — routing never
+            depends on the cache being reachable.</p>
+            <p class="callout"><strong>All three are disabled</strong> while
+              <a class="panel-link" href="#reject">reject sensitive</a> is on, because a
+              cached decision would skip screening that must fail closed.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="speculative" data-terms="speculative concurrent latency round trip cancel wasted tokens default">
+        <p class="panel-label">08</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Speculative triage</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">routing</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>The triage call and the presumed catch-all route are issued at the same time
+            and the loser is cancelled, taking the triage round trip off the critical path.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>Most requests go to the catch-all. Waiting for triage to confirm what it was
+            probably going to say is latency you can trade for tokens — and it is a trade you
+            can measure, because the decision audit records how often triage disagreed.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[integrated]
+speculative = true   # requires exactly one target with default = true</pre>
+            <p><span class="where">Routing &rsaquo; Triage setup &rsaquo; Speculate the default route</span></p></dd>
+
+          <dt>See it</dt>
+          <dd><p><span class="where">Activity &rsaquo; Decisions</span> — the reason ends with
+            <em>"the route was speculated on concurrently with triage"</em>. Compare the
+            triage latency in the card footers before and after.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>Buffered speculation never reaches the conversation: if triage disagrees the
+            task is aborted and its output dropped. It never runs with sensitive screening on
+            — that would put the prompt in front of a provider before it had been screened —
+            and never when a verb has already decided the route.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="project-overlay" data-terms="project .llmproxy.toml overlay repository per-repo scope untrusted clone merge model_aliases">
+        <p class="panel-label">09</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Project-scoped routing overlay</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">routing</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>A <code>.llmproxy.toml</code> in a repository, defining routes that apply
+            only while you are working in it. One daemon still serves every project.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>Different repositories want different routing, and the natural place to
+            record that is beside the code. The hard constraint is that a project file lives
+            in a repository, and <strong>cloning an untrusted repository must not be able to
+            decide where your prompts are sent or which key pays for them</strong>. So a
+            project file may define only routes and aliases, and every provider it names must
+            already exist in your user config — anything else is rejected by name.</p></dd>
+
+          <dt>Use it</dt>
+          <dd><pre class="command mono"># &lt;repo&gt;/.llmproxy.toml
+[integrated.targets.docs]
+provider = "anthropic"          # must already exist in your user config
+model = "claude-sonnet-4-5"
+hint = "documentation and prose work in this repository"
+
+[model_aliases]
+project-fast = { provider = "openai", model = "gpt-5.4-mini" }</pre>
+            <p>A launcher finds the nearest one at or above the working directory.
+              <code>--project &lt;dir&gt;</code> overrides it; <code>--no-project</code>
+              disables it for that launch.</p></dd>
+
+          <dt>See it</dt>
+          <dd><p>The project name keys the selectors in
+            <span class="where">Activity &rsaquo; Spend</span> and
+            <span class="where">Routing &rsaquo; Project memory</span>. Merged project targets
+            appear in the targets table like any other.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>Project targets merge with your user-level ones and win on a name collision;
+            nothing user-level is removed. Validation rejects a second
+            <code>default = true</code> after the merge. The scope travels to the daemon as a
+            path inside the session token, and because that token is unsigned the daemon
+            re-reads the file and re-validates it rather than trusting anything the token
+            claimed.</p>
+            <p class="callout">Still open: two routes whose hints overlap have no tie-break.
+              Keep hint wording disjoint.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="failover" data-terms="failover circuit breaker health 429 rate limit quota outage backoff half-open probe fallback_on_error">
+        <p class="panel-label">10</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Failover, quota, and circuit breaking</h3>
+          <div class="feature-tags">
+            <span class="badge badge-neutral mono">routing</span>
+            <span class="badge badge-local mono">on by default</span>
+          </div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>A target may name an ordered chain of other targets to try when it is
+            unavailable. Separately, per-provider health tracking routes around a provider
+            that is rate-limited or circuit-open.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>Rate-limit exhaustion mid-task is the sharpest failure in agent-assisted
+            work, and the proxy owns every provider credential, so it is the one component
+            that can absorb it: exhausted on A, continue on B, reported here rather than to
+            the caller. Quota and outage are tracked separately because they need different
+            recoveries — a 429 carries a duration the provider tells us about, while an
+            outage gets exponential backoff behind a single half-open probe.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[integrated.targets.routine]
+failover = ["backend"]        # per target
+
+[integrated]
+failover = ["PROVIDER_DEFAULT"]   # default chain for targets without one
+
+[health]
+enabled = true
+failure_threshold = 4
+open_secs = 30
+max_open_secs = 600
+max_rate_limit_secs = 900</pre>
+            <p><span class="where">Routing &rsaquo; Triage setup</span> has a
+              <strong>failover</strong> column on every target row;
+              <span class="where">Settings &rsaquo; Provider health and circuit breaking</span>
+              holds the thresholds.</p></dd>
+
+          <dt>See it</dt>
+          <dd><p>That same Settings disclosure carries a <strong>live health table</strong> —
+            provider, status, ok, failed, retry-in, last error — with a <em>Clear health
+            state</em> button. Failover events append <em>"Failover&nbsp;&hellip;"</em> to the
+            reason in <span class="where">Activity &rsaquo; Decisions</span>.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>Failover fires only on a non-success status, which means the provider
+            rejected the request before generating anything — so no work is billed or
+            produced twice. An unhealthy provider is also withheld from the triage tool list
+            so the model picks a working route in the first place, <em>unless</em> withholding
+            would leave nothing: an empty route list is worse than an optimistic one.</p></dd>
+        </dl>
+      </article>
+    </section>
+
+    <!-- ============================= EVIDENCE ============================ -->
+
+    <section class="help-section" id="evidence">
+      <h2>Evidence and cost</h2>
+      <p class="section-intro">Four features that turn "which model should I use" from an
+        opinion into something you can look up. All of them are built on traffic that already
+        happened in your repository, not on a public benchmark.</p>
+
+      <article class="panel feature" id="spend" data-terms="spend cost pricing tokens cache_read cache_write ledger usage.json subscription insight estimated currency">
+        <p class="panel-label">11</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Spend meter and cost insight</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">evidence</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>Live per-project spend priced from your own rate table, plus the insight
+            built on it: a proposed routing change, with the exact payload the routing editor
+            takes.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>Four things would each have made the number untrustworthy, so each is handled
+            explicitly rather than approximated:</p>
+            <ul class="help-list">
+              <li><strong>Rates change</strong>, so config is the only source of truth and
+                nothing is hardcoded. An exact model id wins, then the longest configured
+                prefix, then <code>*</code>.</li>
+              <li><strong>Cached tokens</strong> read at a steep discount and write at a
+                premium, so a naive input-token multiplication overstated agent traffic
+                badly. Cache counts now reach the ledger through every protocol adapter,
+                normalised onto one convention.</li>
+              <li><strong>Estimated counts</strong> are labelled as approximations rather
+                than presented as precise figures.</li>
+              <li><strong>Counters survive a restart</strong> in a month-bucketed ledger
+                under <code>~/.llmproxy</code>. It stores counters, never prices, so
+                correcting a rate re-prices history instead of leaving a stale number behind.</li>
+            </ul>
+            <p>And cost alone is never a reason to move a route. Pairing the spend figure
+              with observed satisfaction is what stops the insight from recommending its way
+              into a worse outcome.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[providers.openai.pricing]
+currency = "USD"
+# subscription = true   # bills against a plan: volume only, never a dollar figure
+
+[providers.openai.pricing.models."gpt-5.4"]
+input = 1.25          # per million tokens, as vendors publish them
+output = 10.0
+cache_read = 0.125    # defaults to the input rate when unset
+cache_write = 1.5625</pre></dd>
+
+          <dt>See it</dt>
+          <dd><p><span class="where">Activity &rsaquo; Spend</span> — month and project
+            selectors, totals for input, cache, and output, breakdowns by project and by
+            model, and <em>Reset ledger</em>. A summary tile also sits on
+            <span class="where">Overview</span>.</p>
+            <p><strong>Cost insight</strong> is on the same page. When a cheaper route has
+              enough evidence behind it and is not observably worse, you get a card reading
+              <code>target: from &rarr; to</code> with cost per answer, sample sizes,
+              satisfaction on both sides and the observed saving — and an <em>Apply routing
+              change</em> button that writes it straight into the target.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>A provider with <code>subscription = true</code> reports token volume and no
+            dollar figure, because a figure there would be a fiction. A provider with no
+            pricing table reads as "unpriced" everywhere — never as zero.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="leaderboard" data-terms="leaderboard ranking satisfaction re-ask sample size floor hint candidates rank benchmark">
+        <p class="panel-label">12</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Personal model leaderboard</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">evidence</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>A per-project ranking of the models this proxy actually routed to, scored on
+            the aftermath it can observe: an immediate re-ask with no intervening tool use,
+            an error, a broken stream.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>Public benchmarks rank models on generic tasks. What you want to know is
+            which model does well on <em>your</em> work in <em>this</em> repository — and the
+            proxy is already watching the aftermath of every answer, which is free implicit
+            labelling. That yields a per-project ranking rather than an average one.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><p>Nothing beyond a writable <code>~/.llmproxy</code>. It scores best with
+            <code>retry_escalation</code> on, since a re-ask is the strongest label available.</p></dd>
+
+          <dt>See it</dt>
+          <dd><p><span class="where">Activity &rsaquo; Spend</span>, below Cost insight:
+            rank, provider, model, answers, retried, failed, satisfaction, cost per answer.</p>
+            <p>Underneath it, <strong>hint candidates</strong> proposes the terms that
+              distinguish one target's observed prompts from the rest — useful raw material
+              for rewriting a <code>hint</code>.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>Rows below the sample-size floor are shown but never ranked: a rank derived
+            from a handful of requests is noise wearing a number's clothes. The panel names
+            the current floor rather than leaving you to guess it. Cost breaks ties rather
+            than driving the order, because a cheap route that gets re-asked is not cheap.
+            Hint candidates are a frequency contrast, not a topic model, and are offered for
+            you to edit rather than applied automatically.</p>
+            <p class="callout">Still open: the signal set is small. Whether you reverted an
+              edit is the strongest label there is, and the proxy cannot see it without
+              watching the repository.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="shadow" data-terms="shadow sampling one-in-N diff comparison overlap buffered evidence provider choice">
+        <p class="panel-label">13</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Shadow requests</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">evidence</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>A sampled share of requests is also sent to a second target. One answer is
+            returned to you; both are recorded and diffed here.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>It turns "is the expensive provider actually better" into something you can
+            read side by side on your own prompts, at a cost you choose.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[integrated.shadow]
+enabled = true
+target = "PROVIDER_DEFAULT"
+sample_one_in = 20
+timeout_ms = 120000</pre>
+            <p><span class="where">Routing &rsaquo; Triage setup &rsaquo; Shadow requests</span></p></dd>
+
+          <dt>See it</dt>
+          <dd><p><span class="where">Activity &rsaquo; Shadow</span> — paired cards with the
+            prompt, both answers, and a word-overlap percentage. The second answer is labelled
+            <em>"never seen by the caller"</em>. This feed polls only while its tab is open,
+            because each entry carries two whole answers.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>Sampled requests are <strong>buffered rather than streamed</strong>, because
+            a diff needs both complete answers. That is the reason to keep the rate low.
+            Sampling is an exact one-in-N counter rather than a random draw, so the observed
+            rate is exact and a replay is reproducible.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="second-opinion" data-terms="second opinion present reconcile disagreement agreement two providers consequential design decision">
+        <p class="panel-label">14</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Second opinion on consequential requests</h3>
+          <div class="feature-tags">
+            <span class="badge badge-neutral mono">evidence</span>
+            <span class="badge badge-external mono">config file only</span>
+          </div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>Opt in per target: two providers answer the same request and both are shown,
+            or a third reconciles them while being told to name the disagreements rather than
+            smooth them over.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>Agreement is signal; divergence is the stronger one, and nothing else
+            surfaces it. Reconciliation is told explicitly not to smooth, because a smoothed
+            answer destroys the only thing a second opinion produces.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[integrated.targets.design.second_opinion]
+target = "frontend"
+mode = "present"          # or "reconcile"
+reconciler = "backend"    # required for mode = "reconcile"</pre>
+            <p class="callout"><strong>There is no editor for this in the interface.</strong>
+              Use <span class="where">Settings &rsaquo; Configuration file</span> or edit
+              <code>config.toml</code>. The target-row editor preserves an existing
+              <code>second_opinion</code> when you save other fields, but will not create one.</p></dd>
+
+          <dt>See it</dt>
+          <dd><p>In the agent's own answer — this is the one feature that surfaces to the
+            caller rather than to this interface. <code>present</code> returns both answers
+            under headings with an agreement note; <code>reconcile</code> returns one answer
+            that names where the two disagreed.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>A tool call on either side cancels the comparison and the request is sent
+            normally, because a composed answer is text and would silently drop the call. The
+            agreement score is a word overlap, not a semantic judgement, and is labelled as
+            such — treat divergence as a prompt to look, not as a verdict.</p>
+            <p>It costs two answers and gives up streaming for the requests it touches. That
+              is the right trade for a design decision and the wrong one for everything else,
+              which is why it is per-target rather than global.</p></dd>
+        </dl>
+      </article>
+    </section>
+
+    <!-- ============================== SAFETY ============================= -->
+
+    <section class="help-section" id="safety">
+      <h2>Safety</h2>
+      <p class="section-intro">Two answers to the same question — what should happen when a
+        prompt contains a secret. One refuses; the other substitutes and continues. Pick
+        deliberately, because the strict one switches several other features off.</p>
+
+      <article class="panel feature" id="reject" data-terms="reject_sensitive screening fail closed refuse credential secret REJECT no-action">
+        <p class="panel-label">15</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Reject sensitive prompts</h3>
+          <div class="feature-tags">
+            <span class="badge badge-neutral mono">safety</span>
+            <span class="badge badge-external mono">strict</span>
+          </div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>A mandatory screening step before any local answer or external route. A
+            prompt that fails screening gets a native, successful no-action response instead
+            of being sent anywhere.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>It fails closed: if screening cannot complete, nothing goes out. The refusal
+            reason names a safe category and never repeats the detected value.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[interceptor]
+reject_sensitive = true</pre>
+            <p><span class="where">Routing &rsaquo; Triage setup &rsaquo; Local interceptor</span></p></dd>
+
+          <dt>See it</dt>
+          <dd><p><span class="where">Activity &rsaquo; Decisions</span> — decision
+            <code>reject</code>, with the prompt shown as <em>"prompt redacted"</em> and no
+            <em>Test this prompt</em> button. Screened bodies are omitted from the trace log
+            too.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p class="callout">This is the switch with the widest blast radius. It disables
+            sticky routing, the embedding cache, drift re-triage, retry escalation,
+            speculative triage, and memory <em>writes</em> — each because they would
+            otherwise skip or outlive screening that must fail closed: every request is
+            screened and routed on its own merits. See
+            <a class="panel-link" href="#interactions">What disables what</a>. Pure
+            <code>--proxy</code> launcher sessions disable it to stay prompt-free.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="redact" data-terms="redact placeholder rehydrate secret substitute streaming private key extra_literals permissive">
+        <p class="panel-label">16</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Redact and route</h3>
+          <div class="feature-tags">
+            <span class="badge badge-neutral mono">safety</span>
+            <span class="badge badge-local mono">permissive</span>
+          </div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>Detected secrets become stable placeholders, the request routes normally,
+            and the originals are put back as the response streams.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p><code>reject_sensitive</code> is binary, which turns "there is a credential
+            in this file" into "you cannot use a good external model on this code at all".
+            Substituting placeholders converts that into "you can".</p>
+            <p>Rehydration is handled by narrowing rather than by cleverness: only values
+              that need no JSON escaping are ever spliced back, so a placeholder inside a
+              tool-call argument string is safe. Detection is prefix- and context-driven
+              rather than entropy-scored, because a false positive silently damages a prompt,
+              which is worse than a miss.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[interceptor.redact]
+enabled = true
+rehydrate = true
+extra_literals = ["build01.internal.invalid"]</pre>
+            <p><span class="where">Settings &rsaquo; Redact and route</span> — including
+              <em>extra_literals</em> as a comma-separated list, for the things detectors
+              cannot know about, such as internal hostnames.</p></dd>
+
+          <dt>Use it</dt>
+          <dd><p>Nothing to drive. The streaming rehydrator holds back a chunk tail so a
+            placeholder split across two chunks is still matched, and hands the text layer
+            only complete UTF-8.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>A value that would need JSON escaping — a private-key block — is redacted and
+            <strong>stays</strong> redacted rather than corrupting a response body.
+            Redaction never suppresses <code>reject_sensitive</code>; if both are on, the
+            strict one still applies.</p></dd>
+        </dl>
+      </article>
+    </section>
+
+    <!-- ============================== MEMORY ============================= -->
+
+    <section class="help-section" id="memory">
+      <h2>Memory</h2>
+
+      <article class="panel feature" id="project-memory" data-terms="memory remember recall forget notes cross-agent shared inject findings dead ends">
+        <p class="panel-label">17</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Cross-agent shared project memory</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">memory</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>A project-scoped store of prior findings, decisions, and dead ends, injected
+            into whichever agent is running. A note written from Codex is read by Claude
+            Code, and the other way round.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>Each agent CLI keeps its own history and shares nothing with the others. The
+            proxy sees all of them, so it is the only place this can live.</p>
+            <p>Two limits are deliberate. The store is written and read <strong>by explicit
+              direction only</strong>, because nothing else here can be undone: a wrong
+              inference would be silently prepended to every later request in the project.
+              And the injected block is hard-bounded and labelled as prior context rather
+              than as instructions, because it is paid for on every turn and read by a model
+              that will otherwise treat it as a directive.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[memory]
+enabled = true
+inject = true
+max_notes = 64
+max_note_chars = 2000
+max_injected_chars = 6000</pre>
+            <p><span class="where">Settings &rsaquo; Shared project memory</span></p></dd>
+
+          <dt>Use it</dt>
+          <dd><p>From any agent, at the start of a message:</p>
+            <pre class="command mono">remember: rayon made the parser slower, do not retry it
+recall:
+forget:</pre></dd>
+
+          <dt>See it</dt>
+          <dd><p><span class="where">Routing &rsaquo; Project memory</span> — a project
+            selector, the note list, and a form to record one by hand. Notes live in
+            <code>~/.llmproxy/memory/&lt;project&gt;.json</code>, owner-only.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>Memory writes are refused while <code>reject_sensitive</code> is on: a note
+            outlives the request that carried it, so an unscreened one would turn a single
+            exposure into a standing one.</p>
+            <p class="callout">Still open: nothing captures memory automatically. Automatic
+              extraction is the obvious next step and the obvious way to poison the store; it
+              wants an explicit review step before anything reaches injection.</p></dd>
+        </dl>
+      </article>
+    </section>
+
+    <!-- ============================= PLATFORM ============================ -->
+
+    <section class="help-section" id="platform">
+      <h2>Platform</h2>
+      <p class="section-intro">The parts that make a routing policy something you can change
+        with confidence, and watch while it runs.</p>
+
+      <article class="panel feature" id="corpus" data-terms="corpus regression replay diff CI falsifiable route-corpus capture exit code policy edit">
+        <p class="panel-label">18</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Routing regression suite</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">platform</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>Real requests captured from the decision audit, replayed against an edited
+            prompt or target set, and diffed.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>Single-shot route testing answers "where would this one prompt go". The
+            question that actually matters when you edit a policy is <em>"what did this
+            change move"</em> — and without an answer, a prompt edit is a matter of taste.
+            With one, it is falsifiable in CI.</p></dd>
+
+          <dt>Use it</dt>
+          <dd><p>In the interface:
+            <span class="where">Routing &rsaquo; Policy &amp; test &rsaquo; Routing regression suite</span>
+            — <em>Capture from decisions</em>, <em>Download corpus</em>, edit your prompt or
+            targets, then <em>Replay &amp; diff</em>.</p>
+            <p>In CI:</p>
+            <pre class="command mono">llmproxy --route-corpus corpus.json --route-corpus-mode integrated</pre>
+            <p>It exits non-zero when a decision moved. The same corpus is available at
+              <code>GET /api/route-corpus</code>.</p></dd>
+
+          <dt>See it</dt>
+          <dd><p>The results table lists only what moved, with the recorded destination beside
+            the new one.</p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>Decisions that mean the same destination compare as one — a sticky reuse and
+            a cached replay are both "it went to that target" — and a new case is not a
+            regression.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="ribbons" data-terms="flow ribbons overview diagram served_by_provider locality colour palette fan-out traffic pulse latency">
+        <p class="panel-label">19</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Per-provider flow ribbons</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">platform</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>The Overview flow diagram, with one ribbon per provider actually serving
+            traffic, thickness by volume.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>Four decisions are easy to get wrong here, so they are fixed deliberately:</p>
+            <ul class="help-list">
+              <li><strong>Colour stays bound to locality, not provider identity.</strong> The
+                whole interface encodes local and external through one mint/amber pair;
+                per-provider hues would break that. Identity is carried by stable position
+                and a direct label, so it is never colour-alone.</li>
+              <li><strong>Ribbon order is stable, never sorted by volume</strong>, or
+                providers would swap places on every poll. Group by locality, then sort
+                alphabetically; only thickness varies.</li>
+              <li><strong>The fan-out is capped</strong> at about six ribbons, beyond which
+                labels collide; the tail folds into one aggregate.</li>
+              <li><strong>Updates are keyed, not wholesale</strong>, because rebuilding the
+                nodes each poll restarts the drift animation and visibly stutters.</li>
+            </ul></dd>
+
+          <dt>See it</dt>
+          <dd><p><span class="where">Overview &rsaquo; Traffic pulse</span> — ribbons, the
+            local/external split band, p50 and p99 latency bars, and stat tiles for requests,
+            remapped, intercepted, local, external, spend, and tokens.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="trimming" data-terms="triage_max_messages trimming window conversation length cost tokenizer system message tool result">
+        <p class="panel-label">20</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Triage payload trimming</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">platform</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>The copy of the conversation sent to triage keeps every system message plus
+            the newest window of turns, instead of the whole thing.</p></dd>
+
+          <dt>Why</dt>
+          <dd><p>The whole client conversation used to be copied, so triage input grew with
+            conversation length — you paid more for routing the longer you worked. Trimming
+            also reduces the noise your route hints are matched against.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">[interceptor]
+triage_max_messages = 24   # 0 copies the whole conversation</pre>
+            <p><span class="where">Settings &rsaquo; Redact and route &rsaquo; triage_max_messages</span></p></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>The window is trimmed from the front until it starts on a user turn, so a
+            tool result never arrives without the assistant call that produced it.</p>
+            <p class="callout">Still open: the window is a message count. Trimming by token
+              budget would track the real cost more closely, at the price of a tokenizer the
+              proxy does not have.</p></dd>
+        </dl>
+      </article>
+
+      <article class="panel feature" id="diagnostics" data-terms="logs trace errors retention decisions audit event log 0600 permissions authorization header">
+        <p class="panel-label">21</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Logs, decisions, and diagnostics</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">platform</span></div>
+        </div>
+        <dl class="spec">
+          <dt>What it is</dt>
+          <dd><p>Three layers: a live traffic log and error feed here, a bounded 24-hour
+            decision audit with prompt previews, and a full request/response TRACE file on
+            disk.</p></dd>
+
+          <dt>Turn it on</dt>
+          <dd><pre class="command mono">max_logging_retention_days = 7   # 0 keeps logs indefinitely</pre>
+            <p><span class="where">Settings &rsaquo; log retention days</span>. Cleanup runs
+              at startup and removes only matching llmproxy log files.</p></dd>
+
+          <dt>See it</dt>
+          <dd>
+            <ul class="help-list">
+              <li><span class="where">Activity &rsaquo; Decisions</span> — why triage chose
+                what it chose, the requested model, triage model and latency, the finalized
+                provider and model, and any fallback error. Filter by text or outcome, and
+                send any prompt straight into the route tester.</li>
+              <li><span class="where">Activity &rsaquo; Event log</span> — live traffic and
+                recent errors, both clearable.</li>
+              <li><code>~/.llmproxy/llmproxy-yyyymmddhhmmss.log</code> — full bodies. HTTP
+                failures, stream failures, and timeouts are ERROR events.</li>
+            </ul></dd>
+
+          <dt>Caveat</dt>
+          <dd><p>Log files are owner-only (<code>0600</code> on Unix) and
+            <strong>never contain authorization headers</strong>. Screened and rejected
+            prompts are redacted in both the trace and the audit.</p></dd>
+        </dl>
+      </article>
+    </section>
+
+    <!-- ============================ REFERENCE ============================ -->
+
+    <section class="help-section" id="reference">
+      <h2>Reference</h2>
+
+      <article class="panel feature" id="ui-map" data-terms="map tabs navigation where overview activity routing models providers settings">
+        <p class="panel-label">22</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Where things live</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">reference</span></div>
+        </div>
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead><tr><th>page</th><th>what is there</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">Overview</td><td>launch command builder, active routes, per-provider flow ribbons, latency, spend and token tiles</td></tr>
+              <tr><td class="mono">Activity &rsaquo; Usage</td><td>routing distribution, provider calls, destinations, model usage</td></tr>
+              <tr><td class="mono">Activity &rsaquo; Spend</td><td>durable spend, cost insight with Apply, model leaderboard, hint candidates</td></tr>
+              <tr><td class="mono">Activity &rsaquo; Decisions</td><td>every routing decision: verb, sticky, cache replay, escalation, failover, rejection</td></tr>
+              <tr><td class="mono">Activity &rsaquo; Shadow</td><td>sampled two-provider comparisons</td></tr>
+              <tr><td class="mono">Activity &rsaquo; Event log</td><td>live traffic log and recent errors</td></tr>
+              <tr><td class="mono">Routing &rsaquo; Triage setup</td><td>interceptor, targets table, sticky bounds, verbs, failover, speculation, shadow, embeddings</td></tr>
+              <tr><td class="mono">Routing &rsaquo; Policy &amp; test</td><td>routing policy editor, single-prompt route test, regression corpus</td></tr>
+              <tr><td class="mono">Routing &rsaquo; Project memory</td><td>notes per project</td></tr>
+              <tr><td class="mono">Models</td><td>model catalog as clients see it, and alias editing</td></tr>
+              <tr><td class="mono">Providers</td><td>provider registry: kind, base URL, credential, reasoning effort, timeouts</td></tr>
+              <tr><td class="mono">Settings</td><td>protocol defaults, provider health, memory, redaction, triage trimming, raw TOML editor</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="panel feature" id="cli" data-terms="cli flags command line arguments project no-project route-corpus restart shutdown listen upstream bin">
+        <p class="panel-label">23</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Command line</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">reference</span></div>
+        </div>
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead><tr><th>flag</th><th>effect</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">--config &lt;path&gt;</td><td>config file; otherwise <code>LLMPROXY_CONFIG</code>, <code>./config.toml</code>, <code>~/.llmproxy/config.toml</code></td></tr>
+              <tr><td class="mono">--listen &lt;addr&gt;</td><td>override the listen address</td></tr>
+              <tr><td class="mono">--upstream &lt;url&gt;</td><td>override the external base URL; rejected by <code>--proxy</code> and <code>--integrated</code> launchers, which take their destination from config</td></tr>
+              <tr><td class="mono">--codex --claude --copilot</td><td>launch that agent through the proxy</td></tr>
+              <tr><td class="mono">--proxy --intercept --integrated</td><td>mode override; integrated is the default</td></tr>
+              <tr><td class="mono">--codex-bin &lt;path&gt;</td><td>agent executable; also <code>--claude-bin</code>, <code>--copilot-bin</code></td></tr>
+              <tr><td class="mono">--project &lt;dir&gt;</td><td>use this project's <code>.llmproxy.toml</code> instead of the nearest one</td></tr>
+              <tr><td class="mono">--no-project</td><td>ignore any project overlay for this launch</td></tr>
+              <tr><td class="mono">--route-corpus &lt;file&gt;</td><td>replay a corpus, print the diff, exit non-zero when a decision moved</td></tr>
+              <tr><td class="mono">--route-corpus-mode</td><td><code>intercept</code> or <code>integrated</code></td></tr>
+              <tr><td class="mono">--restart / --shutdown</td><td>replace or stop the managed daemon</td></tr>
+              <tr><td class="mono">-- &lt;args&gt;</td><td>everything after the separator is passed to the agent</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="panel feature" id="interactions" data-terms="interactions disables conflicts matrix reject_sensitive streaming buffered incompatible">
+        <p class="panel-label">24</p>
+        <div class="feature-head">
+          <h3 class="feature-title">What disables what</h3>
+          <div class="feature-tags"><span class="badge badge-external mono">read this one</span></div>
+        </div>
+        <p class="section-intro">Features that silently switch other features off. If
+          something looks dead, this table is the first place to check.</p>
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead><tr><th>when this is on</th><th>this stops happening</th><th>because</th></tr></thead>
+            <tbody>
+              <tr>
+                <td class="mono">reject_sensitive</td>
+                <td>sticky routing, embedding cache, drift re-triage, retry escalation, speculative triage, memory writes</td>
+                <td>each would skip or outlive screening that must fail closed</td>
+              </tr>
+              <tr>
+                <td class="mono">an in-band verb</td>
+                <td>speculative triage, and the sticky lookup for that turn</td>
+                <td>the route is already decided, deterministically</td>
+              </tr>
+              <tr>
+                <td class="mono">second_opinion or shadow</td>
+                <td>streaming, for the requests they touch</td>
+                <td>a diff needs both complete answers</td>
+              </tr>
+              <tr>
+                <td class="mono">a tool call in the answer</td>
+                <td>second opinion and shadow comparison for that request</td>
+                <td>a composed answer is text and would drop the call</td>
+              </tr>
+              <tr>
+                <td class="mono">--proxy</td>
+                <td>interception, integrated routing, aliases, non-default providers, and <code>reject_sensitive</code></td>
+                <td>a pure adapter session stays prompt-free</td>
+              </tr>
+              <tr>
+                <td class="mono">an explicit model</td>
+                <td>integrated triage</td>
+                <td>only <code>Auto</code> reaches the router; aliases and <code>provider/model</code> win outright</td>
+              </tr>
+              <tr>
+                <td class="mono">no embeddings provider</td>
+                <td>routing cache, drift re-triage, retry escalation</td>
+                <td>all three are embedding distances</td>
+              </tr>
+              <tr>
+                <td class="mono">subscription = true</td>
+                <td>dollar figures for that provider</td>
+                <td>a figure there would be a fiction; volume is still reported</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="panel feature" id="troubleshooting" data-terms="troubleshooting problems not working empty blank missing broken debug">
+        <p class="panel-label">25</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Troubleshooting</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">reference</span></div>
+        </div>
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead><tr><th>symptom</th><th>first thing to check</th></tr></thead>
+            <tbody>
+              <tr><td>Config edit had no effect</td><td>The file is not live on its own — restart, or edit through this interface, which validates and swaps atomically.</td></tr>
+              <tr><td>Everything goes to one provider</td><td>The agent is sending an explicit model rather than <code>Auto</code>, or the mode is <code>--proxy</code>.</td></tr>
+              <tr><td>Routing ignores a new target</td><td>Its <code>hint</code> overlaps a broader route's. Hint wording must stay disjoint — there is no tie-break yet.</td></tr>
+              <tr><td>A conversation will not change route</td><td>It is pinned. Send <span class="verb">unstick:</span>, or set <code>sticky_absolute_ttl_secs</code> / <code>sticky_max_turns</code>: the idle TTL alone bounds nothing during active work.</td></tr>
+              <tr><td>Spend shows no dollar figure</td><td>No <code>[providers.*.pricing]</code> for that provider, or it is marked <code>subscription = true</code>.</td></tr>
+              <tr><td>Leaderboard is empty or unranked</td><td>No writable <code>~/.llmproxy</code>, or rows are still below the sample-size floor.</td></tr>
+              <tr><td>Cache, escalation, or speculation never fires</td><td><code>reject_sensitive</code> is on, or no embeddings provider is configured. See <a class="panel-link" href="#interactions">What disables what</a>.</td></tr>
+              <tr><td>Shadow tab stays empty</td><td><code>[integrated.shadow] enabled</code> is off, or the sample rate has not come round yet — it is an exact one-in-N counter.</td></tr>
+              <tr><td>Second opinion never appears</td><td>It is config-file only, and either side asking for a tool call cancels it.</td></tr>
+              <tr><td>Admin UI shows a "files not found" page</td><td>The <code>ui/</code> directory is not beside the binary. Set <code>LLMPROXY_UI_DIR</code> or <code>[admin] ui_dir</code>; release builds read it once at startup, so restart after installing.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="panel feature" id="further" data-terms="further reading files README AGENTS ROADMAP example toml api">
+        <p class="panel-label">26</p>
+        <div class="feature-head">
+          <h3 class="feature-title">Further reading</h3>
+          <div class="feature-tags"><span class="badge badge-neutral mono">reference</span></div>
+        </div>
+        <ul class="help-list">
+          <li><code>llmproxy.example.toml</code> — every configuration key, credential-free, with the reasoning attached.</li>
+          <li><code>README.md</code> — the short version of this page.</li>
+          <li><code>ROADMAP.md</code> — why each feature was built the way it was, and what is still open.</li>
+          <li><code>AGENTS.md</code> — the invariants each feature must keep.</li>
+          <li>The JSON API under <code>/api/</code> serves everything this interface shows.</li>
+        </ul>
+      </article>
+    </section>
+  </main>
+</div>
+
+<footer class="footer mono">
+  <span>llmproxy user guide</span>
+  <span><a class="panel-link" href="/#/overview">Back to admin</a></span>
+</footer>
+
+<script src="/help.js"></script>
+</body>
+</html>

@@ -256,6 +256,13 @@ Without a launcher, preserve these rules:
   Routing, Models, Providers, and Settings; Activity and Routing use focused
   secondary views — Activity > Usage, Spend, Decisions, Shadow, and Event log,
   and Routing > Triage setup, Policy & test, and Project memory.
+- `ui/help.html`: the user guide, served at `/help.html` by the same static
+  fallback as the rest of `ui/` and linked from the masthead of every admin
+  page. One card per feature, each answering what it is, why it was built, how
+  to switch it on, how to drive it, where to watch it, and what it costs. It
+  calls no API, so it stays readable when the proxy is unhealthy. Keep it in
+  step with the settings it names; the recorded reasoning behind each feature
+  lives in `ROADMAP.md`.
 - `llmproxy.example.toml`: public credential-free configuration reference.
 - `ROADMAP.md`: candidate work and recorded design decisions, grouped by
   what each item delivers. Nothing in it is committed work.

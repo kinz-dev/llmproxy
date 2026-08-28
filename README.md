@@ -105,7 +105,10 @@ events. `max_logging_retention_days = 7` controls cleanup at startup, while `0`
 keeps logs indefinitely. Logs use `0600` permissions on Unix and the user's
 inherited profile ACL on Windows; they never include authorization headers.
 The loopback admin's Activity > Decisions view shows why triage chose local or
-external routing, rejected a prompt, and the finalized provider/model.
+external routing, rejected a prompt, and the finalized provider/model. The
+**Help** link in its masthead opens a full user guide at `/help.html`: one card
+per feature covering what it is, why it was built, how to switch it on, how to
+drive it, where to watch it, and what it costs.
 
 ```sh
 llmproxy              # start or reuse

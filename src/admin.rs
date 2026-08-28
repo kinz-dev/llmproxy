@@ -140,6 +140,8 @@ fn router(state: AdminState) -> Router {
         .route("/api/route-cache/clear", post(api_route_cache_clear))
         .route("/api/shadow", get(api_shadow))
         .route("/api/shadow/clear", post(api_shadow_clear))
+        .route("/api/memory", get(api_memory).post(api_memory_post))
+        .route("/api/memory/{id}", axum::routing::delete(api_memory_delete))
         .route("/api/logs", get(api_logs))
         .route("/api/logs/clear", post(api_logs_clear))
         .route("/api/errors", get(api_errors))
@@ -453,6 +455,88 @@ async fn api_stats(State(state): State<AdminState>) -> Response {
 async fn api_stats_reset() -> Response {
     proxy_stats().reset();
     Json(json!({ "ok": true })).into_response()
+}
+
+#[derive(Deserialize)]
+struct MemoryQuery {
+    /// Project to read; defaults to the one this daemon is scoped to.
+    project: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MemoryPostBody {
+    project: Option<String>,
+    text: String,
+}
+
+fn memory_project(state: &AppState, requested: Option<String>) -> Option<String> {
+    requested
+        .filter(|project| !project.trim().is_empty())
+        .or_else(|| state.config.project.clone())
+}
+
+/// The shared project memory: what earlier sessions, possibly from a different
+/// agent, recorded about this project.
+async fn api_memory(State(state): State<AdminState>, Query(query): Query<MemoryQuery>) -> Response {
+    let snapshot = state.shared.snapshot();
+    let project = memory_project(&snapshot, query.project);
+    Json(crate::memory::project_memory().snapshot_json(project.as_deref())).into_response()
+}
+
+async fn api_memory_post(
+    State(state): State<AdminState>,
+    Json(body): Json<MemoryPostBody>,
+) -> Response {
+    let snapshot = state.shared.snapshot();
+    if !snapshot.config.memory.enabled || !crate::memory::project_memory().enabled() {
+        return api_error(StatusCode::BAD_REQUEST, "project memory is not enabled");
+    }
+    let Some(project) = memory_project(&snapshot, body.project) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "no project scope; pass a project name",
+        );
+    };
+    match crate::memory::project_memory().remember(
+        &snapshot.config.memory,
+        &project,
+        &body.text,
+        Some("admin"),
+    ) {
+        Some(note) => Json(json!({ "ok": true, "note": note })).into_response(),
+        None => api_error(StatusCode::BAD_REQUEST, "the note was empty"),
+    }
+}
+
+async fn api_memory_delete(
+    State(state): State<AdminState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<MemoryQuery>,
+) -> Response {
+    let snapshot = state.shared.snapshot();
+    let Some(project) = memory_project(&snapshot, query.project) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "no project scope; pass a project name",
+        );
+    };
+    // "all" is the deliberate spelling for clearing the whole store, so a
+    // stray path segment cannot do it by accident.
+    let note_id = if id == "all" {
+        None
+    } else {
+        match id.parse::<u64>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "note id must be a number or \"all\"",
+                );
+            }
+        }
+    };
+    let removed = crate::memory::project_memory().forget(&project, note_id);
+    Json(json!({ "ok": true, "removed": removed })).into_response()
 }
 
 /// Paired answers from sampled shadow requests, so provider choice can be

@@ -1082,6 +1082,21 @@ pub(crate) async fn maybe_intercept(
         );
         return InterceptionOutcome::Continue(audit);
     }
+    // Memory verbs are proxy-local commands: they never reach a provider, and
+    // they are answered in the caller's own protocol.
+    audit = match handle_memory_verb(
+        state,
+        verb.as_ref(),
+        &local_chat_request,
+        protocol,
+        &client_model,
+        client_streaming,
+        audit,
+    ) {
+        Ok(response) => return InterceptionOutcome::Respond(response),
+        Err(audit) => audit,
+    };
+
     proxy_stats().record_intercept_attempt();
 
     let conversation_key =
@@ -1940,6 +1955,109 @@ fn start_speculation(
         target: name,
         handle,
     })
+}
+
+/// A synthetic assistant message rendered in the caller's protocol. Used for
+/// answers the proxy produces itself, which never involve a provider.
+fn proxy_notice(text: String) -> Value {
+    json!({
+        "id": "chatcmpl-llmproxy",
+        "object": "chat.completion",
+        "created": crate::unix_timestamp(),
+        "model": "llmproxy",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": text },
+            "finish_reason": "stop"
+        }],
+    })
+}
+
+/// Handle `remember:`, `forget:`, and `recall:`.
+///
+/// The store is project-scoped, so all three need a project. Writes are
+/// refused outright while sensitive screening is on: a note is injected into
+/// every later request in the project, so an unscreened one would turn a
+/// single leak into a persistent one.
+fn handle_memory_verb(
+    state: &AppState,
+    verb: Option<&RoutingVerb>,
+    chat_request: &Value,
+    protocol: InterceptorProtocol,
+    client_model: &Option<String>,
+    client_streaming: bool,
+    mut audit: RoutingAuditDraft,
+) -> std::result::Result<Response, RoutingAuditDraft> {
+    if !matches!(
+        verb,
+        Some(RoutingVerb::Remember | RoutingVerb::Forget | RoutingVerb::Recall)
+    ) {
+        return Err(audit);
+    }
+    let verb = verb.expect("matched a memory verb");
+    let config = &state.config.memory;
+    let memory = crate::memory::project_memory();
+    let notice = if !config.enabled || !memory.enabled() {
+        "Project memory is not enabled on this proxy.".to_string()
+    } else if let Some(project) = state.config.project.as_deref() {
+        match verb {
+            RoutingVerb::Remember if state.config.interceptor.reject_sensitive => {
+                "Project memory is read-only while sensitive-data screening is enabled, because a                  note is injected into every later request in this project."
+                    .to_string()
+            }
+            RoutingVerb::Remember => {
+                let text = request_prompt_preview(chat_request);
+                match memory.remember(
+                    config,
+                    project,
+                    &text,
+                    state.launcher_kind.map(crate::LauncherKind::as_str),
+                ) {
+                    Some(note) => format!(
+                        "Recorded in the shared memory for project {project:?} as note {}: {}",
+                        note.id, note.text
+                    ),
+                    None => format!("Nothing to record in the shared memory for project {project:?}."),
+                }
+            }
+            RoutingVerb::Forget => format!(
+                "Cleared {} note(s) from the shared memory for project {project:?}.",
+                memory.forget(project, None)
+            ),
+            _ => {
+                let notes = memory.notes(project);
+                if notes.is_empty() {
+                    format!("The shared memory for project {project:?} is empty.")
+                } else {
+                    let mut body = format!("Shared memory for project {project:?}:\n");
+                    for note in notes.iter().rev() {
+                        body.push_str(&format!("- [{}] {}\n", note.id, note.text));
+                    }
+                    body
+                }
+            }
+        }
+    } else {
+        "Project memory needs a project scope. Launch the agent from a directory containing a          .llmproxy.toml, or pass --project."
+            .to_string()
+    };
+
+    audit.set_decision(
+        "memory",
+        format!(
+            "An in-band \"{}\" directive was handled by the proxy.",
+            verb.as_str()
+        ),
+    );
+    let request_id = audit.audit.request_id.clone();
+    audit.record();
+    Ok(render_local_completion(
+        protocol,
+        proxy_notice(notice),
+        client_model.clone(),
+        client_streaming,
+        &request_id,
+    ))
 }
 
 /// Label a target carries in a composed answer: name plus its destination, so

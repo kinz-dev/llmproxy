@@ -22,7 +22,9 @@ use crate::interceptor::IntegratedTarget;
 
 /// Fixed verbs. Target names are recognised in addition to these, so a target
 /// may not be named after one of them.
-pub(crate) const RESERVED_VERBS: [&str; 4] = ["triage", "unstick", "local", "default"];
+pub(crate) const RESERVED_VERBS: [&str; 7] = [
+    "triage", "unstick", "local", "default", "remember", "forget", "recall",
+];
 
 /// Longest token treated as a possible verb. Target names are capped at 64
 /// characters, so nothing longer can match.
@@ -40,6 +42,12 @@ pub(crate) enum RoutingVerb {
     Default,
     /// Pin this configured route directly: deterministic and triage-free.
     Target(String),
+    /// Record the rest of this message in the project's shared memory.
+    Remember,
+    /// Clear the project's shared memory.
+    Forget,
+    /// Show what the project's shared memory currently holds.
+    Recall,
 }
 
 impl RoutingVerb {
@@ -49,6 +57,9 @@ impl RoutingVerb {
             Self::Unstick => "unstick",
             Self::Local => "local",
             Self::Default => "default",
+            Self::Remember => "remember",
+            Self::Forget => "forget",
+            Self::Recall => "recall",
             Self::Target(name) => name,
         }
     }
@@ -65,6 +76,9 @@ impl RoutingVerb {
             "unstick" => Some(Self::Unstick),
             "local" => Some(Self::Local),
             "default" => Some(Self::Default),
+            "remember" => Some(Self::Remember),
+            "forget" => Some(Self::Forget),
+            "recall" => Some(Self::Recall),
             _ => None,
         }
     }

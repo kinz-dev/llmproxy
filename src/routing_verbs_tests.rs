@@ -167,3 +167,33 @@ fn a_body_without_a_conversation_is_ignored() {
     let mut body = json!({ "model": "Auto" });
     assert_eq!(detect_and_strip(&mut body, &targets()), None);
 }
+
+#[test]
+fn memory_verbs_are_recognized_and_stripped() {
+    for (raw, expected, remainder) in [
+        (
+            "remember: the parser is the bottleneck",
+            RoutingVerb::Remember,
+            "the parser is the bottleneck",
+        ),
+        ("forget: everything", RoutingVerb::Forget, "everything"),
+        ("recall:", RoutingVerb::Recall, ""),
+    ] {
+        let mut body = chat(json!([{ "role": "user", "content": raw }]));
+        assert_eq!(
+            detect_and_strip(&mut body, &targets()),
+            Some(expected),
+            "{raw:?}"
+        );
+        assert_eq!(text_of(&body, 0), remainder, "{raw:?}");
+    }
+}
+
+#[test]
+fn every_reserved_verb_parses_back_to_itself() {
+    for verb in RESERVED_VERBS {
+        let mut body = chat(json!([{ "role": "user", "content": format!("{verb}: body") }]));
+        let parsed = detect_and_strip(&mut body, &targets()).expect("reserved verbs parse");
+        assert_eq!(parsed.as_str(), verb);
+    }
+}

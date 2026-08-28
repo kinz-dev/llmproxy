@@ -50,6 +50,7 @@ mod copilot_launcher;
 mod health;
 mod interceptor;
 mod logging;
+mod memory;
 mod oauth;
 mod pricing;
 mod project;
@@ -219,6 +220,7 @@ struct Config {
     models: ModelsConfig,
     admin: AdminConfig,
     health: health::HealthConfig,
+    memory: memory::MemoryConfig,
     #[serde(skip)]
     model_routing: ModelRoutingMode,
     #[serde(skip)]
@@ -248,6 +250,7 @@ impl Default for Config {
             models: ModelsConfig::default(),
             admin: AdminConfig::default(),
             health: health::HealthConfig::default(),
+            memory: memory::MemoryConfig::default(),
             model_routing: ModelRoutingMode::Remap,
             anthropic_mode: AnthropicMode::ChatCompletions,
             project: None,
@@ -1124,6 +1127,9 @@ async fn run_server(
             );
         } else {
             usage_store::usage_store().open(&directory);
+            if config.memory.enabled {
+                memory::project_memory().open(&directory);
+            }
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(usage_store::flush_interval());
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2356,6 +2362,32 @@ async fn embeddings_impl(
     )
 }
 
+/// Prepend the project's shared memory to a request.
+///
+/// Injection happens on the caller's native body, so the notes reach whichever
+/// provider ends up answering — and the triage copy derived from it — without
+/// each protocol needing its own path.
+fn inject_project_memory(state: &AppState, body: &mut Value) {
+    let config = &state.config.memory;
+    if !config.enabled || !config.inject {
+        return;
+    }
+    let Some(project) = state.config.project.as_deref() else {
+        return;
+    };
+    let notes = memory::project_memory().notes(project);
+    let Some(block) = memory::injected_block(config, &notes) else {
+        return;
+    };
+    if memory::inject(body, &block) {
+        debug!(
+            project,
+            notes = notes.len(),
+            "injected shared project memory"
+        );
+    }
+}
+
 /// Detect and strip an in-band routing verb from the caller's native body.
 ///
 /// Stripping happens on the caller's own copy before the local triage copy is
@@ -2424,6 +2456,7 @@ async fn chat_completions_routed(
     headers: HeaderMap,
     mut body: Value,
 ) -> Response {
+    inject_project_memory(&state, &mut body);
     trace_client_request(
         "chat_completions",
         launcher_token,
@@ -2558,6 +2591,7 @@ async fn responses_routed(
     headers: HeaderMap,
     mut body: Value,
 ) -> Response {
+    inject_project_memory(&state, &mut body);
     trace_client_request(
         "responses",
         launcher_token,
@@ -2719,6 +2753,7 @@ async fn anthropic_messages_routed(
     headers: HeaderMap,
     mut body: Value,
 ) -> Response {
+    inject_project_memory(&state, &mut body);
     trace_client_request(
         "anthropic_messages",
         launcher_token,
@@ -7028,6 +7063,9 @@ fn validate_config(config: &Config) -> Result<()> {
         }
     }
     if let Err(error) = config.health.validate() {
+        bail!(error);
+    }
+    if let Err(error) = config.memory.validate() {
         bail!(error);
     }
     let mut routing_interceptor = config.interceptor.clone();

@@ -101,6 +101,16 @@ pub(super) enum LauncherKind {
     Copilot,
 }
 
+impl LauncherKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Copilot => "copilot",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum LauncherMode {

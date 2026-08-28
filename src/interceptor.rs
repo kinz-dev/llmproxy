@@ -623,17 +623,18 @@ pub(crate) fn validate_integrated_config(
     interceptor: &InterceptorConfig,
     providers: &HashMap<String, UpstreamConfig>,
 ) -> Result<()> {
+    // Structural rules apply whether or not the section is switched on. An
+    // `--integrated` launcher enables integrated routing for its own session,
+    // so a file with `enabled = false` would otherwise carry a broken target
+    // table until the first request found it.
+    if config.enabled || !config.targets.is_empty() {
+        validate_integrated_structure(config, providers)?;
+    }
     if !config.enabled {
         return Ok(());
     }
     if config.targets.is_empty() {
         bail!("integrated mode requires at least one [integrated.targets.*] entry");
-    }
-    if config.sticky_ttl_secs == 0 {
-        bail!("integrated.sticky_ttl_secs must be greater than zero");
-    }
-    if config.sticky_capacity == 0 {
-        bail!("integrated.sticky_capacity must be greater than zero");
     }
     for (name, provider) in providers {
         // Borrowed-OAuth providers carry the local CLI's login instead of a
@@ -648,6 +649,26 @@ pub(crate) fn validate_integrated_config(
                 "integrated external provider {name:?} requires proxy-owned api_key or api_key_env (or auth = \"codex-oauth\"/\"claude-oauth\")"
             );
         }
+    }
+    for (name, target) in &config.targets {
+        if target.provider == interceptor.provider {
+            bail!("integrated target {name:?} cannot route back to the interceptor provider");
+        }
+    }
+    Ok(())
+}
+
+/// Everything about the target table that is wrong regardless of whether
+/// integrated routing is currently switched on.
+fn validate_integrated_structure(
+    config: &IntegratedConfig,
+    providers: &HashMap<String, UpstreamConfig>,
+) -> Result<()> {
+    if config.sticky_ttl_secs == 0 {
+        bail!("integrated.sticky_ttl_secs must be greater than zero");
+    }
+    if config.sticky_capacity == 0 {
+        bail!("integrated.sticky_capacity must be greater than zero");
     }
     if let Err(error) = config
         .embedding
@@ -739,9 +760,6 @@ pub(crate) fn validate_integrated_config(
                 target.provider
             );
         };
-        if target.provider == interceptor.provider {
-            bail!("integrated target {name:?} cannot route back to the interceptor provider");
-        }
         if target.model.trim().is_empty() {
             bail!("integrated target {name:?} has an empty model");
         }

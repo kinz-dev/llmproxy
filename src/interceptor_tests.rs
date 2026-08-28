@@ -1313,3 +1313,66 @@ fn a_rejection_still_fails_closed_when_the_model_changes_its_case() {
         CompletionDecision::Reject
     );
 }
+
+#[test]
+fn a_broken_target_table_is_caught_even_while_integrated_is_switched_off() {
+    // An --integrated launcher enables integrated routing for its own session,
+    // so a file with `enabled = false` must not be able to carry a target
+    // table that only fails at the first request.
+    let providers = HashMap::from([
+        ("local".to_string(), crate::UpstreamConfig::default()),
+        (
+            "openai".to_string(),
+            crate::UpstreamConfig {
+                base_url: "https://api.openai.invalid/v1".to_string(),
+                api_key: Some("k".to_string()),
+                ..crate::UpstreamConfig::default()
+            },
+        ),
+    ]);
+    let interceptor = InterceptorConfig {
+        provider: "local".to_string(),
+        model: "triage".to_string(),
+        ..InterceptorConfig::default()
+    };
+    let mut first = target_named("openai", None);
+    first.is_default = true;
+    let mut second = target_named("openai", None);
+    second.is_default = true;
+    let config = IntegratedConfig {
+        enabled: false,
+        targets: BTreeMap::from([("one".to_string(), first), ("two".to_string(), second)]),
+        ..IntegratedConfig::default()
+    };
+    let error = validate_integrated_config(&config, &interceptor, &providers)
+        .expect_err("two catch-alls are rejected even when disabled");
+    assert!(format!("{error:#}").contains("default = true"));
+
+    let config = IntegratedConfig {
+        enabled: false,
+        targets: BTreeMap::from([("one".to_string(), target_named("ghost", None))]),
+        ..IntegratedConfig::default()
+    };
+    assert!(
+        validate_integrated_config(&config, &interceptor, &providers).is_err(),
+        "an unknown provider is rejected even when disabled"
+    );
+}
+
+#[test]
+fn a_disabled_section_with_no_targets_is_left_alone() {
+    // Nothing to check, and the routing-time rules must not fire: a config
+    // that never routes should not be rejected for a missing target table or
+    // for an external provider with no proxy-owned key.
+    let providers = HashMap::from([(
+        "keyless_external".to_string(),
+        crate::UpstreamConfig {
+            base_url: "https://api.example.invalid/v1".to_string(),
+            ..crate::UpstreamConfig::default()
+        },
+    )]);
+    let interceptor = InterceptorConfig::default();
+    let config = IntegratedConfig::default();
+    validate_integrated_config(&config, &interceptor, &providers)
+        .expect("a disabled, empty integrated section is valid");
+}

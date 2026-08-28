@@ -2307,6 +2307,18 @@ async fn execute_integrated_redirect(
         .escalate
         .then(|| state.config.integrated.stronger_than(target_name))
         .flatten();
+    if context.escalate
+        && let Some(target) = state.config.integrated.targets.get(target_name)
+    {
+        // The route that just got re-asked is the one that disappointed, so
+        // the signal is recorded against it rather than against its successor.
+        crate::usage_store::usage_store().record_outcome(
+            state.config.project.as_deref(),
+            &target.provider,
+            &target.model,
+            crate::usage_store::Outcome::Retried,
+        );
+    }
     let target_name = match escalated {
         Some(stronger) => {
             proxy_stats().record_retry_escalation();

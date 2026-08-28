@@ -36,6 +36,13 @@ const FILE_VERSION: u32 = 1;
 /// Attribution for traffic that arrived without a project scope.
 pub(crate) const UNSCOPED_PROJECT: &str = "(unscoped)";
 
+/// An aftermath signal about a completed answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Retried,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct UsageKey {
     month: String,
@@ -54,6 +61,10 @@ struct UsageRecord {
     cache_write_tokens: u64,
     estimated_requests: u64,
     total_time_ms: u64,
+    /// The user immediately re-asked a question this route had just answered.
+    retries: u64,
+    /// The route answered with an error, or its stream broke.
+    failures: u64,
     first_seen_ms: u64,
     last_seen_ms: u64,
 }
@@ -192,6 +203,73 @@ impl UsageStore {
             .or_default()
             .add(elapsed, usage, now_ms);
         state.dirty = true;
+    }
+
+    /// Record an aftermath signal against the route that produced the answer.
+    ///
+    /// These are the implicit labels a leaderboard is built from: nobody types
+    /// them, and no other layer can see them.
+    pub(crate) fn record_outcome(
+        &self,
+        project: Option<&str>,
+        provider: &str,
+        model: &str,
+        outcome: Outcome,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        let now_ms = epoch_millis();
+        let key = UsageKey {
+            month: month_of(now_ms),
+            project: project.unwrap_or(UNSCOPED_PROJECT).to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+        };
+        let mut state = self.state.lock().expect("usage store poisoned");
+        if state.entries.len() >= MAX_ROWS && !state.entries.contains_key(&key) {
+            return;
+        }
+        let entry = state.entries.entry(key).or_default();
+        match outcome {
+            Outcome::Retried => entry.retries = entry.retries.saturating_add(1),
+            Outcome::Failed => entry.failures = entry.failures.saturating_add(1),
+        }
+        state.dirty = true;
+    }
+
+    /// Observed records per (provider, model), priced at current rates.
+    pub(crate) fn records(
+        &self,
+        pricing: &PricingIndex,
+        month: Option<&str>,
+        project: Option<&str>,
+    ) -> Vec<crate::leaderboard::Record> {
+        let state = self.state.lock().expect("usage store poisoned");
+        let mut merged: BTreeMap<(String, String), crate::leaderboard::Record> = BTreeMap::new();
+        for (key, record) in &state.entries {
+            if month.is_some_and(|selected| selected != key.month) {
+                continue;
+            }
+            if project.is_some_and(|selected| selected != key.project) {
+                continue;
+            }
+            let entry = merged
+                .entry((key.provider.clone(), key.model.clone()))
+                .or_insert_with(|| crate::leaderboard::Record {
+                    provider: key.provider.clone(),
+                    model: key.model.clone(),
+                    ..Default::default()
+                });
+            entry.answers = entry.answers.saturating_add(record.requests);
+            entry.retried = entry.retried.saturating_add(record.retries);
+            entry.failed = entry.failed.saturating_add(record.failures);
+            entry.total_time_ms = entry.total_time_ms.saturating_add(record.total_time_ms);
+            if let Some(spend) = pricing.spend(&key.provider, &key.model, record.counters()) {
+                entry.cost = Some(entry.cost.unwrap_or(0.0) + spend.total());
+            }
+        }
+        merged.into_values().collect()
     }
 
     /// Write the ledger when it has changed. Called on a timer and once more
@@ -388,6 +466,8 @@ fn merge(mut into: UsageRecord, from: UsageRecord) -> UsageRecord {
     into.estimated_requests = into
         .estimated_requests
         .saturating_add(from.estimated_requests);
+    into.retries = into.retries.saturating_add(from.retries);
+    into.failures = into.failures.saturating_add(from.failures);
     into.total_time_ms = into.total_time_ms.saturating_add(from.total_time_ms);
     into.first_seen_ms = match (into.first_seen_ms, from.first_seen_ms) {
         (0, other) | (other, 0) => other,

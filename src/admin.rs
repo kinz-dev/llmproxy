@@ -134,6 +134,7 @@ fn router(state: AdminState) -> Router {
         .route("/api/stats/reset", post(api_stats_reset))
         .route("/api/spend", get(api_spend))
         .route("/api/spend/reset", post(api_spend_reset))
+        .route("/api/leaderboard", get(api_leaderboard))
         .route("/api/health", get(api_health))
         .route("/api/health/reset", post(api_health_reset))
         .route("/api/route-cache", get(api_route_cache))
@@ -597,7 +598,74 @@ async fn api_spend(State(state): State<AdminState>, Query(query): Query<SpendQue
         query.project.as_deref(),
     );
     report["current_project"] = json!(snapshot.config.project);
+    report["insight"] = cost_insight(
+        &snapshot,
+        &pricing,
+        query.month.as_deref(),
+        query.project.as_deref(),
+    );
     Json(report).into_response()
+}
+
+/// What each configured route costs per answer and whether the evidence
+/// supports moving any of it somewhere cheaper.
+fn cost_insight(
+    state: &AppState,
+    pricing: &crate::pricing::PricingIndex,
+    month: Option<&str>,
+    project: Option<&str>,
+) -> Value {
+    let records = crate::usage_store::usage_store().records(pricing, month, project);
+    let candidates = state
+        .config
+        .integrated
+        .targets
+        .iter()
+        .filter_map(|(name, target)| {
+            let record = records
+                .iter()
+                .find(|record| record.provider == target.provider && record.model == target.model)?
+                .clone();
+            Some(crate::leaderboard::RouteCandidate {
+                target: name.clone(),
+                provider: target.provider.clone(),
+                model: target.model.clone(),
+                record,
+            })
+        })
+        .collect::<Vec<_>>();
+    crate::leaderboard::cost_insight(&candidates, pricing.currency())
+}
+
+/// A per-project ranking of the models this proxy actually routed to, scored
+/// on observed aftermath rather than on a public benchmark.
+async fn api_leaderboard(
+    State(state): State<AdminState>,
+    Query(query): Query<SpendQuery>,
+) -> Response {
+    let snapshot = state.shared.snapshot();
+    let pricing = snapshot.pricing_index();
+    if !crate::usage_store::usage_store().enabled() {
+        return Json(json!({
+            "available": false,
+            "reason": "no writable llmproxy state directory; outcomes are not being recorded",
+        }))
+        .into_response();
+    }
+    let records = crate::usage_store::usage_store().records(
+        &pricing,
+        query.month.as_deref(),
+        query.project.as_deref(),
+    );
+    let mut ranking = crate::leaderboard::rank(&records);
+    ranking["available"] = json!(true);
+    ranking["project"] = json!(query.project.or_else(|| snapshot.config.project.clone()));
+    ranking["month"] = json!(query.month);
+    ranking["currency"] = json!(pricing.currency());
+    // Proposed hints derived from what the router observably sent where.
+    ranking["hint_candidates"] =
+        crate::leaderboard::hint_candidates(&routing_decision_log().prompts_by_target(), 8);
+    Json(ranking).into_response()
 }
 
 async fn api_spend_reset() -> Response {

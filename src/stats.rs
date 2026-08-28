@@ -3,7 +3,7 @@
 //! One global [`ProxyStats`] instance collects counters, latency sample
 //! windows, and approximate token savings. Everything resets on restart.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -888,6 +888,13 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
         } else {
             crate::health::provider_health().record_failure(&provider, format!("HTTP {status}"));
         }
+        // An aftermath signal for the leaderboard: this route did not deliver.
+        crate::usage_store::usage_store().record_outcome(
+            project.as_deref(),
+            &provider,
+            &model,
+            crate::usage_store::Outcome::Failed,
+        );
         error!(
             route_class = class.as_str(),
             provider,
@@ -1592,6 +1599,49 @@ impl RoutingDecisionLog {
 
     pub(crate) fn snapshot_after(&self, after: u64) -> Value {
         self.buffer.snapshot_after(after, ROUTING_DECISION_LOG_TTL)
+    }
+
+    /// Prompt previews grouped by the target they were routed to.
+    ///
+    /// This is the observed corpus behind proposed hints: what the router
+    /// actually sent where, rather than what a hint claims it sends.
+    pub(crate) fn prompts_by_target(&self) -> BTreeMap<String, Vec<String>> {
+        let state = self.buffer.state.lock().expect("log buffer poisoned");
+        let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for entry in &state.entries {
+            let Some(target) = entry.audit.target.clone() else {
+                continue;
+            };
+            if entry.audit.prompt.starts_with("[redacted") {
+                continue;
+            }
+            grouped
+                .entry(target)
+                .or_default()
+                .push(entry.audit.prompt.clone());
+        }
+        grouped
+    }
+
+    /// Prompts recorded in the last 24 hours, as a replayable corpus.
+    pub(crate) fn corpus(&self) -> Vec<Value> {
+        let state = self.buffer.state.lock().expect("log buffer poisoned");
+        state
+            .entries
+            .iter()
+            .filter(|entry| !entry.audit.prompt.starts_with("[redacted"))
+            .map(|entry| {
+                json!({
+                    "request_id": entry.audit.request_id,
+                    "prompt": entry.audit.prompt,
+                    "mode": entry.audit.mode,
+                    "decision": entry.audit.decision,
+                    "target": entry.audit.target,
+                    "provider": entry.audit.provider,
+                    "model": entry.audit.model,
+                })
+            })
+            .collect()
     }
 }
 

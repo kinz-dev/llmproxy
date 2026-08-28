@@ -49,6 +49,7 @@ mod comparison;
 mod copilot_launcher;
 mod health;
 mod interceptor;
+mod leaderboard;
 mod logging;
 mod memory;
 mod oauth;

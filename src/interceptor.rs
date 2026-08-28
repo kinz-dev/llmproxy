@@ -991,13 +991,6 @@ impl StickyRoutes {
             .0
             .remove(&key);
     }
-
-    #[cfg(test)]
-    fn clear(&self) {
-        let mut routes = self.entries.lock().expect("sticky route store poisoned");
-        routes.0.clear();
-        routes.1.clear();
-    }
 }
 
 fn sticky_routes() -> &'static StickyRoutes {
@@ -1039,15 +1032,16 @@ pub(crate) async fn maybe_intercept(
     state: &AppState,
     incoming_headers: &HeaderMap,
     local_chat_request: Value,
-    protocol: InterceptorProtocol,
+    caller: CallerContext,
     policy: InterceptionPolicy,
-    client_model: Option<String>,
-    client_streaming: bool,
     // `verb` was already detected and stripped from the caller's native body
     // by the protocol handler, so neither copy still carries it.
     verb: Option<RoutingVerb>,
 ) -> InterceptionOutcome {
     let config = &state.config.interceptor;
+    let protocol = caller.protocol;
+    let client_model = caller.model.clone();
+    let client_streaming = caller.streaming;
     let integrated =
         integrated_routing_requested(&state.config.integrated, client_model.as_deref());
     let request_id = request_id_from_headers(incoming_headers);
@@ -1084,18 +1078,24 @@ pub(crate) async fn maybe_intercept(
     }
     // Memory verbs are proxy-local commands: they never reach a provider, and
     // they are answered in the caller's own protocol.
-    audit = match handle_memory_verb(
-        state,
-        verb.as_ref(),
-        &local_chat_request,
-        protocol,
-        &client_model,
-        client_streaming,
-        audit,
-    ) {
-        Ok(response) => return InterceptionOutcome::Respond(response),
-        Err(audit) => audit,
-    };
+    if let Some(notice) = memory_verb_notice(state, verb.as_ref(), &local_chat_request) {
+        audit.set_decision(
+            "memory",
+            format!(
+                "An in-band \"{}\" directive was handled by the proxy.",
+                verb.as_ref().map(RoutingVerb::as_str).unwrap_or_default()
+            ),
+        );
+        let request_id = audit.audit.request_id.clone();
+        audit.record();
+        return InterceptionOutcome::Respond(render_local_completion(
+            caller.protocol,
+            proxy_notice(notice),
+            caller.model.clone(),
+            caller.streaming,
+            &request_id,
+        ));
+    }
 
     proxy_stats().record_intercept_attempt();
 
@@ -1157,9 +1157,7 @@ pub(crate) async fn maybe_intercept(
                     state,
                     &target,
                     local_chat_request,
-                    protocol,
-                    client_model,
-                    client_streaming,
+                    &caller,
                     Some(key),
                     &route_context,
                     audit,
@@ -1205,9 +1203,7 @@ pub(crate) async fn maybe_intercept(
             state,
             &name,
             local_chat_request,
-            protocol,
-            client_model,
-            client_streaming,
+            &caller,
             conversation_key,
             &route_context,
             audit,
@@ -1262,9 +1258,7 @@ pub(crate) async fn maybe_intercept(
                     state,
                     &target,
                     redirect_request,
-                    protocol,
-                    client_model,
-                    client_streaming,
+                    &caller,
                     conversation_key,
                     &route_context,
                     audit,
@@ -1281,9 +1275,7 @@ pub(crate) async fn maybe_intercept(
                         state,
                         &name,
                         redirect_request,
-                        protocol,
-                        client_model,
-                        client_streaming,
+                        &caller,
                         conversation_key,
                         &route_context,
                         audit,
@@ -1311,15 +1303,7 @@ pub(crate) async fn maybe_intercept(
         && state.config.integrated.speculative
         && !config.reject_sensitive
         && verb.is_none())
-    .then(|| {
-        start_speculation(
-            state,
-            redirect_request.clone(),
-            protocol,
-            &client_model,
-            client_streaming,
-        )
-    })
+    .then(|| start_speculation(state, redirect_request.clone(), &caller))
     .flatten();
 
     let local_request = match build_local_request(
@@ -1345,9 +1329,7 @@ pub(crate) async fn maybe_intercept(
                 &request_id,
                 message,
                 audit,
-                protocol,
-                client_model,
-                client_streaming,
+                &caller,
             );
         }
     };
@@ -1408,9 +1390,7 @@ pub(crate) async fn maybe_intercept(
                     &meta.request_id,
                     error.to_string(),
                     audit,
-                    protocol,
-                    client_model,
-                    client_streaming,
+                    &caller,
                 );
             }
             return if config.fallback_on_error {
@@ -1449,9 +1429,7 @@ pub(crate) async fn maybe_intercept(
                 &meta.request_id,
                 message,
                 audit,
-                protocol,
-                client_model,
-                client_streaming,
+                &caller,
             );
         }
     };
@@ -1488,9 +1466,7 @@ pub(crate) async fn maybe_intercept(
             &meta.request_id,
             message,
             audit,
-            protocol,
-            client_model,
-            client_streaming,
+            &caller,
         );
     }
 
@@ -1514,9 +1490,7 @@ pub(crate) async fn maybe_intercept(
             &meta.request_id,
             message,
             audit,
-            protocol,
-            client_model,
-            client_streaming,
+            &caller,
         );
     }
 
@@ -1628,9 +1602,7 @@ pub(crate) async fn maybe_intercept(
             state,
             &name,
             redirect_request,
-            protocol,
-            client_model,
-            client_streaming,
+            &caller,
             conversation_key,
             &route_context,
             audit,
@@ -1697,9 +1669,7 @@ pub(crate) async fn maybe_intercept(
                     state,
                     name,
                     redirect_request,
-                    protocol,
-                    client_model,
-                    client_streaming,
+                    &caller,
                     conversation_key,
                     &route_context,
                     audit,
@@ -1753,9 +1723,7 @@ pub(crate) async fn maybe_intercept(
                 state,
                 &target,
                 redirect_request,
-                protocol,
-                client_model,
-                client_streaming,
+                &caller,
                 conversation_key,
                 &route_context,
                 audit,
@@ -1778,9 +1746,7 @@ pub(crate) async fn maybe_intercept(
                 &meta.request_id,
                 message,
                 audit,
-                protocol,
-                client_model,
-                client_streaming,
+                &caller,
             )
         }
         CompletionDecision::Local => {
@@ -1893,6 +1859,18 @@ async fn embed_text(
     }
 }
 
+/// How to render a response for this caller: the protocol it spoke, the model
+/// it asked for, and whether it wants a stream.
+///
+/// These three always travel together — every path that can answer a request
+/// needs all of them and none of them separately.
+#[derive(Clone)]
+pub(crate) struct CallerContext {
+    pub(crate) protocol: InterceptorProtocol,
+    pub(crate) model: Option<String>,
+    pub(crate) streaming: bool,
+}
+
 /// Per-request routing extras that several paths need but that would
 /// otherwise be threaded through every signature individually.
 #[derive(Default, Clone)]
@@ -1916,9 +1894,7 @@ struct Speculation {
 fn start_speculation(
     state: &AppState,
     chat_request: Value,
-    protocol: InterceptorProtocol,
-    client_model: &Option<String>,
-    client_streaming: bool,
+    caller: &CallerContext,
 ) -> Option<Speculation> {
     let (name, target) = default_target(&state.config.integrated)?;
     let provider = state.providers.get(&target.provider)?;
@@ -1932,7 +1908,7 @@ fn start_speculation(
     }
     let name = name.to_string();
     let state = state.clone();
-    let client_model = client_model.clone();
+    let caller = caller.clone();
     let speculated = name.clone();
     let handle = tokio::spawn(async move {
         let target = &state.config.integrated.targets[&speculated];
@@ -1944,9 +1920,9 @@ fn start_speculation(
             provider,
             chat_request,
             target,
-            protocol,
-            client_model,
-            client_streaming,
+            caller.protocol,
+            caller.model,
+            caller.streaming,
             state.config.as_ref(),
         )
         .await
@@ -1973,28 +1949,25 @@ fn proxy_notice(text: String) -> Value {
     })
 }
 
-/// Handle `remember:`, `forget:`, and `recall:`.
+/// Handle `remember:`, `forget:`, and `recall:`, returning what to tell the
+/// caller, or `None` when this is not a memory directive.
 ///
 /// The store is project-scoped, so all three need a project. Writes are
 /// refused outright while sensitive screening is on: a note is injected into
 /// every later request in the project, so an unscreened one would turn a
 /// single leak into a persistent one.
-fn handle_memory_verb(
+fn memory_verb_notice(
     state: &AppState,
     verb: Option<&RoutingVerb>,
     chat_request: &Value,
-    protocol: InterceptorProtocol,
-    client_model: &Option<String>,
-    client_streaming: bool,
-    mut audit: RoutingAuditDraft,
-) -> std::result::Result<Response, RoutingAuditDraft> {
+) -> Option<String> {
+    let verb = verb?;
     if !matches!(
         verb,
-        Some(RoutingVerb::Remember | RoutingVerb::Forget | RoutingVerb::Recall)
+        RoutingVerb::Remember | RoutingVerb::Forget | RoutingVerb::Recall
     ) {
-        return Err(audit);
+        return None;
     }
-    let verb = verb.expect("matched a memory verb");
     let config = &state.config.memory;
     let memory = crate::memory::project_memory();
     let notice = if !config.enabled || !memory.enabled() {
@@ -2046,22 +2019,7 @@ fn handle_memory_verb(
             .to_string()
     };
 
-    audit.set_decision(
-        "memory",
-        format!(
-            "An in-band \"{}\" directive was handled by the proxy.",
-            verb.as_str()
-        ),
-    );
-    let request_id = audit.audit.request_id.clone();
-    audit.record();
-    Ok(render_local_completion(
-        protocol,
-        proxy_notice(notice),
-        client_model.clone(),
-        client_streaming,
-        &request_id,
-    ))
+    Some(notice)
 }
 
 /// Label a target carries in a composed answer: name plus its destination, so
@@ -2107,9 +2065,7 @@ async fn run_second_opinion(
     state: &AppState,
     target_name: &str,
     chat_request: &Value,
-    protocol: InterceptorProtocol,
-    client_model: &Option<String>,
-    client_streaming: bool,
+    caller: &CallerContext,
     audit: &mut RoutingAuditDraft,
 ) -> Option<Response> {
     let second = state
@@ -2178,10 +2134,10 @@ async fn run_second_opinion(
         message["content"] = Value::String(composed);
     }
     Some(render_local_completion(
-        protocol,
+        caller.protocol,
         completion,
-        client_model.clone(),
-        client_streaming,
+        caller.model.clone(),
+        caller.streaming,
         &audit.audit.request_id.clone(),
     ))
 }
@@ -2192,9 +2148,7 @@ async fn run_shadow_comparison(
     state: &AppState,
     target_name: &str,
     chat_request: &Value,
-    protocol: InterceptorProtocol,
-    client_model: &Option<String>,
-    client_streaming: bool,
+    caller: &CallerContext,
     audit: &mut RoutingAuditDraft,
 ) -> Option<Response> {
     let shadow = &state.config.integrated.shadow;
@@ -2253,10 +2207,10 @@ async fn run_shadow_comparison(
 
     // The caller only ever sees the primary answer.
     Some(render_local_completion(
-        protocol,
+        caller.protocol,
         primary,
-        client_model.clone(),
-        client_streaming,
+        caller.model.clone(),
+        caller.streaming,
         &audit.audit.request_id.clone(),
     ))
 }
@@ -2297,9 +2251,7 @@ async fn execute_integrated_redirect(
     state: &AppState,
     target_name: &str,
     mut chat_request: Value,
-    protocol: InterceptorProtocol,
-    client_model: Option<String>,
-    client_streaming: bool,
+    caller: &CallerContext,
     conversation_key: Option<u64>,
     context: &RouteContext,
     mut audit: RoutingAuditDraft,
@@ -2346,16 +2298,8 @@ async fn execute_integrated_redirect(
     // Both comparison paths need whole answers, so they buffer instead of
     // streaming. Second opinion is deliberate and per-target; shadowing is
     // sampled, which is why its rate should stay low.
-    if let Some(response) = run_second_opinion(
-        state,
-        target_name,
-        &chat_request,
-        protocol,
-        &client_model,
-        client_streaming,
-        &mut audit,
-    )
-    .await
+    if let Some(response) =
+        run_second_opinion(state, target_name, &chat_request, caller, &mut audit).await
     {
         if let Some(key) = conversation_key {
             sticky_routes().insert(
@@ -2374,16 +2318,8 @@ async fn execute_integrated_redirect(
         audit.record_destination(provider, &target.model);
         return InterceptionOutcome::Respond(response);
     }
-    if let Some(response) = run_shadow_comparison(
-        state,
-        target_name,
-        &chat_request,
-        protocol,
-        &client_model,
-        client_streaming,
-        &mut audit,
-    )
-    .await
+    if let Some(response) =
+        run_shadow_comparison(state, target_name, &chat_request, caller, &mut audit).await
     {
         if let Some(key) = conversation_key {
             sticky_routes().insert(
@@ -2443,7 +2379,7 @@ async fn execute_integrated_redirect(
             model = target.model,
             attempt,
             reasoning_effort = target.reasoning_effort.map(crate::ReasoningEffort::as_str),
-            protocol = protocol.as_str(),
+            protocol = caller.protocol.as_str(),
             "sending integrated route"
         );
         // Only the final attempt can consume the request outright.
@@ -2456,9 +2392,9 @@ async fn execute_integrated_redirect(
             provider,
             request,
             target,
-            protocol,
-            client_model.clone(),
-            client_streaming,
+            caller.protocol,
+            caller.model.clone(),
+            caller.streaming,
             state.config.as_ref(),
         )
         .await;
@@ -2544,9 +2480,7 @@ fn fallback_or_error(
     request_id: &str,
     message: String,
     mut audit: RoutingAuditDraft,
-    protocol: InterceptorProtocol,
-    client_model: Option<String>,
-    client_streaming: bool,
+    caller: &CallerContext,
 ) -> InterceptionOutcome {
     crate::stats::error_log().record(&config.provider, "interceptor", message.as_str());
     audit.set_error(message.clone());
@@ -2559,10 +2493,10 @@ fn fallback_or_error(
         );
         audit.record();
         return InterceptionOutcome::Respond(render_rejection(
-            protocol,
+            caller.protocol,
             "sensitive information that could not be screened safely",
-            client_model,
-            client_streaming,
+            caller.model.clone(),
+            caller.streaming,
             request_id,
         ));
     }

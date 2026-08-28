@@ -112,7 +112,7 @@ impl Sampler {
             return false;
         }
         let seen = self.seen.fetch_add(1, Ordering::Relaxed);
-        seen % one_in == 0
+        seen.is_multiple_of(one_in)
     }
 }
 

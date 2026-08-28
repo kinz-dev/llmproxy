@@ -189,7 +189,7 @@ fn old_months_are_pruned_before_the_ledger_grows_without_bound() {
     }
     prune(&mut entries);
     assert_eq!(entries.len(), RETAINED_MONTHS);
-    assert!(entries.keys().all(|key| key.month >= "2005-01".to_string()));
+    assert!(entries.keys().all(|key| key.month.as_str() >= "2005-01"));
 }
 
 #[test]

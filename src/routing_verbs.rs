@@ -93,12 +93,8 @@ pub(crate) fn detect_and_strip(
     body: &mut Value,
     targets: &BTreeMap<String, IntegratedTarget>,
 ) -> Option<RoutingVerb> {
-    let Some(items) = user_message_indexes(body) else {
-        return None;
-    };
-    let Some((&newest, earlier)) = items.split_last() else {
-        return None;
-    };
+    let items = user_message_indexes(body)?;
+    let (&newest, earlier) = items.split_last()?;
     for &index in earlier {
         // Stale directives are removed but never acted on.
         strip_at(body, index, targets);

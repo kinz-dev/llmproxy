@@ -71,7 +71,7 @@ use backend_adapters::{
     sanitize_copilot_chat_request, sanitize_cross_provider_chat_request,
 };
 use interceptor::{
-    IntegratedConfig, InterceptionOutcome, InterceptionPolicy, InterceptorConfig,
+    CallerContext, IntegratedConfig, InterceptionOutcome, InterceptionPolicy, InterceptorConfig,
     InterceptorProtocol, maybe_intercept,
 };
 use stats::{
@@ -2562,12 +2562,15 @@ async fn chat_completions_routed(
             &state,
             &headers,
             body.clone(),
-            InterceptorProtocol::ChatCompletions,
+            CallerContext {
+                protocol: InterceptorProtocol::ChatCompletions,
+                model: body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                streaming: request_is_streaming(&body),
+            },
             InterceptionPolicy::Eligible,
-            body.get("model")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            request_is_streaming(&body),
             verb,
         )
         .await
@@ -2704,10 +2707,12 @@ async fn responses_routed(
             &state,
             &headers,
             local_chat_request,
-            InterceptorProtocol::Responses,
+            CallerContext {
+                protocol: InterceptorProtocol::Responses,
+                model: client_model.clone(),
+                streaming: request_is_streaming(&body),
+            },
             policy,
-            client_model.clone(),
-            request_is_streaming(&body),
             verb,
         )
         .await
@@ -2865,10 +2870,12 @@ async fn anthropic_messages_routed(
             &state,
             &headers,
             local_chat_request,
-            InterceptorProtocol::AnthropicMessages,
+            CallerContext {
+                protocol: InterceptorProtocol::AnthropicMessages,
+                model: client_model.clone(),
+                streaming: request_is_streaming(&body),
+            },
             InterceptionPolicy::Eligible,
-            client_model.clone(),
-            request_is_streaming(&body),
             verb,
         )
         .await

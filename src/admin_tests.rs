@@ -374,3 +374,42 @@ fn provider_doc_edit_writes_a_price_table_that_parses_back() {
     assert_eq!(price.cache_read, Some(0.125));
     assert_eq!(price.cache_write, None);
 }
+
+#[test]
+fn persisted_thresholds_stay_readable_in_the_config_file() {
+    let mut doc: DocumentMut = "[integrated]\n".parse().unwrap();
+    let body = IntegratedPutBody {
+        enabled: None,
+        sticky_ttl_secs: None,
+        sticky_absolute_ttl_secs: None,
+        sticky_max_turns: None,
+        sticky_policy: None,
+        sticky_capacity: None,
+        verbs: None,
+        speculative: None,
+        failover: None,
+        shadow: None,
+        embedding: Some(crate::route_cache::EmbeddingConfig {
+            enabled: true,
+            provider: "embeddings".to_string(),
+            model: "embed-test".to_string(),
+            threshold: 0.95,
+            retriage_below: 0.4,
+            ..crate::route_cache::EmbeddingConfig::default()
+        }),
+        instructions: None,
+        targets: None,
+    };
+    body.apply_to_doc(&mut doc).unwrap();
+
+    let rendered = doc.to_string();
+    // Widening an f32 would otherwise write 0.949999988079071 into a file a
+    // human is expected to read and edit.
+    assert!(
+        rendered.contains("threshold = 0.95"),
+        "rendered:\n{rendered}"
+    );
+    assert!(rendered.contains("retriage_below = 0.4"));
+    let config: Config = toml::from_str(&rendered).unwrap();
+    assert_eq!(config.integrated.embedding.threshold, 0.95);
+}

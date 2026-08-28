@@ -1269,6 +1269,12 @@ fn persist_change(state: &AdminState, persist: Persist) -> (bool, Option<String>
 }
 
 /// Fetch a mutable `[section]` table, creating it as an explicit table.
+/// Widening an `f32` threshold to `f64` exposes its binary tail — 0.95 becomes
+/// 0.949999988079071 — in a file a human is expected to read and edit.
+fn readable_ratio(value: f32) -> f64 {
+    (f64::from(value) * 1e6).round() / 1e6
+}
+
 fn string_array(values: &[String]) -> toml_edit::Array {
     values
         .iter()
@@ -1626,14 +1632,17 @@ impl IntegratedPutBody {
             entry.insert("enabled", value(embedding.enabled));
             entry.insert("provider", value(embedding.provider.as_str()));
             entry.insert("model", value(embedding.model.as_str()));
-            entry.insert("threshold", value(f64::from(embedding.threshold)));
+            entry.insert("threshold", value(readable_ratio(embedding.threshold)));
             entry.insert("capacity", value(embedding.capacity as i64));
             entry.insert("ttl_secs", value(embedding.ttl_secs as i64));
-            entry.insert("retriage_below", value(f64::from(embedding.retriage_below)));
+            entry.insert(
+                "retriage_below",
+                value(readable_ratio(embedding.retriage_below)),
+            );
             entry.insert("retry_escalation", value(embedding.retry_escalation));
             entry.insert(
                 "retry_threshold",
-                value(f64::from(embedding.retry_threshold)),
+                value(readable_ratio(embedding.retry_threshold)),
             );
             entry.insert("timeout_ms", value(embedding.timeout_ms as i64));
             table.insert("embedding", Item::Table(entry));

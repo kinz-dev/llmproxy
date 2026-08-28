@@ -1419,6 +1419,11 @@ details.provider-editor .field-row { margin-top: 10px; }
   color: var(--muted);
 }
 
+/* A status badge in a narrow table column must not wrap onto two lines. */
+.data-table .badge {
+  white-space: nowrap;
+}
+
 /* A row that is reported but deliberately not ranked. */
 .row-muted {
   opacity: 0.62;

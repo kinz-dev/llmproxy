@@ -651,6 +651,48 @@
           </div>
           <div id="test-results"></div>
         </section>
+
+        <section class="panel" aria-labelledby="corpus-label">
+          <h3 class="panel-label" id="corpus-label">Routing regression suite</h3>
+          <p class="panel-intro">Replay a corpus of real requests against the policy above and diff the decisions. This is what makes a policy edit falsifiable rather than a matter of taste.</p>
+          <div class="form-actions corpus-actions">
+            <button class="button" type="button" id="corpus-capture">Capture from decisions</button>
+            <button class="button" type="button" id="corpus-download">Download corpus</button>
+            <span class="hint form-note" id="corpus-count">no corpus loaded</span>
+            <button class="button button-primary" type="button" id="corpus-replay">Replay &amp; diff</button>
+          </div>
+          <textarea class="input mono corpus-editor" id="corpus-json" rows="8" spellcheck="false"
+            placeholder='{ "mode": "integrated", "cases": [{ "prompt": "…", "decision": "redirect", "target": "backend" }] }'
+            aria-label="Routing corpus JSON"></textarea>
+          <p class="hint" id="corpus-running" hidden>replaying…</p>
+          <div id="corpus-results"></div>
+          <p class="hint">Save the corpus in the repository and run
+            <code class="mono">llmproxy --route-corpus corpus.json</code> in CI; it exits non-zero when a decision moves.</p>
+        </section>
+      </div>
+
+      <div id="subview-routing-memory" class="subview" role="tabpanel" aria-labelledby="subtab-routing-memory" hidden>
+        <section class="panel" aria-labelledby="memory-label">
+          <div class="panel-head">
+            <h3 class="panel-label" id="memory-label">Shared project memory</h3>
+            <div class="panel-controls">
+              <label class="filter-field"><span class="filter-name mono">project</span>
+                <select class="input mono" id="memory-project"></select></label>
+              <button class="button button-quiet" id="memory-refresh" type="button">Refresh</button>
+            </div>
+          </div>
+          <p class="panel-intro">Findings, decisions, and dead ends recorded by earlier sessions — from any agent — and prepended to later requests in this project.</p>
+          <p class="hint" id="memory-status"></p>
+          <ul class="memory-list" id="memory-list"></ul>
+          <p class="hint" id="memory-empty">nothing recorded for this project yet</p>
+          <form class="inline-form" id="memory-add-form">
+            <input class="input" id="memory-add-text" placeholder="e.g. the parser is the bottleneck; rayon made it slower" aria-label="New note">
+            <button class="button button-primary" type="submit">Record note</button>
+          </form>
+          <p class="hint">Agents can record notes in-band with
+            <code class="mono">remember: …</code>, list them with <code class="mono">recall:</code>,
+            and clear them with <code class="mono">forget:</code>.</p>
+        </section>
       </div>
     </div>
 
@@ -772,6 +814,58 @@
               <input class="input mono" id="rolemap-add-to" placeholder="rewritten role e.g. system" aria-label="Rewritten role">
               <button class="button" type="button" id="rolemap-add">Add rewrite</button>
             </div>
+          </details>
+          <details class="adv">
+            <summary>Provider health and circuit breaking</summary>
+            <p class="hint">A provider that is rate-limited or down is routed around rather than retried into the ground. Quota exhaustion has a duration the provider tells us about; an outage gets exponential backoff behind a single probe.</p>
+            <div class="field-row">
+              <label class="field field-check"><input type="checkbox" id="set-health-enabled">
+                <span>Track provider health</span></label>
+              <label class="field"><span class="field-name mono">failure_threshold</span>
+                <input class="input mono" id="set-health-threshold" type="number" min="1"></label>
+              <label class="field"><span class="field-name mono">open_secs</span>
+                <input class="input mono" id="set-health-open" type="number" min="1"></label>
+              <label class="field"><span class="field-name mono">max_open_secs</span>
+                <input class="input mono" id="set-health-max-open" type="number" min="1"></label>
+            </div>
+            <div class="table-scroll bounded-table">
+              <table class="data-table" id="health-table">
+                <thead><tr><th>provider</th><th>status</th><th>ok</th><th>failed</th><th>retry in</th><th>last error</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <div class="form-actions">
+              <button class="button button-quiet" id="health-reset" type="button">Clear health state</button>
+            </div>
+          </details>
+
+          <details class="adv">
+            <summary>Shared project memory</summary>
+            <div class="field-row">
+              <label class="field field-check"><input type="checkbox" id="set-memory-enabled">
+                <span>Keep a project memory</span></label>
+              <label class="field field-check"><input type="checkbox" id="set-memory-inject">
+                <span>Inject it into requests <span class="choice-note">paid for on every turn</span></span></label>
+              <label class="field"><span class="field-name mono">max_notes</span>
+                <input class="input mono" id="set-memory-notes" type="number" min="1"></label>
+              <label class="field"><span class="field-name mono">max_injected_chars</span>
+                <input class="input mono" id="set-memory-chars" type="number" min="1" step="500"></label>
+            </div>
+          </details>
+
+          <details class="adv">
+            <summary>Redact and route</summary>
+            <p class="hint">The permissive counterpart to rejecting sensitive prompts: detected secrets become stable placeholders, the request routes normally, and the originals are put back as the response streams. A private-key block is redacted and stays redacted.</p>
+            <div class="field-row">
+              <label class="field field-check"><input type="checkbox" id="set-redact-enabled">
+                <span>Redact secrets before routing</span></label>
+              <label class="field field-check"><input type="checkbox" id="set-redact-rehydrate">
+                <span>Restore originals in the response</span></label>
+              <label class="field"><span class="field-name mono">triage_max_messages <span class="sub-note">0 = whole conversation</span></span>
+                <input class="input mono" id="set-triage-max" type="number" min="0"></label>
+            </div>
+            <label class="field"><span class="field-name mono">extra_literals <span class="sub-note">comma separated; things the detectors cannot know about</span></span>
+              <input class="input mono" id="set-redact-literals" placeholder="build01.internal.invalid"></label>
           </details>
           <div class="form-actions"><button class="button button-primary" type="submit">Save settings</button></div>
         </form>

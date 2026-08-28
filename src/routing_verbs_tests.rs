@@ -10,9 +10,7 @@ fn targets() -> BTreeMap<String, IntegratedTarget> {
             model: "claude-test".to_string(),
             hint: "GUI work".to_string(),
             reasoning_effort: None,
-            is_default: false,
-            strength: None,
-            failover: Vec::new(),
+            ..IntegratedTarget::default()
         },
     )])
 }

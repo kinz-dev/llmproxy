@@ -148,6 +148,9 @@ pub(crate) struct IntegratedConfig {
     /// Embedding-cached routing, sticky drift detection, and retry-driven
     /// escalation, all of which need one vector per request.
     pub(crate) embedding: crate::route_cache::EmbeddingConfig,
+    /// Send a sampled share of requests to a second provider, return one, and
+    /// log both for comparison in the admin interface.
+    pub(crate) shadow: crate::comparison::ShadowConfig,
     /// Default failover chain for targets that do not define their own.
     /// Quota exhaustion and outages are absorbed here rather than reported to
     /// the caller mid-task.
@@ -195,6 +198,7 @@ impl Default for IntegratedConfig {
             sticky_capacity: 1024,
             verbs: true,
             embedding: crate::route_cache::EmbeddingConfig::default(),
+            shadow: crate::comparison::ShadowConfig::default(),
             failover: Vec::new(),
             speculative: false,
             instructions: String::new(),
@@ -244,7 +248,7 @@ fn integrated_routing_requested(config: &IntegratedConfig, client_model: Option<
     config.enabled && client_model == Some(INTEGRATED_AUTO_MODEL)
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct IntegratedTarget {
     pub(crate) provider: String,
@@ -268,6 +272,10 @@ pub(crate) struct IntegratedTarget {
     /// `integrated.failover`.
     #[serde(default)]
     pub(crate) failover: Vec<String>,
+    /// Ask a second provider the same question and show or reconcile both
+    /// answers. Opt-in per target, for routes that carry consequential work.
+    #[serde(default)]
+    pub(crate) second_opinion: Option<crate::comparison::SecondOpinionConfig>,
 }
 
 impl Default for InterceptorConfig {
@@ -480,6 +488,21 @@ impl RoutingAuditDraft {
         );
     }
 
+    fn note_second_opinion(&mut self, second: &str, mode: &str, overlap: f32) {
+        self.audit.reason = format!(
+            "{} A second opinion was taken from {second:?} in {mode} mode; the two answers overlapped {:.0}%.",
+            self.audit.reason,
+            overlap * 100.0
+        );
+    }
+
+    fn note_shadow(&mut self, shadow: &str) {
+        self.audit.reason = format!(
+            "{} A sampled shadow copy was sent to {shadow:?} for comparison; the caller received the primary answer.",
+            self.audit.reason
+        );
+    }
+
     /// Record what the failover chain did, so the admin Decisions view shows
     /// an absorbed outage rather than an unexplained provider change.
     fn note_failover(&mut self, skipped: &[String], failed: &[String]) {
@@ -624,9 +647,38 @@ pub(crate) fn validate_integrated_config(
     {
         bail!(error);
     }
+    if let Err(error) = config
+        .shadow
+        .validate(|name| config.targets.contains_key(name))
+    {
+        bail!(error);
+    }
     for candidate in &config.failover {
         if !config.targets.contains_key(candidate) {
             bail!("integrated.failover references unknown target {candidate:?}");
+        }
+    }
+    for (name, target) in &config.targets {
+        let Some(second) = &target.second_opinion else {
+            continue;
+        };
+        if second.target == *name {
+            bail!("integrated target {name:?} cannot ask itself for a second opinion");
+        }
+        if !config.targets.contains_key(&second.target) {
+            bail!(
+                "integrated target {name:?} second_opinion references unknown target {:?}",
+                second.target
+            );
+        }
+        match (&second.mode, &second.reconciler) {
+            (crate::comparison::SecondOpinionMode::Reconcile, None) => bail!(
+                "integrated target {name:?} second_opinion mode \"reconcile\" requires a reconciler target"
+            ),
+            (_, Some(reconciler)) if !config.targets.contains_key(reconciler) => bail!(
+                "integrated target {name:?} second_opinion reconciler {reconciler:?} is not a configured target"
+            ),
+            _ => {}
         }
     }
     for (name, target) in &config.targets {
@@ -1882,6 +1934,203 @@ fn start_speculation(
     })
 }
 
+/// Label a target carries in a composed answer: name plus its destination, so
+/// the reader knows which provider said what.
+fn target_label(state: &AppState, name: &str) -> String {
+    match state.config.integrated.targets.get(name) {
+        Some(target) => format!("{name} ({}/{})", target.provider, target.model),
+        None => name.to_string(),
+    }
+}
+
+/// Ask one target for a complete answer.
+async fn target_completion(state: &AppState, name: &str, chat_request: &Value) -> Option<Value> {
+    let target = state.config.integrated.targets.get(name)?;
+    let provider = state.providers.get(&target.provider)?;
+    if !crate::health::provider_health()
+        .peek(&provider.name)
+        .is_available()
+    {
+        return None;
+    }
+    match crate::integrated_chat_completion(
+        provider,
+        chat_request.clone(),
+        target,
+        state.config.as_ref(),
+    )
+    .await
+    {
+        Ok(completion) => Some(completion),
+        Err(error) => {
+            crate::health::provider_health().record_failure(&provider.name, error.to_string());
+            crate::stats::error_log().record(&provider.name, "comparison", error.to_string());
+            None
+        }
+    }
+}
+
+/// Second opinion: ask two providers, then present both or have a third
+/// reconcile them. Returns `None` whenever the comparison cannot be completed
+/// honestly, in which case the caller sends the request the ordinary way.
+async fn run_second_opinion(
+    state: &AppState,
+    target_name: &str,
+    chat_request: &Value,
+    protocol: InterceptorProtocol,
+    client_model: &Option<String>,
+    client_streaming: bool,
+    audit: &mut RoutingAuditDraft,
+) -> Option<Response> {
+    let second = state
+        .config
+        .integrated
+        .targets
+        .get(target_name)?
+        .second_opinion
+        .clone()?;
+    let (primary, alternate) = tokio::join!(
+        target_completion(state, target_name, chat_request),
+        target_completion(state, &second.target, chat_request),
+    );
+    let primary = primary?;
+    let Some(alternate) = alternate else {
+        // One answer is not a second opinion. Serving the primary answer as
+        // if it had been checked would be worse than not checking.
+        return None;
+    };
+    if crate::comparison::wants_tool_call(&primary)
+        || crate::comparison::wants_tool_call(&alternate)
+    {
+        // A composed answer is text and would silently drop the tool call.
+        return None;
+    }
+    let primary_answer = crate::comparison::answer_text(&primary);
+    let alternate_answer = crate::comparison::answer_text(&alternate);
+    if primary_answer.trim().is_empty() || alternate_answer.trim().is_empty() {
+        return None;
+    }
+    let primary_label = target_label(state, target_name);
+    let second_label = target_label(state, &second.target);
+
+    let composed = match second.mode {
+        crate::comparison::SecondOpinionMode::Present => crate::comparison::present_both(
+            &primary_label,
+            &primary_answer,
+            &second_label,
+            &alternate_answer,
+        ),
+        crate::comparison::SecondOpinionMode::Reconcile => {
+            let reconciler = second.reconciler.as_ref()?;
+            let prompt = crate::comparison::reconcile_prompt(
+                &request_prompt_preview(chat_request),
+                &primary_label,
+                &primary_answer,
+                &second_label,
+                &alternate_answer,
+            );
+            let request = json!({ "messages": [{ "role": "user", "content": prompt }] });
+            let reconciled = target_completion(state, reconciler, &request).await?;
+            let text = crate::comparison::answer_text(&reconciled);
+            if text.trim().is_empty() {
+                return None;
+            }
+            text
+        }
+    };
+
+    proxy_stats().record_second_opinion();
+    let overlap = crate::comparison::word_overlap(&primary_answer, &alternate_answer);
+    audit.note_second_opinion(&second.target, second.mode.as_str(), overlap);
+
+    let mut completion = primary;
+    if let Some(message) = crate::first_chat_choice_message_mut(&mut completion) {
+        message["content"] = Value::String(composed);
+    }
+    Some(render_local_completion(
+        protocol,
+        completion,
+        client_model.clone(),
+        client_streaming,
+        &audit.audit.request_id.clone(),
+    ))
+}
+
+/// Shadow request: send a sampled copy to a second provider, return the
+/// primary answer, and record both so the choice can be argued from evidence.
+async fn run_shadow_comparison(
+    state: &AppState,
+    target_name: &str,
+    chat_request: &Value,
+    protocol: InterceptorProtocol,
+    client_model: &Option<String>,
+    client_streaming: bool,
+    audit: &mut RoutingAuditDraft,
+) -> Option<Response> {
+    let shadow = &state.config.integrated.shadow;
+    if !shadow.is_active() || shadow.target == target_name {
+        return None;
+    }
+    if !crate::comparison::shadow_sampler().take(shadow.sample_one_in) {
+        return None;
+    }
+    let started = Instant::now();
+    let (primary, alternate) = tokio::join!(
+        target_completion(state, target_name, chat_request),
+        tokio::time::timeout(
+            Duration::from_millis(shadow.timeout_ms),
+            target_completion(state, &shadow.target, chat_request),
+        ),
+    );
+    let primary = primary?;
+    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let alternate = alternate.ok().flatten();
+
+    let primary_answer = crate::comparison::answer_text(&primary);
+    let shadow_answer = alternate
+        .as_ref()
+        .map(crate::comparison::answer_text)
+        .unwrap_or_default();
+    let shadow_model = state
+        .config
+        .integrated
+        .targets
+        .get(&shadow.target)
+        .map(|target| target.model.clone())
+        .unwrap_or_default();
+    crate::stats::shadow_log().record(crate::stats::ShadowComparison {
+        request_id: audit.audit.request_id.clone(),
+        project: state.config.project.clone(),
+        prompt: request_prompt_preview(chat_request),
+        primary_target: target_name.to_string(),
+        primary_model: state.config.integrated.targets[target_name].model.clone(),
+        primary_answer,
+        primary_ms: elapsed_ms,
+        shadow_target: shadow.target.clone(),
+        shadow_model,
+        shadow_answer: shadow_answer.clone(),
+        shadow_ms: elapsed_ms,
+        shadow_error: alternate
+            .is_none()
+            .then(|| "the shadow provider did not answer".to_string()),
+        overlap: crate::comparison::word_overlap(
+            &crate::comparison::answer_text(&primary),
+            &shadow_answer,
+        ),
+    });
+    proxy_stats().record_shadow_request();
+    audit.note_shadow(&shadow.target);
+
+    // The caller only ever sees the primary answer.
+    Some(render_local_completion(
+        protocol,
+        primary,
+        client_model.clone(),
+        client_streaming,
+        &audit.audit.request_id.clone(),
+    ))
+}
+
 /// The ordered list of targets to try: the chosen one, then its failover
 /// chain, then the shared default chain. Deduplicated and bounded so a
 /// mis-configured cycle cannot loop.
@@ -1946,6 +2195,67 @@ async fn execute_integrated_redirect(
         None => target_name.to_string(),
     };
     let target_name = target_name.as_str();
+
+    // Both comparison paths need whole answers, so they buffer instead of
+    // streaming. Second opinion is deliberate and per-target; shadowing is
+    // sampled, which is why its rate should stay low.
+    if let Some(response) = run_second_opinion(
+        state,
+        target_name,
+        &chat_request,
+        protocol,
+        &client_model,
+        client_streaming,
+        &mut audit,
+    )
+    .await
+    {
+        if let Some(key) = conversation_key {
+            sticky_routes().insert(
+                key,
+                target_name.to_string(),
+                state.config.integrated.sticky_ttl_secs,
+                state.config.integrated.sticky_capacity,
+                context.vector.clone(),
+            );
+        }
+        let target = &state.config.integrated.targets[target_name];
+        let provider = state
+            .providers
+            .get(&target.provider)
+            .expect("validated integrated provider missing");
+        audit.record_destination(provider, &target.model);
+        return InterceptionOutcome::Respond(response);
+    }
+    if let Some(response) = run_shadow_comparison(
+        state,
+        target_name,
+        &chat_request,
+        protocol,
+        &client_model,
+        client_streaming,
+        &mut audit,
+    )
+    .await
+    {
+        if let Some(key) = conversation_key {
+            sticky_routes().insert(
+                key,
+                target_name.to_string(),
+                state.config.integrated.sticky_ttl_secs,
+                state.config.integrated.sticky_capacity,
+                context.vector.clone(),
+            );
+        }
+        let target = &state.config.integrated.targets[target_name];
+        let provider = state
+            .providers
+            .get(&target.provider)
+            .expect("validated integrated provider missing");
+        audit.record_destination(provider, &target.model);
+        return InterceptionOutcome::Respond(response);
+    }
+
     let chain = failover_chain(&state.config.integrated, target_name);
     let mut skipped: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();

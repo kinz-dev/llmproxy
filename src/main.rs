@@ -45,6 +45,7 @@ mod agent_launcher;
 mod backend_adapters;
 mod claude_launcher;
 mod codex_launcher;
+mod comparison;
 mod copilot_launcher;
 mod health;
 mod interceptor;
@@ -1102,6 +1103,7 @@ async fn run_server(
         stats::traffic_log().set_enabled(true);
         stats::error_log().set_enabled(true);
         stats::routing_decision_log().set_enabled(true);
+        stats::shadow_log().set_enabled(true);
         let admin_context = Arc::new(admin::AdminContext::new(
             config_path,
             launcher_name,
@@ -3905,6 +3907,58 @@ async fn proxy_anthropic_stream_via_chat(
     }
 }
 
+/// One buffered chat completion from an integrated target.
+///
+/// Shares every rule `proxy_integrated_chat` applies — the target's reasoning
+/// effort override, cross-provider sanitization, protocol adaptation — but
+/// returns the completion as a value so two of them can be compared. Used by
+/// second opinions and shadow requests, both of which need whole answers.
+pub(crate) async fn integrated_chat_completion(
+    provider: &ProviderState,
+    mut chat_request: Value,
+    target: &interceptor::IntegratedTarget,
+    config: &Config,
+) -> std::result::Result<Value, UpstreamFailure> {
+    let provider_override = target.reasoning_effort.map(|effort| {
+        let mut provider_config = (*provider.config).clone();
+        provider_config.reasoning_effort = Some(effort);
+        ProviderState {
+            config: Arc::new(provider_config),
+            ..provider.clone()
+        }
+    });
+    let provider = provider_override.as_ref().unwrap_or(provider);
+    if let Some(object) = chat_request.as_object_mut() {
+        object.insert("model".to_string(), Value::String(target.model.clone()));
+        object.insert("stream".to_string(), Value::Bool(false));
+        object.remove("stream_options");
+    }
+    sanitize_cross_provider_chat_request(&mut chat_request);
+    normalize_chat_completion_request(&mut chat_request, config);
+
+    let headers = HeaderMap::new();
+    let class = route_class_for_base_url(&provider.config.base_url);
+    let started = Instant::now();
+    let estimated_input_tokens = estimate_tokens(&chat_request) as u64;
+    log_request_value(class, &provider.name, &chat_request);
+    let completion = upstream_chat_json(provider, &headers, &chat_request).await?;
+    stats::log_response_value(class, &provider.name, &completion);
+    let usage = stats::TokenUsage::from_response(
+        completion.get("usage"),
+        estimated_input_tokens,
+        estimate_tokens(&completion) as u64,
+    );
+    proxy_stats().record_model_usage(
+        config.project.as_deref(),
+        &provider.name,
+        &target.model,
+        started.elapsed(),
+        usage,
+    );
+    health::provider_health().record_success(&provider.name);
+    Ok(completion)
+}
+
 pub(crate) async fn proxy_integrated_chat(
     provider: &ProviderState,
     mut chat_request: Value,
@@ -5639,6 +5693,14 @@ fn first_chat_choice_message(upstream: &Value) -> Option<&Value> {
         .and_then(|choice| choice.get("message"))
 }
 
+fn first_chat_choice_message_mut(upstream: &mut Value) -> Option<&mut Value> {
+    upstream
+        .get_mut("choices")
+        .and_then(Value::as_array_mut)
+        .and_then(|choices| choices.first_mut())
+        .and_then(|choice| choice.get_mut("message"))
+}
+
 fn response_message_item(item_id: &str, status: &str, output_text: &str) -> Value {
     json!({
         "id": item_id,
@@ -7279,9 +7341,7 @@ mod tests {
                 model: "local-model".to_string(),
                 hint: "larger local work".to_string(),
                 reasoning_effort: None,
-                is_default: false,
-                strength: None,
-                failover: Vec::new(),
+                ..interceptor::IntegratedTarget::default()
             },
         );
         assert!(validate_launcher_runtime(&config, LauncherMode::Integrated).is_ok());
@@ -7625,9 +7685,7 @@ mod tests {
                         model: "target-model".to_string(),
                         hint: "explicitly selected work".to_string(),
                         reasoning_effort: None,
-                        is_default: false,
-                        strength: None,
-                        failover: Vec::new(),
+                        ..interceptor::IntegratedTarget::default()
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -7780,9 +7838,7 @@ mod tests {
                         model: "target-model".to_string(),
                         hint: "complex work".to_string(),
                         reasoning_effort: Some(ReasoningEffort::Max),
-                        is_default: false,
-                        strength: None,
-                        failover: Vec::new(),
+                        ..interceptor::IntegratedTarget::default()
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -7890,9 +7946,7 @@ mod tests {
                         model: "fallback-model".to_string(),
                         hint: "complex work".to_string(),
                         reasoning_effort: None,
-                        is_default: false,
-                        strength: None,
-                        failover: Vec::new(),
+                        ..interceptor::IntegratedTarget::default()
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -8015,9 +8069,7 @@ mod tests {
                         model: "target-model".to_string(),
                         hint: "complex work".to_string(),
                         reasoning_effort: None,
-                        is_default: false,
-                        strength: None,
-                        failover: Vec::new(),
+                        ..interceptor::IntegratedTarget::default()
                     },
                 )]),
                 ..IntegratedConfig::default()
@@ -11122,9 +11174,7 @@ mod tests {
                 model: "gpt-test".to_string(),
                 hint: "everything else".to_string(),
                 reasoning_effort: None,
-                is_default: false,
-                strength: None,
-                failover: Vec::new(),
+                ..interceptor::IntegratedTarget::default()
             },
         );
         config.integrated.targets.insert(
@@ -11134,9 +11184,7 @@ mod tests {
                 model: "ghost".to_string(),
                 hint: "unreachable".to_string(),
                 reasoning_effort: None,
-                is_default: false,
-                strength: None,
-                failover: Vec::new(),
+                ..interceptor::IntegratedTarget::default()
             },
         );
 

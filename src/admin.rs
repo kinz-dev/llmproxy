@@ -138,6 +138,8 @@ fn router(state: AdminState) -> Router {
         .route("/api/health/reset", post(api_health_reset))
         .route("/api/route-cache", get(api_route_cache))
         .route("/api/route-cache/clear", post(api_route_cache_clear))
+        .route("/api/shadow", get(api_shadow))
+        .route("/api/shadow/clear", post(api_shadow_clear))
         .route("/api/logs", get(api_logs))
         .route("/api/logs/clear", post(api_logs_clear))
         .route("/api/errors", get(api_errors))
@@ -450,6 +452,17 @@ async fn api_stats(State(state): State<AdminState>) -> Response {
 
 async fn api_stats_reset() -> Response {
     proxy_stats().reset();
+    Json(json!({ "ok": true })).into_response()
+}
+
+/// Paired answers from sampled shadow requests, so provider choice can be
+/// argued from evidence.
+async fn api_shadow(Query(query): Query<LogsQuery>) -> Response {
+    Json(crate::stats::shadow_log().snapshot_after(query.after)).into_response()
+}
+
+async fn api_shadow_clear() -> Response {
+    crate::stats::shadow_log().clear();
     Json(json!({ "ok": true })).into_response()
 }
 

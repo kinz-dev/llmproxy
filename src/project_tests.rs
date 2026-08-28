@@ -6,9 +6,7 @@ fn sample_target(provider: &str) -> IntegratedTarget {
         model: "model-x".to_string(),
         hint: "frontend work".to_string(),
         reasoning_effort: None,
-        is_default: false,
-        strength: None,
-        failover: Vec::new(),
+        ..IntegratedTarget::default()
     }
 }
 

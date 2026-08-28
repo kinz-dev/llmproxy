@@ -266,6 +266,8 @@ pub(crate) struct ProxyStats {
     intercept_pass: AtomicU64,
     intercept_redirect: AtomicU64,
     intercept_failover: AtomicU64,
+    second_opinions: AtomicU64,
+    shadow_requests: AtomicU64,
     route_cache_hits: AtomicU64,
     retry_escalations: AtomicU64,
     speculation_used: AtomicU64,
@@ -346,6 +348,14 @@ impl ProxyStats {
             .lock()
             .expect("redirect stats poisoned");
         *redirects.entry(target.to_string()).or_default() += 1;
+    }
+
+    pub(crate) fn record_second_opinion(&self) {
+        self.second_opinions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_shadow_request(&self) {
+        self.shadow_requests.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A past decision with a near-identical embedding was replayed, so the
@@ -493,6 +503,8 @@ impl ProxyStats {
             &self.intercept_pass,
             &self.intercept_redirect,
             &self.intercept_failover,
+            &self.second_opinions,
+            &self.shadow_requests,
             &self.route_cache_hits,
             &self.retry_escalations,
             &self.speculation_used,
@@ -687,6 +699,8 @@ impl ProxyStats {
                 "pass": load(&self.intercept_pass),
                 "redirect": load(&self.intercept_redirect),
                 "failover": load(&self.intercept_failover),
+                "second_opinions": load(&self.second_opinions),
+                "shadow_requests": load(&self.shadow_requests),
                 "route_cache_hits": load(&self.route_cache_hits),
                 "retry_escalations": load(&self.retry_escalations),
                 "speculation_used": load(&self.speculation_used),
@@ -1578,6 +1592,113 @@ impl RoutingDecisionLog {
 
     pub(crate) fn snapshot_after(&self, after: u64) -> Value {
         self.buffer.snapshot_after(after, ROUTING_DECISION_LOG_TTL)
+    }
+}
+
+// Shadow comparisons: a bounded, expiring feed of paired answers so provider
+// choice can be argued from evidence rather than preference.
+
+const SHADOW_LOG_CAP: usize = 128;
+const SHADOW_LOG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const SHADOW_PREVIEW_CHARS: usize = 1200;
+
+#[derive(Debug, Clone)]
+pub(crate) struct ShadowComparison {
+    pub(crate) request_id: String,
+    pub(crate) project: Option<String>,
+    pub(crate) prompt: String,
+    pub(crate) primary_target: String,
+    pub(crate) primary_model: String,
+    pub(crate) primary_answer: String,
+    pub(crate) primary_ms: u64,
+    pub(crate) shadow_target: String,
+    pub(crate) shadow_model: String,
+    pub(crate) shadow_answer: String,
+    pub(crate) shadow_ms: u64,
+    pub(crate) shadow_error: Option<String>,
+    pub(crate) overlap: f32,
+}
+
+struct ShadowEntry {
+    metadata: LogMetadata,
+    comparison: ShadowComparison,
+}
+
+impl LogEntry for ShadowEntry {
+    fn metadata(&self) -> &LogMetadata {
+        &self.metadata
+    }
+
+    fn to_json(&self) -> Value {
+        let comparison = &self.comparison;
+        json!({
+            "id": self.metadata.id,
+            "ts_ms": self.metadata.epoch_ms,
+            "request_id": comparison.request_id,
+            "project": comparison.project,
+            "prompt": comparison.prompt,
+            "primary": {
+                "target": comparison.primary_target,
+                "model": comparison.primary_model,
+                "answer": comparison.primary_answer,
+                "elapsed_ms": comparison.primary_ms,
+            },
+            "shadow": {
+                "target": comparison.shadow_target,
+                "model": comparison.shadow_model,
+                "answer": comparison.shadow_answer,
+                "elapsed_ms": comparison.shadow_ms,
+                "error": comparison.shadow_error,
+            },
+            // A coarse word-overlap score, not a semantic judgement.
+            "overlap": comparison.overlap,
+        })
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ShadowLog {
+    buffer: LogBuffer<ShadowEntry>,
+}
+
+pub(crate) fn shadow_log() -> &'static ShadowLog {
+    static LOG: OnceLock<ShadowLog> = OnceLock::new();
+    LOG.get_or_init(ShadowLog::default)
+}
+
+impl ShadowLog {
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        self.buffer.set_enabled(enabled);
+    }
+
+    pub(crate) fn record(&self, mut comparison: ShadowComparison) {
+        comparison.prompt = bounded_single_line(comparison.prompt, ROUTING_PROMPT_PREVIEW_CHARS);
+        comparison.primary_answer =
+            bounded_single_line(comparison.primary_answer, SHADOW_PREVIEW_CHARS);
+        comparison.shadow_answer =
+            bounded_single_line(comparison.shadow_answer, SHADOW_PREVIEW_CHARS);
+        info!(
+            request_id = comparison.request_id,
+            primary = comparison.primary_target,
+            shadow = comparison.shadow_target,
+            overlap = comparison.overlap,
+            "shadow comparison recorded"
+        );
+        self.buffer
+            .record(SHADOW_LOG_CAP, SHADOW_LOG_TTL, move |metadata| {
+                ShadowEntry {
+                    metadata,
+                    comparison,
+                }
+            });
+    }
+
+    pub(crate) fn clear(&self) {
+        self.buffer.clear();
+    }
+
+    pub(crate) fn snapshot_after(&self, after: u64) -> Value {
+        self.buffer.snapshot_after(after, SHADOW_LOG_TTL)
     }
 }
 

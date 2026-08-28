@@ -53,6 +53,7 @@ mod logging;
 mod oauth;
 mod pricing;
 mod project;
+mod redact;
 mod route_cache;
 mod routing_verbs;
 mod stats;
@@ -2384,6 +2385,12 @@ async fn launcher_chat_completions(
     chat_completions_impl(&shared, Some(launcher_token.as_str()), headers, body).await
 }
 
+/// Redact on the way in, route, then put the originals back on the way out.
+///
+/// Substitution happens on the caller's own body before the local triage copy
+/// is derived from it, so a secret reaches neither the triage model nor the
+/// provider, and rehydration wraps every path out — local answer, redirect,
+/// and normal routing alike.
 async fn chat_completions_impl(
     shared: &SharedState,
     launcher_token: Option<&str>,
@@ -2394,6 +2401,29 @@ async fn chat_completions_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
+    if !state.config.interceptor.redact.enabled {
+        return chat_completions_routed(state, launcher_token, headers, body).await;
+    }
+    let redaction = redact::redact_request(&state.config.interceptor.redact, &mut body);
+    if redaction.is_empty() {
+        return chat_completions_routed(state, launcher_token, headers, body).await;
+    }
+    info!(
+        frontend = "chat_completions",
+        placeholders = redaction.issued(),
+        restorable = redaction.restorable(),
+        "redacted a request before routing"
+    );
+    let response = chat_completions_routed(state, launcher_token, headers, body).await;
+    redact::rehydrate_response(response, &redaction)
+}
+
+async fn chat_completions_routed(
+    state: AppState,
+    launcher_token: Option<&str>,
+    headers: HeaderMap,
+    mut body: Value,
+) -> Response {
     trace_client_request(
         "chat_completions",
         launcher_token,
@@ -2489,6 +2519,12 @@ async fn launcher_responses(
     responses_impl(&shared, Some(launcher_token.as_str()), headers, body).await
 }
 
+/// Redact on the way in, route, then put the originals back on the way out.
+///
+/// Substitution happens on the caller's own body before the local triage copy
+/// is derived from it, so a secret reaches neither the triage model nor the
+/// provider, and rehydration wraps every path out — local answer, redirect,
+/// and normal routing alike.
 async fn responses_impl(
     shared: &SharedState,
     launcher_token: Option<&str>,
@@ -2499,6 +2535,29 @@ async fn responses_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
+    if !state.config.interceptor.redact.enabled {
+        return responses_routed(state, launcher_token, headers, body).await;
+    }
+    let redaction = redact::redact_request(&state.config.interceptor.redact, &mut body);
+    if redaction.is_empty() {
+        return responses_routed(state, launcher_token, headers, body).await;
+    }
+    info!(
+        frontend = "responses",
+        placeholders = redaction.issued(),
+        restorable = redaction.restorable(),
+        "redacted a request before routing"
+    );
+    let response = responses_routed(state, launcher_token, headers, body).await;
+    redact::rehydrate_response(response, &redaction)
+}
+
+async fn responses_routed(
+    state: AppState,
+    launcher_token: Option<&str>,
+    headers: HeaderMap,
+    mut body: Value,
+) -> Response {
     trace_client_request(
         "responses",
         launcher_token,
@@ -2621,6 +2680,12 @@ async fn launcher_anthropic_messages(
     anthropic_messages_impl(&shared, Some(launcher_token.as_str()), headers, body).await
 }
 
+/// Redact on the way in, route, then put the originals back on the way out.
+///
+/// Substitution happens on the caller's own body before the local triage copy
+/// is derived from it, so a secret reaches neither the triage model nor the
+/// provider, and rehydration wraps every path out — local answer, redirect,
+/// and normal routing alike.
 async fn anthropic_messages_impl(
     shared: &SharedState,
     launcher_token: Option<&str>,
@@ -2631,6 +2696,29 @@ async fn anthropic_messages_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
+    if !state.config.interceptor.redact.enabled {
+        return anthropic_messages_routed(state, launcher_token, headers, body).await;
+    }
+    let redaction = redact::redact_request(&state.config.interceptor.redact, &mut body);
+    if redaction.is_empty() {
+        return anthropic_messages_routed(state, launcher_token, headers, body).await;
+    }
+    info!(
+        frontend = "anthropic_messages",
+        placeholders = redaction.issued(),
+        restorable = redaction.restorable(),
+        "redacted a request before routing"
+    );
+    let response = anthropic_messages_routed(state, launcher_token, headers, body).await;
+    redact::rehydrate_response(response, &redaction)
+}
+
+async fn anthropic_messages_routed(
+    state: AppState,
+    launcher_token: Option<&str>,
+    headers: HeaderMap,
+    mut body: Value,
+) -> Response {
     trace_client_request(
         "anthropic_messages",
         launcher_token,

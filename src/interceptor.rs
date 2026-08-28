@@ -118,6 +118,10 @@ pub(crate) struct InterceptorConfig {
     /// routing instead of serving a clipped answer.
     pub(crate) max_tokens: u64,
     pub(crate) parallel_tool_calls: bool,
+    /// Replace detected secrets with placeholders, route normally, and put the
+    /// originals back in the response. The permissive counterpart to
+    /// `reject_sensitive`.
+    pub(crate) redact: crate::redact::RedactConfig,
     /// Newest non-system messages copied into the triage request. The whole
     /// conversation is otherwise copied, so triage input grows with the
     /// conversation; trimming it cuts cost and reduces the noise the hints are
@@ -291,6 +295,7 @@ impl Default for InterceptorConfig {
             temperature: 0.0,
             max_tokens: 512,
             parallel_tool_calls: false,
+            redact: crate::redact::RedactConfig::default(),
             triage_max_messages: 24,
         }
     }
@@ -583,6 +588,9 @@ pub(crate) fn validate_config(
     config: &InterceptorConfig,
     providers: &HashMap<String, UpstreamConfig>,
 ) -> Result<()> {
+    if let Err(error) = config.redact.validate() {
+        bail!(error);
+    }
     if !config.enabled && !config.reject_sensitive {
         return Ok(());
     }

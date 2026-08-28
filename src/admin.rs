@@ -117,8 +117,15 @@ pub(crate) async fn spawn(
     info!(admin_url = %format!("http://{bound}/"), "admin interface listening");
 
     let app = router(AdminState { shared, context });
+    // The admin listener shuts down on the same signal as the proxy. Without
+    // this it stayed bound for as long as the process lived — including the
+    // whole of a graceful drain — so a replacement daemon started during a
+    // restart could not bind it, and exited instead.
     tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, app).await {
+        if let Err(error) = axum::serve(listener, app)
+            .with_graceful_shutdown(crate::shutdown_signal())
+            .await
+        {
             error!(error = %error, "admin interface server exited");
         }
     });

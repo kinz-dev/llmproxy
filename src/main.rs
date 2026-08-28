@@ -1579,11 +1579,103 @@ async fn shutdown_daemon(addr: SocketAddr) -> Result<bool> {
         return Err(error).context(format!("failed to stop llmproxy pid {pid}"));
     }
 
+    // The proxy listener going quiet is not the same as the daemon being gone.
+    // Axum stops accepting the moment it is signalled, but the process lives
+    // until every in-flight stream drains, and it holds the admin listener for
+    // all of that time. A replacement started at that point binds the proxy
+    // port, fails to bind the admin port, and exits — which is how a restart
+    // used to leave nothing running at all. So wait for the process itself.
+    match stop_daemon_process(pid).await {
+        DaemonStop::Exited => {}
+        DaemonStop::Forced => warn!(
+            pid,
+            grace_secs = DAEMON_STOP_GRACE.as_secs(),
+            "llmproxy did not finish in-flight work within the grace period and was forced; \
+             the final usage-ledger flush was skipped"
+        ),
+        DaemonStop::Stuck => {
+            bail!("llmproxy pid {pid} survived shutdown at {addr}; its listeners may still be held")
+        }
+    }
     wait_for_daemon(addr, false).await?;
     let _ = fs::remove_file(&pid_path);
     let _ = fs::remove_file(daemon_info_path(addr));
     println!("llmproxy stopped at {addr}");
     Ok(true)
+}
+
+/// How a daemon reached the point of no longer running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonStop {
+    /// It drained and exited within the grace period.
+    Exited,
+    /// It overran the grace period and had to be forced.
+    Forced,
+    /// It survived even the forced kill.
+    Stuck,
+}
+
+/// How long a signalled daemon gets to finish in-flight work. Long enough that
+/// an ordinary shutdown drains and flushes its usage ledger, short enough that
+/// `--restart` stays something you wait for at the prompt: an upstream call may
+/// legitimately run for `timeout_secs`, and blocking a restart on one is worse
+/// than cutting it.
+const DAEMON_STOP_GRACE: Duration = Duration::from_secs(10);
+/// How long the forced kill itself gets before the daemon is reported stuck.
+const DAEMON_KILL_GRACE: Duration = Duration::from_secs(2);
+/// Gap between liveness checks while waiting for either.
+const DAEMON_STOP_POLL: Duration = Duration::from_millis(100);
+
+/// Wait for an already-signalled daemon to exit, forcing it if it overruns.
+async fn stop_daemon_process(pid: u32) -> DaemonStop {
+    stop_process_with(
+        DAEMON_STOP_GRACE,
+        DAEMON_KILL_GRACE,
+        DAEMON_STOP_POLL,
+        || process_exists(pid),
+        || kill_daemon_process(pid),
+    )
+    .await
+}
+
+/// The stop policy itself, over injected liveness and kill operations so all
+/// three outcomes can be tested without spawning a process.
+async fn stop_process_with(
+    grace: Duration,
+    kill_grace: Duration,
+    tick: Duration,
+    mut alive: impl FnMut() -> bool,
+    kill: impl FnOnce() -> io::Result<()>,
+) -> DaemonStop {
+    if wait_while(grace, tick, &mut alive).await {
+        return DaemonStop::Exited;
+    }
+    // A kill that failed because the process had already gone is a success,
+    // not an error worth reporting.
+    if kill().is_err() && !alive() {
+        return DaemonStop::Exited;
+    }
+    if wait_while(kill_grace, tick, &mut alive).await {
+        DaemonStop::Forced
+    } else {
+        DaemonStop::Stuck
+    }
+}
+
+/// Poll `condition` until it goes false or `grace` elapses, reporting whether
+/// it went false in time. Split out from the process checks so the timing
+/// policy can be tested without spawning anything.
+async fn wait_while(grace: Duration, tick: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        if !condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(tick).await;
+    }
 }
 
 async fn wait_for_daemon(addr: SocketAddr, expect_running: bool) -> Result<()> {
@@ -1704,6 +1796,25 @@ fn terminate_daemon_process(pid: u32) -> io::Result<()> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// Force a daemon that overran its grace period. On Unix this escalates
+/// SIGTERM to SIGKILL; on Windows `terminate_daemon_process` is already a
+/// forced termination, so there is nothing to escalate to.
+#[cfg(unix)]
+fn kill_daemon_process(pid: u32) -> io::Result<()> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pid exceeds platform range"))?;
+    if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn kill_daemon_process(pid: u32) -> io::Result<()> {
+    terminate_daemon_process(pid)
 }
 
 #[cfg(unix)]
@@ -7256,6 +7367,104 @@ mod tests {
         fs::write(&path, "42\n").expect("replace pid file");
         assert_eq!(read_pid_file(&path).expect("read pid file"), Some(42));
         fs::remove_file(path).expect("remove pid file");
+    }
+
+    /// Stopping a daemon is not finished when its proxy port goes quiet. Axum
+    /// stops accepting the moment it is signalled while the process drains
+    /// in-flight streams, holding the admin listener throughout, so a
+    /// replacement started at that point cannot bind it. These cover the
+    /// policy that waits for the process itself.
+    #[tokio::test]
+    async fn waiting_stops_as_soon_as_the_condition_clears() {
+        let mut remaining = 3;
+        let cleared = wait_while(Duration::from_secs(5), Duration::from_millis(1), || {
+            remaining -= 1;
+            remaining > 0
+        })
+        .await;
+        assert!(cleared);
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn waiting_gives_up_once_the_grace_elapses() {
+        let cleared =
+            wait_while(Duration::from_millis(20), Duration::from_millis(1), || true).await;
+        assert!(!cleared);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_drains_in_time_is_never_forced() {
+        let mut polls = 0;
+        let mut killed = false;
+        let outcome = stop_process_with(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            || {
+                polls += 1;
+                polls < 3
+            },
+            || {
+                killed = true;
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(outcome, DaemonStop::Exited);
+        assert!(!killed, "a daemon that exits on its own must not be killed");
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_overruns_its_grace_is_forced() {
+        let killed = std::cell::Cell::new(false);
+        let outcome = stop_process_with(
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || !killed.get(),
+            || {
+                killed.set(true);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(outcome, DaemonStop::Forced);
+        assert!(killed.get());
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_survives_the_kill_is_reported_rather_than_assumed_gone() {
+        let outcome = stop_process_with(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            || true,
+            || Ok(()),
+        )
+        .await;
+        // Reporting matters: the caller must not start a replacement that
+        // would fail to bind the listeners this process still holds.
+        assert_eq!(outcome, DaemonStop::Stuck);
+    }
+
+    #[tokio::test]
+    async fn a_kill_that_races_the_exit_is_not_an_error() {
+        let killed = std::cell::Cell::new(false);
+        let outcome = stop_process_with(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            || !killed.get(),
+            || {
+                // The process exits between the last poll and the kill, so the
+                // kill fails with "no such process".
+                killed.set(true);
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            },
+        )
+        .await;
+        assert_eq!(outcome, DaemonStop::Exited);
     }
 
     #[test]

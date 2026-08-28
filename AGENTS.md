@@ -180,7 +180,15 @@ Without a launcher, preserve these rules:
 ## Daemon And Admin
 
 - Normal startup creates or reuses the managed background daemon.
-- `--restart` replaces it and `--shutdown` stops it.
+- `--restart` replaces it and `--shutdown` stops it. Both wait for the daemon
+  *process* to exit, not merely for its proxy port to stop answering: the
+  server stops accepting the moment it is signalled but stays alive draining
+  in-flight streams, holding the admin listener for all of that time, so a
+  replacement started any earlier cannot bind it and exits. A daemon that
+  overruns `DAEMON_STOP_GRACE` is forced, and the skipped final ledger flush is
+  reported rather than left silent; one that survives the force is an error, not
+  a green light to start a replacement. The admin listener shuts down on the
+  same signal as the proxy.
 - The daemon publishes credential-free runtime metadata after the proxy and
   optional admin listeners bind. Startup prints the exact proxy, admin, and log
   locations.

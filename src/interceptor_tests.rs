@@ -1256,3 +1256,60 @@ fn only_replayable_decisions_are_cached() {
         None
     );
 }
+
+#[test]
+fn a_lowercase_target_is_reachable_and_spelling_drift_is_tolerated() {
+    let targets = BTreeMap::from([("back_end".to_string(), target_named("openai", None))]);
+    // The model is asked to call `back_end` and may return it with the case or
+    // the separator changed; every spelling has to reach the same route.
+    for name in ["back_end", "Back_End", "BACK_END", "back-end"] {
+        let completion = json!({
+            "choices": [{
+                "message": {
+                    "content": Value::Null,
+                    "tool_calls": [{ "function": { "name": name, "arguments": "{}" } }]
+                }
+            }]
+        });
+        assert_eq!(
+            classify_completion_with_targets(&completion, &targets),
+            CompletionDecision::Redirect("back_end".to_string()),
+            "{name:?} must reach the configured target"
+        );
+    }
+}
+
+#[test]
+fn a_target_that_was_never_configured_is_still_a_caller_tool_call() {
+    let targets = BTreeMap::from([("backend".to_string(), target_named("openai", None))]);
+    let completion = json!({
+        "choices": [{
+            "message": {
+                "content": Value::Null,
+                "tool_calls": [{ "function": { "name": "write_file", "arguments": "{}" } }]
+            }
+        }]
+    });
+    assert_eq!(
+        classify_completion_with_targets(&completion, &targets),
+        CompletionDecision::Local
+    );
+}
+
+#[test]
+fn a_rejection_still_fails_closed_when_the_model_changes_its_case() {
+    let completion = json!({
+        "choices": [{
+            "message": {
+                "content": Value::Null,
+                "tool_calls": [{
+                    "function": { "name": "reject", "arguments": "{\"reason\":\"api key\"}" }
+                }]
+            }
+        }]
+    });
+    assert_eq!(
+        classify_completion_details(&completion, &BTreeMap::new(), true).decision,
+        CompletionDecision::Reject
+    );
+}

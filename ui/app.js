@@ -92,6 +92,8 @@ function fmtUptime(secs) {
 /* Navigation */
 
 const PRIMARY_VIEWS = ["overview", "activity", "routing", "models", "providers", "settings"];
+const ACTIVITY_VIEWS = ["usage", "spend", "decisions", "shadow", "logs"];
+const ROUTING_VIEWS = ["triage", "policy", "memory"];
 
 function currentRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
@@ -109,8 +111,8 @@ function currentRoute() {
     secondary = "policy";
   }
   if (!PRIMARY_VIEWS.includes(primary)) primary = "overview";
-  if (primary === "activity" && !["usage", "decisions", "logs"].includes(secondary)) secondary = "usage";
-  if (primary === "routing" && !["triage", "policy"].includes(secondary)) secondary = "triage";
+  if (primary === "activity" && !ACTIVITY_VIEWS.includes(secondary)) secondary = "usage";
+  if (primary === "routing" && !ROUTING_VIEWS.includes(secondary)) secondary = "triage";
   return { primary, secondary };
 }
 
@@ -130,8 +132,8 @@ function renderTab() {
     if (active) $(`#tab-${name}`).setAttribute("aria-current", "page");
     else $(`#tab-${name}`).removeAttribute("aria-current");
   }
-  renderSubview("activity", primary === "activity" ? secondary : "usage", ["usage", "decisions", "logs"]);
-  renderSubview("routing", primary === "routing" ? secondary : "triage", ["triage", "policy"]);
+  renderSubview("activity", primary === "activity" ? secondary : "usage", ACTIVITY_VIEWS);
+  renderSubview("routing", primary === "routing" ? secondary : "triage", ROUTING_VIEWS);
   document.title = `llmproxy · ${primary}`;
 
   if (primary === "models") {
@@ -141,12 +143,452 @@ function renderTab() {
     loadConfigEditors();
   }
   if (primary === "routing" && secondary === "policy") loadPromptTab();
+  if (primary === "routing" && secondary === "memory") loadMemory();
+  if (primary === "activity" && secondary === "spend") loadSpend();
+  if (primary === "activity" && secondary === "shadow") pollShadow();
+  if (primary === "settings") loadHealth();
 }
 
 window.addEventListener("hashchange", () => {
   renderTab();
   window.scrollTo(0, 0);
 });
+
+/* Money, evidence, and memory
+   ---------------------------
+   Every figure here carries its own caveat next to it. Spend priced from
+   estimated token counts is an approximation, a subscription provider has no
+   dollar figure at all, and a rank from a handful of requests is noise: each
+   is said in the panel rather than left for the reader to infer. */
+
+function fmtMoney(value, currency) {
+  if (value === null || value === undefined) return "—";
+  const symbol = currency === "USD" ? "$" : "";
+  const suffix = currency && currency !== "USD" ? ` ${currency}` : "";
+  const digits = Math.abs(value) >= 100 ? 2 : Math.abs(value) >= 1 ? 3 : 4;
+  return `${symbol}${value.toFixed(digits)}${suffix}`;
+}
+
+function fmtPercent(value) {
+  return value === null || value === undefined ? "—" : `${(value * 100).toFixed(1)}%`;
+}
+
+let spendData = null;
+let leaderboardData = null;
+
+function spendQuery() {
+  const month = $("#spend-month").value;
+  const project = $("#spend-project").value;
+  const params = new URLSearchParams();
+  if (month) params.set("month", month);
+  if (project) params.set("project", project);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+async function loadSpend() {
+  try {
+    const query = spendQuery();
+    const [spend, leaderboard] = await Promise.all([
+      apiGet(`/api/spend${query}`),
+      apiGet(`/api/leaderboard${query}`),
+    ]);
+    spendData = spend;
+    leaderboardData = leaderboard;
+    renderSpend();
+    renderLeaderboard();
+  } catch (error) {
+    toast("Failed to load spend.", "error", String(error.message || error));
+  }
+}
+
+function fillSelect(select, values, current, allLabel) {
+  const previous = current ?? select.value;
+  select.replaceChildren(el("option", { value: "", text: allLabel }));
+  for (const value of values) select.append(el("option", { value, text: value }));
+  select.value = values.includes(previous) ? previous : "";
+}
+
+function renderSpend() {
+  const data = spendData;
+  if (!data) return;
+  if (data.available === false) {
+    $("#spend-intro").textContent = data.reason || "usage history is not being recorded";
+    return;
+  }
+  fillSelect($("#spend-month"), data.months || [], data.month, "all months");
+  fillSelect(
+    $("#spend-project"),
+    (data.projects || []).map((row) => row.project),
+    data.project,
+    "all projects"
+  );
+
+  const total = data.total || {};
+  const cost = total.cost || {};
+  const currency = data.currency;
+  const priced = data.priced;
+  $("#spend-total").textContent = priced ? fmtMoney(cost.total, currency) : "—";
+  $("#spend-total-sub").textContent = `${fmtCount(total.requests || 0)} requests`;
+  $("#spend-input").textContent = priced ? fmtMoney(cost.input, currency) : "—";
+  $("#spend-input-sub").textContent = `${fmtCount(total.input_tokens || 0)} prompt tokens`;
+  $("#spend-cache").textContent = priced ? fmtMoney(cost.cache_read, currency) : "—";
+  $("#spend-cache-sub").textContent = `${fmtCount(total.cache_read_tokens || 0)} read · ${fmtCount(total.cache_write_tokens || 0)} written`;
+  $("#spend-output").textContent = priced ? fmtMoney(cost.output, currency) : "—";
+  $("#spend-output-sub").textContent = `${fmtCount(total.output_tokens || 0)} completion tokens`;
+
+  const caveats = [];
+  if (!priced) caveats.push("No prices are configured, so only token volume is shown. Add a [providers.*.pricing] table.");
+  if (total.estimated_requests) {
+    caveats.push(`${fmtCount(total.estimated_requests)} request(s) had their tokens estimated rather than reported, so the figure is an approximation.`);
+  }
+  if (total.subscription_requests) {
+    caveats.push(`${fmtCount(total.subscription_requests)} request(s) went to a subscription provider and are billed against a plan, not per token.`);
+  }
+  if (total.unpriced_requests) {
+    caveats.push(`${fmtCount(total.unpriced_requests)} request(s) used a model with no configured price and are excluded from the total.`);
+  }
+  $("#spend-caveat").textContent = caveats.join(" ");
+
+  const projectRows = $("#spend-projects tbody");
+  projectRows.replaceChildren();
+  for (const row of data.projects || []) {
+    projectRows.append(el("tr", {}, [
+      el("td", { class: "mono", text: row.project }),
+      el("td", { class: "mono", text: fmtCount(row.requests) }),
+      el("td", { class: "mono", text: fmtCount(row.input_tokens) }),
+      el("td", { class: "mono", text: fmtCount(row.output_tokens) }),
+      el("td", { class: "mono", text: row.priced_requests ? fmtMoney(row.cost.total, currency) : "—" }),
+    ]));
+  }
+  if (!projectRows.children.length) {
+    projectRows.append(el("tr", {}, [el("td", { colspan: "5", text: "nothing recorded yet" })]));
+  }
+
+  const modelRows = $("#spend-models tbody");
+  modelRows.replaceChildren();
+  for (const row of data.models || []) {
+    const label = row.subscription_requests
+      ? "included in subscription"
+      : row.priced_requests
+        ? fmtMoney(row.cost.total, currency)
+        : "unpriced";
+    modelRows.append(el("tr", {}, [
+      el("td", { class: "mono", text: row.provider }),
+      el("td", { class: "mono", text: row.model }),
+      el("td", { class: "mono", text: fmtCount(row.requests) }),
+      el("td", { class: "mono", text: fmtCount(row.input_tokens + row.output_tokens) }),
+      el("td", { class: "mono", text: label }),
+    ]));
+  }
+  if (!modelRows.children.length) {
+    modelRows.append(el("tr", {}, [el("td", { colspan: "5", text: "nothing recorded yet" })]));
+  }
+
+  renderInsight(data.insight, currency);
+}
+
+function renderInsight(insight, currency) {
+  const host = $("#insight-list");
+  host.replaceChildren();
+  const suggestions = insight?.suggestions || [];
+  $("#insight-empty").hidden = suggestions.length > 0;
+  for (const suggestion of suggestions) {
+    const apply = el("button", { class: "button button-primary", type: "button", text: "Apply routing change" });
+    apply.addEventListener("click", async () => {
+      const change = suggestion.apply;
+      if (!confirm(`Point target ${change.target} at ${change.provider}/${change.model}?`)) return;
+      const targets = structuredClone(configData?.integrated?.targets || {});
+      const existing = targets[change.target];
+      if (!existing) {
+        toast(`Target ${change.target} no longer exists.`, "error");
+        return;
+      }
+      existing.provider = change.provider;
+      existing.model = change.model;
+      try {
+        const result = await apiSend("/api/integrated", "PUT", { targets });
+        applyToast(result, `Target ${change.target}`);
+        refreshFromResult(result);
+        loadSpend();
+      } catch (error) {
+        toast("The routing change was not applied.", "error", error.message);
+      }
+    });
+    host.append(el("div", { class: "insight-card" }, [
+      el("p", { class: "insight-head mono", text: `${suggestion.target}: ${suggestion.from.provider}/${suggestion.from.model} → ${suggestion.to.provider}/${suggestion.to.model}` }),
+      el("p", {
+        class: "insight-body",
+        text: `${fmtMoney(suggestion.from.cost_per_answer, currency)} per answer against ${fmtMoney(suggestion.to.cost_per_answer, currency)}, `
+          + `on ${fmtCount(suggestion.from.answers)} and ${fmtCount(suggestion.to.answers)} observed answers. `
+          + `Satisfaction ${fmtPercent(suggestion.from.satisfaction)} against ${fmtPercent(suggestion.to.satisfaction)}. `
+          + `Observed saving ${fmtMoney(suggestion.observed_saving, currency)}.`,
+      }),
+      el("div", { class: "form-actions" }, [apply]),
+    ]));
+  }
+}
+
+function renderLeaderboard() {
+  const data = leaderboardData;
+  const tbody = $("#leaderboard-table tbody");
+  tbody.replaceChildren();
+  if (!data || data.available === false) {
+    $("#leaderboard-intro").textContent = data?.reason || "outcomes are not being recorded";
+    return;
+  }
+  $("#leaderboard-intro").textContent =
+    `Ranked on observed aftermath — immediate re-asks and failures — not a public benchmark. `
+    + `Rows with fewer than ${data.min_ranked_answers} answers are shown but not ranked.`;
+  for (const row of data.models || []) {
+    tbody.append(el("tr", { class: row.ranked ? "" : "row-muted" }, [
+      el("td", { class: "mono", text: row.rank ?? "—" }),
+      el("td", { class: "mono", text: row.provider }),
+      el("td", { class: "mono", text: row.model }),
+      el("td", { class: "mono", text: fmtCount(row.answers) }),
+      el("td", { class: "mono", text: fmtCount(row.retried) }),
+      el("td", { class: "mono", text: fmtCount(row.failed) }),
+      el("td", { class: "mono", text: fmtPercent(row.satisfaction) }),
+      el("td", { class: "mono", text: row.cost_per_answer === null || row.cost_per_answer === undefined ? "—" : fmtMoney(row.cost_per_answer, data.currency) }),
+    ]));
+  }
+  if (!tbody.children.length) {
+    tbody.append(el("tr", {}, [el("td", { colspan: "8", text: "nothing observed yet" })]));
+  }
+
+  const hints = $("#hint-candidates");
+  hints.replaceChildren();
+  for (const [target, entry] of Object.entries(data.hint_candidates || {})) {
+    const terms = (entry.terms || []).map((term) => term.term).join(", ");
+    hints.append(el("p", { class: "hint" }, [
+      el("span", { class: "mono", text: `${target} ` }),
+      el("span", { text: terms ? `(${entry.prompts} prompts): ${terms}` : `(${entry.prompts} prompts): nothing distinctive yet` }),
+    ]));
+  }
+  if (!hints.children.length) {
+    hints.append(el("p", { class: "hint", text: "no routed prompts observed in the last 24 hours" }));
+  }
+}
+
+/* Shadow comparisons */
+
+let shadowLastId = 0;
+
+async function pollShadow() {
+  try {
+    const data = await apiGet(`/api/shadow?after=${shadowLastId}`);
+    const host = $("#shadow-list");
+    for (const entry of data.entries || []) {
+      shadowLastId = Math.max(shadowLastId, entry.id);
+      $("#shadow-empty").hidden = true;
+      const card = el("div", { class: "shadow-card" }, [
+        el("p", { class: "shadow-head mono" }, [
+          el("span", { text: `${entry.primary.target} (${entry.primary.model})` }),
+          el("span", { class: "shadow-vs", text: " vs " }),
+          el("span", { text: `${entry.shadow.target} (${entry.shadow.model})` }),
+          el("span", { class: "shadow-overlap", text: ` overlap ${fmtPercent(entry.overlap)}` }),
+        ]),
+        el("p", { class: "shadow-prompt", text: entry.prompt }),
+        el("div", { class: "shadow-pair" }, [
+          el("div", { class: "shadow-answer" }, [
+            el("h4", { class: "sub-label mono", text: "primary — returned to the caller" }),
+            el("pre", { class: "mono", text: entry.primary.answer || "(no text)" }),
+          ]),
+          el("div", { class: "shadow-answer" }, [
+            el("h4", { class: "sub-label mono", text: "shadow — never seen by the caller" }),
+            el("pre", { class: "mono", text: entry.shadow.error || entry.shadow.answer || "(no text)" }),
+          ]),
+        ]),
+      ]);
+      host.prepend(card);
+    }
+    while (host.querySelectorAll(".shadow-card").length > 50) {
+      host.querySelector(".shadow-card:last-of-type")?.remove();
+    }
+  } catch {
+    // The shadow feed is diagnostic; a poll failure is not worth a toast.
+  }
+}
+
+/* Project memory */
+
+let memoryData = null;
+
+async function loadMemory() {
+  try {
+    const project = $("#memory-project").value;
+    memoryData = await apiGet(`/api/memory${project ? `?project=${encodeURIComponent(project)}` : ""}`);
+    renderMemory();
+  } catch (error) {
+    toast("Failed to load project memory.", "error", String(error.message || error));
+  }
+}
+
+function renderMemory() {
+  const data = memoryData;
+  if (!data) return;
+  fillSelect($("#memory-project"), data.projects || [], data.project, "current project");
+  const status = $("#memory-status");
+  if (!data.available) {
+    status.textContent = "Project memory is not enabled. Turn it on under Settings.";
+  } else if (!data.project) {
+    status.textContent = "No project scope. Launch an agent from a directory containing a .llmproxy.toml, or pick a project above.";
+  } else {
+    status.textContent = `Shared across every agent that runs in ${data.project}.`;
+  }
+  const list = $("#memory-list");
+  list.replaceChildren();
+  const notes = [...(data.notes || [])].reverse();
+  $("#memory-empty").hidden = notes.length > 0;
+  for (const note of notes) {
+    const remove = el("button", { class: "button button-danger", type: "button", text: "Forget" });
+    remove.addEventListener("click", async () => {
+      const project = data.project ? `?project=${encodeURIComponent(data.project)}` : "";
+      try {
+        await apiSend(`/api/memory/${note.id}${project}`, "DELETE");
+        loadMemory();
+      } catch (error) {
+        toast("The note was not removed.", "error", error.message);
+      }
+    });
+    list.append(el("li", { class: "memory-note" }, [
+      el("span", { class: "memory-text", text: note.text }),
+      note.source ? el("span", { class: "badge badge-neutral", text: note.source }) : null,
+      remove,
+    ]));
+  }
+}
+
+/* Provider health */
+
+async function loadHealth() {
+  try {
+    const data = await apiGet("/api/health");
+    const tbody = $("#health-table tbody");
+    tbody.replaceChildren();
+    for (const row of data.providers || []) {
+      tbody.append(el("tr", {}, [
+        el("td", { class: "mono", text: row.provider }),
+        el("td", {}, [el("span", { class: `badge badge-${row.status === "closed" ? "local" : "external"}`, text: row.status })]),
+        el("td", { class: "mono", text: fmtCount(row.successes) }),
+        el("td", { class: "mono", text: fmtCount(row.failures) }),
+        el("td", { class: "mono", text: row.retry_in_secs === null || row.retry_in_secs === undefined ? "—" : `${row.retry_in_secs}s` }),
+        el("td", { text: row.last_error || "" }),
+      ]));
+    }
+    if (!tbody.children.length) {
+      tbody.append(el("tr", {}, [el("td", { colspan: "6", text: data.enabled ? "every provider is healthy" : "health tracking is disabled" })]));
+    }
+  } catch {
+    // Health is diagnostic; a poll failure is not worth a toast.
+  }
+}
+
+/* Routing regression suite */
+
+async function captureCorpus() {
+  try {
+    const mode = promptMode;
+    const corpus = await apiGet(`/api/route-corpus?mode=${encodeURIComponent(mode)}`);
+    $("#corpus-json").value = JSON.stringify(corpus, null, 2);
+    updateCorpusCount();
+    toast(`Captured ${corpus.cases.length} case(s) from the decision audit.`, "ok");
+  } catch (error) {
+    toast("The corpus was not captured.", "error", String(error.message || error));
+  }
+}
+
+function updateCorpusCount() {
+  const raw = $("#corpus-json").value.trim();
+  if (!raw) {
+    $("#corpus-count").textContent = "no corpus loaded";
+    return;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    const cases = Array.isArray(parsed) ? parsed : parsed.cases || [];
+    $("#corpus-count").textContent = `${cases.length} case(s) loaded`;
+  } catch {
+    $("#corpus-count").textContent = "corpus is not valid JSON";
+  }
+}
+
+function downloadCorpus() {
+  const raw = $("#corpus-json").value.trim();
+  if (!raw) {
+    toast("There is no corpus to download.", "error");
+    return;
+  }
+  const url = URL.createObjectURL(new Blob([raw], { type: "application/json" }));
+  const link = el("a", { href: url, download: "llmproxy-route-corpus.json" });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function replayCorpus() {
+  const raw = $("#corpus-json").value.trim();
+  if (!raw) {
+    toast("Load or capture a corpus first.", "error");
+    return;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    toast("The corpus is not valid JSON.", "error", String(error.message || error));
+    return;
+  }
+  const cases = Array.isArray(parsed) ? parsed : parsed.cases || [];
+  const mode = (Array.isArray(parsed) ? null : parsed.mode) || promptMode;
+  $("#corpus-running").hidden = false;
+  $("#corpus-replay").disabled = true;
+  try {
+    const summary = await apiSend("/api/route-corpus/replay", "POST", {
+      mode,
+      instructions: $("#sys-editor").value,
+      cases,
+    });
+    renderCorpusResults(summary);
+  } catch (error) {
+    toast("The replay did not finish.", "error", String(error.message || error));
+  } finally {
+    $("#corpus-running").hidden = true;
+    $("#corpus-replay").disabled = false;
+  }
+}
+
+function renderCorpusResults(summary) {
+  const host = $("#corpus-results");
+  host.replaceChildren();
+  const headline = summary.regressions
+    ? `${summary.regressions} regression(s) out of ${summary.cases} case(s)`
+    : `no regressions across ${summary.cases} case(s)`;
+  host.append(el("p", {
+    class: `corpus-headline ${summary.regressions ? "is-external" : "is-local"}`,
+    text: `${headline} — ${summary.same} same, ${summary.changed} changed, ${summary.new} new, ${summary.errors} errored`,
+  }));
+  const table = el("table", { class: "data-table" }, [
+    el("thead", {}, [el("tr", {}, ["verdict", "was", "now", "prompt"].map((name) => el("th", { text: name })))]),
+  ]);
+  const tbody = el("tbody");
+  for (const row of summary.results || []) {
+    if (row.verdict === "same") continue;
+    const label = (side) => [side.decision || "—", side.target].filter(Boolean).join(" → ");
+    tbody.append(el("tr", {}, [
+      el("td", {}, [el("span", { class: `badge badge-${row.verdict === "changed" || row.verdict === "error" ? "external" : "neutral"}`, text: row.verdict })]),
+      el("td", { class: "mono", text: label(row.expected) }),
+      el("td", { class: "mono", text: label(row.actual) }),
+      el("td", { text: row.prompt }),
+    ]));
+  }
+  if (!tbody.children.length) {
+    tbody.append(el("tr", {}, [el("td", { colspan: "4", text: "every case matched what the corpus recorded" })]));
+  }
+  table.append(tbody);
+  host.append(el("div", { class: "table-scroll bounded-table" }, [table]));
+}
 
 /* Overview */
 
@@ -229,6 +671,10 @@ async function copyLaunchCommand() {
    per-provider stats table can reuse the locality colors. */
 let providerClasses = {};
 
+/// Provider name to its current breaker status, refreshed alongside stats so
+/// an absorbed outage is visible here rather than only in the logs.
+let providerHealth = {};
+
 function renderRouting(data) {
   providerClasses = Object.fromEntries(
     data.providers.map((provider) => [provider.name, provider.class])
@@ -246,6 +692,7 @@ function renderRouting(data) {
         el("span", { class: `badge badge-${provider.class}`, text: provider.class }),
         provider.is_default ? el("span", { class: "badge badge-neutral", text: "default" }) : null,
         provider.is_interceptor ? el("span", { class: "badge badge-neutral", text: "interceptor" }) : null,
+        healthBadge(provider.name),
         el("span", { class: "provider-url", text: provider.base_url }),
         el("span", { class: "provider-models", text: models, title }),
       ])
@@ -280,6 +727,18 @@ function renderRouting(data) {
   $("#rolemap-line").textContent = roles.length
     ? roles.map(([from, to]) => `${from} → ${to}`).join("  ·  ")
     : "none";
+}
+
+function healthBadge(provider) {
+  const status = providerHealth[provider];
+  if (!status || status.status === "closed") return null;
+  const label = status.status === "rate_limited" ? "rate limited" : status.status.replace("_", "-");
+  const retry = status.retry_in_secs ? ` ${status.retry_in_secs}s` : "";
+  return el("span", {
+    class: "badge badge-external",
+    text: `${label}${retry}`,
+    title: status.last_error || "",
+  });
 }
 
 function setLatencyRow(barId, figuresId, entry, maxP99) {
@@ -406,6 +865,19 @@ function renderFlowOut(providers, totalServed) {
 
 function renderStats(stats) {
   $("#meta-uptime").textContent = fmtUptime(stats.uptime_secs);
+
+  const spend = stats.spend || {};
+  if (spend.configured) {
+    $("#stat-spend").textContent = fmtMoney(spend.total, spend.currency);
+    const notes = [];
+    if (spend.estimated_requests) notes.push(`${fmtCount(spend.estimated_requests)} estimated`);
+    if (spend.subscription_requests) notes.push(`${fmtCount(spend.subscription_requests)} on a plan`);
+    if (spend.unpriced_requests) notes.push(`${fmtCount(spend.unpriced_requests)} unpriced`);
+    $("#stat-spend-sub").textContent = notes.length ? notes.join(" · ") : "since start";
+  } else {
+    $("#stat-spend").textContent = "—";
+    $("#stat-spend-sub").textContent = "no prices configured";
+  }
 
   const requests = stats.requests;
   const served = stats.served;
@@ -558,11 +1030,28 @@ let statsTimer = null;
 
 async function pollStats() {
   try {
-    renderStats(await apiGet("/api/stats"));
+    const [stats, health, cache] = await Promise.all([
+      apiGet("/api/stats"),
+      apiGet("/api/health"),
+      apiGet("/api/route-cache"),
+    ]);
+    providerHealth = Object.fromEntries(
+      (health.providers || []).map((row) => [row.provider, row])
+    );
+    renderStats(stats);
+    renderRouteCacheStats(cache);
     $("#lamp-proxy").className = "lamp on";
   } catch {
     $("#lamp-proxy").className = "lamp off";
   }
+}
+
+function renderRouteCacheStats(cache) {
+  const node = $("#route-cache-stats");
+  if (!node) return;
+  node.textContent = cache.lookups
+    ? `cache: ${fmtCount(cache.entries)} entries · ${fmtPercent(cache.hit_rate)} of ${fmtCount(cache.lookups)} lookups hit`
+    : `cache: ${fmtCount(cache.entries)} entries · no lookups yet`;
 }
 
 /* Traffic log */
@@ -800,6 +1289,9 @@ function startPolling() {
       pollLogs();
       pollErrors();
       pollDecisions();
+      // The shadow feed only polls while it is on screen: each entry carries
+      // two whole answers, so it is far heavier than the other feeds.
+      if (currentRoute().secondary === "shadow") pollShadow();
     }
   }, 2000);
   pollStats();
@@ -1318,35 +1810,97 @@ function appendIntegratedTargetRow(name, target) {
   provider.addEventListener("change", syncEffort);
   syncEffort();
   const hint = el("input", { class: "input target-hint", value: target.hint, "aria-label": `Routing hint for ${name}` });
+  // Exactly one target may be the catch-all, so the checkboxes behave as a
+  // radio group without pretending to be one in the markup.
+  const isDefault = el("input", {
+    type: "checkbox", class: "target-default", "aria-label": `Catch-all route for ${name}`,
+    title: "ROUTE_DEFAULT resolves here instead of falling through to model discovery",
+  });
+  isDefault.checked = Boolean(target.default);
+  isDefault.addEventListener("change", () => {
+    if (!isDefault.checked) return;
+    for (const other of document.querySelectorAll(".target-default")) {
+      if (other !== isDefault) other.checked = false;
+    }
+  });
+  const strength = el("input", {
+    class: "input mono target-strength", type: "number", min: "0", step: "1",
+    value: target.strength ?? "", placeholder: "—",
+    "aria-label": `Routing strength for ${name}`,
+    title: "Higher is stronger. Only the ordering matters, and only to the escalate policy.",
+  });
+  const failover = el("input", {
+    class: "input mono target-failover", value: (target.failover || []).join(", "),
+    placeholder: "—", "aria-label": `Failover chain for ${name}`,
+    title: "Comma-separated target names tried when this one is unavailable or fails",
+  });
   const remove = el("button", {
     class: "button button-danger",
     type: "button",
     text: "Remove",
     onclick: (event) => event.target.closest("tr").remove(),
   });
-  tbody.append(el("tr", {}, [
+  const row = el("tr", {}, [
     el("td", {}, [targetName]),
     el("td", {}, [provider]),
     el("td", {}, [model]),
     el("td", {}, [effort]),
+    el("td", { class: "cell-check" }, [isDefault]),
+    el("td", {}, [strength]),
+    el("td", {}, [failover]),
     el("td", {}, [hint]),
     el("td", {}, [remove]),
-  ]));
+  ]);
+  // Second opinions are rare and structural, so they ride along on the row
+  // rather than occupying a column every target would leave empty.
+  row.dataset.secondOpinion = target.second_opinion ? JSON.stringify(target.second_opinion) : "";
+  tbody.append(row);
+}
+
+function targetOptions(select, values, selected, emptyLabel) {
+  select.replaceChildren(el("option", { value: "", text: emptyLabel }));
+  for (const name of values) select.append(el("option", { value: name, text: name }));
+  select.value = values.includes(selected) ? selected : "";
 }
 
 function renderIntegratedForm() {
   const integrated = configData.integrated;
   $("#integrated-enabled").checked = integrated.enabled;
   $("#integrated-ttl").value = integrated.sticky_ttl_secs;
+  $("#integrated-abs-ttl").value = integrated.sticky_absolute_ttl_secs;
+  $("#integrated-max-turns").value = integrated.sticky_max_turns;
+  $("#integrated-policy").value = integrated.sticky_policy;
   $("#integrated-capacity").value = integrated.sticky_capacity;
+  $("#integrated-verbs").checked = integrated.verbs;
+  $("#integrated-verb-list").textContent =
+    `${(integrated.verb_vocabulary || []).map((verb) => `${verb}:`).join(" ")} and any target name`;
+  $("#integrated-speculative").checked = integrated.speculative;
+  $("#integrated-failover").value = (integrated.failover || []).join(", ");
+
+  const shadow = integrated.shadow || {};
+  $("#shadow-enabled").checked = Boolean(shadow.enabled);
+  $("#shadow-sample").value = shadow.sample_one_in ?? 20;
+  $("#shadow-timeout").value = shadow.timeout_ms ?? 120000;
+
+  const embedding = integrated.embedding || {};
+  $("#embed-enabled").checked = Boolean(embedding.enabled);
+  $("#embed-model").value = embedding.model || "";
+  $("#embed-threshold").value = embedding.threshold ?? 0.94;
+  $("#embed-retriage").value = embedding.retriage_below ?? 0;
+  $("#embed-retry-threshold").value = embedding.retry_threshold ?? 0.93;
+  $("#embed-capacity").value = embedding.capacity ?? 2048;
+  $("#embed-timeout").value = embedding.timeout_ms ?? 2000;
+  $("#embed-retry").checked = Boolean(embedding.retry_escalation);
+  providerOptions($("#embed-provider"), embedding.provider || "", false);
+
   const tbody = $("#integrated-targets tbody");
   tbody.replaceChildren();
-  for (const [name, target] of Object.entries(integrated.targets).sort(([a], [b]) => a.localeCompare(b))) {
-    appendIntegratedTargetRow(name, target);
-  }
+  const names = Object.keys(integrated.targets).sort((a, b) => a.localeCompare(b));
+  for (const name of names) appendIntegratedTargetRow(name, integrated.targets[name]);
   if (!tbody.children.length) {
-    tbody.append(el("tr", { class: "integrated-empty" }, [el("td", { colspan: "6", text: "no redirect targets configured" })]));
+    tbody.append(el("tr", { class: "integrated-empty" }, [el("td", { colspan: "9", text: "no redirect targets configured" })]));
   }
+  targetOptions($("#shadow-target"), names, shadow.target || "", "pick a target");
   providerOptions($("#integrated-add-provider"), "", false);
   const addEffort = $("#integrated-add-effort");
   populateReasoningEffortOptions(addEffort, "", "provider default");
@@ -1366,12 +1920,37 @@ function collectIntegratedTargets() {
     const model = row.querySelector(".target-model").value.trim();
     const reasoningEffort = row.querySelector(".target-effort").value;
     const hint = row.querySelector(".target-hint").value.trim();
+    const strengthValue = row.querySelector(".target-strength").value.trim();
+    const failover = row.querySelector(".target-failover").value
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    let secondOpinion = null;
+    if (row.dataset.secondOpinion) {
+      try {
+        secondOpinion = JSON.parse(row.dataset.secondOpinion);
+      } catch {
+        secondOpinion = null;
+      }
+    }
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || name === "PASS" || name === "ROUTE_DEFAULT") {
       throw new Error(`${name || "target"}: use a non-reserved 1-64 character tool name containing letters, digits, _, or -`);
     }
     if (!provider || !model || !hint || hint.includes("\n")) throw new Error(`${name}: provider, model, and one-line hint are required`);
     if (targets[name]) throw new Error(`duplicate integrated target ${name}`);
-    targets[name] = { provider, model, reasoning_effort: reasoningEffort || null, hint };
+    targets[name] = {
+      provider,
+      model,
+      reasoning_effort: reasoningEffort || null,
+      hint,
+      default: row.querySelector(".target-default").checked,
+      strength: strengthValue === "" ? null : Number(strengthValue),
+      failover,
+      second_opinion: secondOpinion,
+    };
+  }
+  if (Object.values(targets).filter((target) => target.default).length > 1) {
+    throw new Error("only one target may be the catch-all route");
   }
   return targets;
 }
@@ -1411,6 +1990,68 @@ function renderProviderEditors() {
     const timeout = el("input", { class: "input mono", type: "number", min: "1", value: provider.timeout_secs });
     const connectTimeout = el("input", { class: "input mono", type: "number", min: "1", value: provider.connect_timeout_secs });
 
+    // Rates are per million tokens so a config entry can be copied straight
+    // off a vendor price page. Nothing is inferred: a provider with no table
+    // simply reads as unpriced everywhere.
+    const pricing = provider.pricing || { subscription: false, currency: "USD", models: {} };
+    const subscription = el("input", { type: "checkbox", "aria-label": `Subscription billing for ${name}` });
+    subscription.checked = Boolean(pricing.subscription);
+    const currency = el("input", { class: "input mono", value: pricing.currency || "USD", "aria-label": `Currency for ${name}` });
+    const priceRows = el("tbody");
+    const addPriceRow = (model, price) => {
+      priceRows.append(el("tr", {}, [
+        el("td", {}, [el("input", { class: "input mono price-model", value: model, placeholder: "gpt-5.4 or *", "aria-label": "Priced model" })]),
+        el("td", {}, [el("input", { class: "input mono price-input", type: "number", min: "0", step: "0.01", value: price.input ?? 0 })]),
+        el("td", {}, [el("input", { class: "input mono price-output", type: "number", min: "0", step: "0.01", value: price.output ?? 0 })]),
+        el("td", {}, [el("input", { class: "input mono price-cache-read", type: "number", min: "0", step: "0.01", value: price.cache_read ?? "", placeholder: "input rate" })]),
+        el("td", {}, [el("input", { class: "input mono price-cache-write", type: "number", min: "0", step: "0.01", value: price.cache_write ?? "", placeholder: "input rate" })]),
+        el("td", {}, [el("button", {
+          class: "button button-danger", type: "button", text: "Remove",
+          onclick: (event) => event.target.closest("tr").remove(),
+        })]),
+      ]));
+    };
+    for (const [model, price] of Object.entries(pricing.models || {}).sort(([a], [b]) => a.localeCompare(b))) {
+      addPriceRow(model, price);
+    }
+    const addPrice = el("button", {
+      class: "button", type: "button", text: "Add model rate",
+      onclick: () => addPriceRow("", { input: 0, output: 0 }),
+    });
+    const collectPricing = () => {
+      const models = {};
+      for (const row of priceRows.querySelectorAll("tr")) {
+        const model = row.querySelector(".price-model").value.trim();
+        if (!model) continue;
+        const rate = (selector) => {
+          const raw = row.querySelector(selector).value.trim();
+          return raw === "" ? null : Number(raw);
+        };
+        models[model] = {
+          input: Number(row.querySelector(".price-input").value) || 0,
+          output: Number(row.querySelector(".price-output").value) || 0,
+          cache_read: rate(".price-cache-read"),
+          cache_write: rate(".price-cache-write"),
+        };
+      }
+      return { subscription: subscription.checked, currency: currency.value.trim() || "USD", models };
+    };
+    const pricingBlock = el("details", { class: "adv" }, [
+      el("summary", { text: "Pricing" }),
+      el("p", { class: "hint", text: "Rates are per million tokens. A subscription provider reports token volume but never a dollar figure, because it bills against a plan." }),
+      el("div", { class: "field-row" }, [
+        el("label", { class: "field field-check" }, [subscription, el("span", { text: "Billed against a plan, not per token" })]),
+        el("label", { class: "field" }, [el("span", { class: "field-name mono", text: "currency" }), currency]),
+      ]),
+      el("div", { class: "table-scroll bounded-table" }, [
+        el("table", { class: "data-table edit-table" }, [
+          el("thead", {}, [el("tr", {}, ["model", "input", "output", "cache read", "cache write", ""].map((label) => el("th", { text: label })))]),
+          priceRows,
+        ]),
+      ]),
+      el("div", { class: "form-actions" }, [addPrice]),
+    ]);
+
     const save = el("button", { class: "button button-primary", type: "button", text: "Save" });
     save.addEventListener("click", async () => {
       const body = {
@@ -1419,6 +2060,7 @@ function renderProviderEditors() {
         reasoning_effort: reasoningEffort.value,
         timeout_secs: Number(timeout.value) || provider.timeout_secs,
         connect_timeout_secs: Number(connectTimeout.value) || provider.connect_timeout_secs,
+        pricing: collectPricing(),
       };
       const envValue = apiKeyEnv.value.trim();
       if (envValue !== (provider.api_key_env || "")) body.api_key_env = envValue;
@@ -1443,6 +2085,11 @@ function renderProviderEditors() {
       provider.is_default ? el("span", { class: "badge badge-neutral", text: "default" }) : null,
       provider.from_upstream_section ? el("span", { class: "badge badge-neutral", text: "[upstream]" }) : null,
       provider.reasoning_effort ? el("span", { class: "badge badge-neutral", text: `reasoning ${provider.reasoning_effort}` }) : null,
+      provider.pricing?.subscription
+        ? el("span", { class: "badge badge-neutral", text: "subscription" })
+        : provider.pricing?.configured
+          ? el("span", { class: "badge badge-neutral", text: "priced" })
+          : null,
       keyBadge,
       el("span", { class: "provider-url", text: provider.base_url }),
     ]);
@@ -1492,6 +2139,7 @@ function renderProviderEditors() {
         el("label", { class: "field" }, [el("span", { class: "field-name mono", text: "timeout_secs" }), timeout]),
         el("label", { class: "field" }, [el("span", { class: "field-name mono", text: "connect_timeout_secs" }), connectTimeout]),
       ]),
+      pricingBlock,
       el("div", { class: "provider-actions" }, [...dangerActions, el("span", { class: "spacer" }), save]),
     ]);
     if (wasOpen.has(name)) card.open = true;
@@ -1532,6 +2180,25 @@ function renderSettingsForm() {
   $("#set-disable-thinking").checked = configData.chat.disable_thinking;
   $("#set-expose-aliases").checked = configData.models.expose_aliases;
   $("#set-expose-upstream").checked = configData.models.expose_upstream;
+
+  const health = configData.health || {};
+  $("#set-health-enabled").checked = Boolean(health.enabled);
+  $("#set-health-threshold").value = health.failure_threshold ?? 4;
+  $("#set-health-open").value = health.open_secs ?? 30;
+  $("#set-health-max-open").value = health.max_open_secs ?? 600;
+
+  const memory = configData.memory || {};
+  $("#set-memory-enabled").checked = Boolean(memory.enabled);
+  $("#set-memory-inject").checked = Boolean(memory.inject);
+  $("#set-memory-notes").value = memory.max_notes ?? 64;
+  $("#set-memory-chars").value = memory.max_injected_chars ?? 6000;
+
+  const redact = configData.interceptor.redact || {};
+  $("#set-redact-enabled").checked = Boolean(redact.enabled);
+  $("#set-redact-rehydrate").checked = Boolean(redact.rehydrate);
+  $("#set-redact-literals").value = (redact.extra_literals || []).join(", ");
+  $("#set-triage-max").value = configData.interceptor.triage_max_messages ?? 0;
+
   renderRoleMapRows(configData.role_map);
 }
 
@@ -1726,7 +2393,31 @@ document.addEventListener("DOMContentLoaded", () => {
       const result = await apiSend("/api/integrated", "PUT", {
         enabled: $("#integrated-enabled").checked,
         sticky_ttl_secs: Number($("#integrated-ttl").value),
+        sticky_absolute_ttl_secs: Number($("#integrated-abs-ttl").value),
+        sticky_max_turns: Number($("#integrated-max-turns").value),
+        sticky_policy: $("#integrated-policy").value,
         sticky_capacity: Number($("#integrated-capacity").value),
+        verbs: $("#integrated-verbs").checked,
+        speculative: $("#integrated-speculative").checked,
+        failover: $("#integrated-failover").value.split(",").map((entry) => entry.trim()).filter(Boolean),
+        shadow: {
+          enabled: $("#shadow-enabled").checked,
+          target: $("#shadow-target").value,
+          sample_one_in: Math.max(1, Number($("#shadow-sample").value) || 20),
+          timeout_ms: Math.max(1, Number($("#shadow-timeout").value) || 120000),
+        },
+        embedding: {
+          enabled: $("#embed-enabled").checked,
+          provider: $("#embed-provider").value,
+          model: $("#embed-model").value.trim(),
+          threshold: Number($("#embed-threshold").value),
+          capacity: Math.max(1, Number($("#embed-capacity").value) || 2048),
+          ttl_secs: configData?.integrated?.embedding?.ttl_secs ?? 86400,
+          retriage_below: Number($("#embed-retriage").value),
+          retry_escalation: $("#embed-retry").checked,
+          retry_threshold: Number($("#embed-retry-threshold").value),
+          timeout_ms: Math.max(1, Number($("#embed-timeout").value) || 2000),
+        },
         targets: collectIntegratedTargets(),
       });
       applyToast(result, "Integrated routing");
@@ -1775,6 +2466,31 @@ document.addEventListener("DOMContentLoaded", () => {
         expose_aliases: $("#set-expose-aliases").checked,
         expose_upstream: $("#set-expose-upstream").checked,
         role_map: collectRoleMap(),
+        health: {
+          enabled: $("#set-health-enabled").checked,
+          failure_threshold: Math.max(1, Number($("#set-health-threshold").value) || 4),
+          open_secs: Math.max(1, Number($("#set-health-open").value) || 30),
+          max_open_secs: Math.max(1, Number($("#set-health-max-open").value) || 600),
+          max_rate_limit_secs: configData?.health?.max_rate_limit_secs ?? 900,
+        },
+        memory: {
+          enabled: $("#set-memory-enabled").checked,
+          inject: $("#set-memory-inject").checked,
+          max_notes: Math.max(1, Number($("#set-memory-notes").value) || 64),
+          max_note_chars: configData?.memory?.max_note_chars ?? 2000,
+          max_injected_chars: Math.max(1, Number($("#set-memory-chars").value) || 6000),
+        },
+      });
+      await apiSend("/api/interceptor", "PUT", {
+        triage_max_messages: Math.max(0, Number($("#set-triage-max").value) || 0),
+        redact: {
+          enabled: $("#set-redact-enabled").checked,
+          rehydrate: $("#set-redact-rehydrate").checked,
+          extra_literals: $("#set-redact-literals").value
+            .split(",")
+            .map((entry) => entry.trim())
+            .filter(Boolean),
+        },
       });
       applyToast(result, "Settings");
       refreshFromResult(result);
@@ -1811,6 +2527,64 @@ document.addEventListener("DOMContentLoaded", () => {
       updateSysDirty();
     }
   });
+
+  $("#spend-refresh").addEventListener("click", loadSpend);
+  $("#spend-month").addEventListener("change", loadSpend);
+  $("#spend-project").addEventListener("change", loadSpend);
+  $("#spend-reset").addEventListener("click", async () => {
+    if (!confirm("Clear the durable usage ledger for every project and month?")) return;
+    try {
+      await apiSend("/api/spend/reset", "POST", {});
+      toast("Usage ledger cleared.", "ok");
+      loadSpend();
+    } catch (error) {
+      toast("The ledger was not cleared.", "error", error.message);
+    }
+  });
+
+  $("#clear-shadow").addEventListener("click", async () => {
+    try {
+      await apiSend("/api/shadow/clear", "POST", {});
+      shadowLastId = 0;
+      $("#shadow-list").replaceChildren($("#shadow-empty"));
+      $("#shadow-empty").hidden = false;
+    } catch (error) {
+      toast("Comparisons were not cleared.", "error", error.message);
+    }
+  });
+
+  $("#memory-refresh").addEventListener("click", loadMemory);
+  $("#memory-project").addEventListener("change", loadMemory);
+  $("#memory-add-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = $("#memory-add-text").value.trim();
+    if (!text) return;
+    try {
+      await apiSend("/api/memory", "POST", {
+        project: $("#memory-project").value || undefined,
+        text,
+      });
+      $("#memory-add-text").value = "";
+      loadMemory();
+    } catch (error) {
+      toast("The note was not recorded.", "error", error.message);
+    }
+  });
+
+  $("#health-reset").addEventListener("click", async () => {
+    try {
+      await apiSend("/api/health/reset", "POST", {});
+      loadHealth();
+      toast("Provider health cleared.", "ok");
+    } catch (error) {
+      toast("Health state was not cleared.", "error", error.message);
+    }
+  });
+
+  $("#corpus-capture").addEventListener("click", captureCorpus);
+  $("#corpus-download").addEventListener("click", downloadCorpus);
+  $("#corpus-replay").addEventListener("click", replayCorpus);
+  $("#corpus-json").addEventListener("input", updateCorpusCount);
 
   $("#raw-reload").addEventListener("click", loadRawConfig);
   $("#raw-config-disclosure").addEventListener("toggle", (event) => {

@@ -1386,3 +1386,156 @@ details.provider-editor .field-row { margin-top: 10px; }
   .drift { animation: none; }
   .split-local, .latency-bar, .toast { transition: none; animation: none; }
 }
+
+/* Money, evidence, and memory
+   ---------------------------
+   These panels share the existing table, badge, and stat vocabulary; the
+   rules below only add the shapes that had no equivalent: a filter row in a
+   panel header, a two-column answer diff, and a note list. */
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.panel-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.filter-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.filter-name {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* A row that is reported but deliberately not ranked. */
+.row-muted {
+  opacity: 0.62;
+}
+
+.cell-check {
+  text-align: center;
+}
+
+.insight-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background: var(--panel-alt, transparent);
+}
+
+.insight-head {
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.insight-body {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.shadow-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.shadow-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.shadow-head {
+  margin: 0 0 6px;
+  font-size: 12px;
+}
+
+.shadow-vs {
+  color: var(--muted);
+}
+
+.shadow-overlap {
+  color: var(--muted);
+}
+
+.shadow-prompt {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.shadow-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+@media (max-width: 900px) {
+  .shadow-pair {
+    grid-template-columns: 1fr;
+  }
+}
+
+.shadow-answer pre {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.memory-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.memory-note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.memory-text {
+  flex: 1;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.corpus-editor {
+  width: 100%;
+  font-size: 12px;
+}
+
+.corpus-actions {
+  flex-wrap: wrap;
+}
+
+.corpus-headline {
+  margin: 12px 0 8px;
+  font-weight: 600;
+}

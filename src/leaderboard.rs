@@ -236,10 +236,13 @@ pub(crate) fn cost_insight(candidates: &[RouteCandidate], currency: Option<&str>
         .iter()
         .filter(|candidate| candidate.record.cost_per_answer().is_some())
         .collect::<Vec<_>>();
+    // Rust's f64 sum identity is -0.0, which would render as "-0.00" in a
+    // report that has simply seen no spend yet.
     let total: f64 = priced
         .iter()
         .filter_map(|candidate| candidate.record.cost)
-        .sum();
+        .sum::<f64>()
+        + 0.0;
 
     let cheapest = priced
         .iter()

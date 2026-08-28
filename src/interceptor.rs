@@ -2002,7 +2002,8 @@ fn handle_memory_verb(
     } else if let Some(project) = state.config.project.as_deref() {
         match verb {
             RoutingVerb::Remember if state.config.interceptor.reject_sensitive => {
-                "Project memory is read-only while sensitive-data screening is enabled, because a                  note is injected into every later request in this project."
+                "Project memory is read-only while sensitive-data screening is enabled, \
+                 because a note is injected into every later request in this project."
                     .to_string()
             }
             RoutingVerb::Remember => {
@@ -2017,7 +2018,9 @@ fn handle_memory_verb(
                         "Recorded in the shared memory for project {project:?} as note {}: {}",
                         note.id, note.text
                     ),
-                    None => format!("Nothing to record in the shared memory for project {project:?}."),
+                    None => {
+                        format!("Nothing to record in the shared memory for project {project:?}.")
+                    }
                 }
             }
             RoutingVerb::Forget => format!(
@@ -2038,7 +2041,8 @@ fn handle_memory_verb(
             }
         }
     } else {
-        "Project memory needs a project scope. Launch the agent from a directory containing a          .llmproxy.toml, or pass --project."
+        "Project memory needs a project scope. Launch the agent from a directory \
+         containing a .llmproxy.toml, or pass --project."
             .to_string()
     };
 
@@ -2328,6 +2332,11 @@ async fn execute_integrated_redirect(
                 "escalating a re-asked request to a stronger route"
             );
             audit.note_escalation(target_name, &stronger);
+            // The audit must name where the request actually went, not the
+            // route it was escalated away from.
+            if let Some(target) = state.config.integrated.targets.get(&stronger) {
+                audit.set_target(&stronger, target);
+            }
             stronger
         }
         None => target_name.to_string(),
@@ -2903,7 +2912,9 @@ pub(super) fn is_pass_tool(tool: &Value) -> bool {
 }
 
 fn is_default_route_name(name: &str) -> bool {
-    name == PASS_TOOL_NAME || name == ROUTE_DEFAULT_TOOL_NAME
+    let normalized = normalized_tool_name(name);
+    normalized == normalized_tool_name(PASS_TOOL_NAME)
+        || normalized == normalized_tool_name(ROUTE_DEFAULT_TOOL_NAME)
 }
 
 #[cfg(test)]
@@ -3066,16 +3077,25 @@ fn control_decision(
     reject_sensitive: bool,
 ) -> Option<CompletionDecision> {
     let name = name?.trim();
-    if reject_sensitive && name == REJECT_TOOL_NAME {
+    if reject_sensitive && normalized_tool_name(name) == normalized_tool_name(REJECT_TOOL_NAME) {
         return Some(CompletionDecision::Reject);
     }
     if is_default_route_name(name) {
         return Some(CompletionDecision::DefaultRoute);
     }
-    let canonical = name.replace('-', "_").to_ascii_uppercase();
+    // Models occasionally return a tool name with the case changed or `-` and
+    // `_` swapped. Matching against the configured names rather than forcing
+    // one spelling keeps a lowercase target reachable, which upper-casing the
+    // candidate quietly did not.
+    let wanted = normalized_tool_name(name);
     targets
-        .contains_key(&canonical)
-        .then_some(CompletionDecision::Redirect(canonical))
+        .keys()
+        .find(|configured| normalized_tool_name(configured) == wanted)
+        .map(|configured| CompletionDecision::Redirect(configured.clone()))
+}
+
+fn normalized_tool_name(name: &str) -> String {
+    name.replace('-', "_").to_ascii_lowercase()
 }
 
 /// True when any choice stopped for length: the completion is clipped and

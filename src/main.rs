@@ -52,6 +52,7 @@ mod logging;
 mod oauth;
 mod pricing;
 mod project;
+mod route_cache;
 mod routing_verbs;
 mod stats;
 mod usage_store;

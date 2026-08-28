@@ -136,6 +136,8 @@ fn router(state: AdminState) -> Router {
         .route("/api/spend/reset", post(api_spend_reset))
         .route("/api/health", get(api_health))
         .route("/api/health/reset", post(api_health_reset))
+        .route("/api/route-cache", get(api_route_cache))
+        .route("/api/route-cache/clear", post(api_route_cache_clear))
         .route("/api/logs", get(api_logs))
         .route("/api/logs/clear", post(api_logs_clear))
         .route("/api/errors", get(api_errors))
@@ -448,6 +450,15 @@ async fn api_stats(State(state): State<AdminState>) -> Response {
 
 async fn api_stats_reset() -> Response {
     proxy_stats().reset();
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn api_route_cache() -> Response {
+    Json(crate::route_cache::route_cache().snapshot_json()).into_response()
+}
+
+async fn api_route_cache_clear() -> Response {
+    crate::route_cache::route_cache().clear();
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -866,6 +877,13 @@ async fn apply_config_change(
 
     let auto_mapping = config.model_routing == ModelRoutingMode::Remap;
     crate::health::provider_health().configure(config.health);
+    // A cached decision naming a route this edit removed must never be
+    // replayed, so the cache is pruned against the new target set.
+    let live_targets = config.integrated.targets.clone();
+    crate::route_cache::route_cache().retain_valid(move |decision| match decision {
+        crate::route_cache::CachedDecision::Redirect(target) => live_targets.contains_key(target),
+        _ => true,
+    });
     let new_state = AppState {
         forward_caller_credentials: !config.integrated.enabled,
         config: Arc::new(config),

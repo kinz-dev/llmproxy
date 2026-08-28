@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use super::{
     IntegratedConfig, IntegratedTarget, StickyBounds, StickyDecision, StickyPolicy, StickyRoutes,
-    apply_escalation_floor, classify_completion_details, classify_completion_with_targets,
-    failover_chain, forced_route_for, routable_targets, trim_triage_messages,
-    validate_integrated_config,
+    apply_escalation_floor, cacheable_decision, classify_completion_details,
+    classify_completion_with_targets, failover_chain, forced_route_for, routable_targets,
+    trim_triage_messages, validate_integrated_config,
 };
 use crate::Config;
 use crate::INTEGRATED_AUTO_MODEL;
@@ -20,6 +20,7 @@ use crate::interceptor::InterceptorProtocol;
 use crate::interceptor::build_local_request;
 use crate::interceptor::classify_completion;
 use crate::interceptor::is_pass_tool;
+use crate::route_cache::CachedDecision;
 use crate::routing_verbs::RoutingVerb;
 use crate::text_from_value;
 
@@ -737,9 +738,9 @@ fn age_sticky_entry(routes: &StickyRoutes, key: u64, by: Duration) {
 #[test]
 fn a_pinned_route_is_reused_while_it_is_inside_every_bound() {
     let routes = StickyRoutes::default();
-    routes.insert(1, "backend".to_string(), 600, 16);
+    routes.insert(1, "backend".to_string(), 600, 16, None);
     assert_eq!(
-        routes.lookup(1, StickyBounds::default()),
+        routes.lookup(1, StickyBounds::default(), None),
         StickyDecision::Reuse("backend".to_string())
     );
 }
@@ -750,17 +751,21 @@ fn the_absolute_bound_survives_a_refresh_that_slides_the_idle_ttl() {
     let bounds = StickyBounds {
         absolute_ttl: Some(Duration::from_secs(60)),
         max_turns: None,
+        drift_below: 0.0,
     };
-    routes.insert(7, "cheap".to_string(), 600, 16);
+    routes.insert(7, "cheap".to_string(), 600, 16, None);
     // Continuous use: every turn refreshes the sliding TTL, which is exactly
     // the case a sliding-only TTL never bounds.
     for _ in 0..5 {
-        assert!(matches!(routes.lookup(7, bounds), StickyDecision::Reuse(_)));
-        routes.insert(7, "cheap".to_string(), 600, 16);
+        assert!(matches!(
+            routes.lookup(7, bounds, None),
+            StickyDecision::Reuse(_)
+        ));
+        routes.insert(7, "cheap".to_string(), 600, 16, None);
     }
     age_sticky_entry(&routes, 7, Duration::from_secs(61));
     assert_eq!(
-        routes.lookup(7, bounds),
+        routes.lookup(7, bounds, None),
         StickyDecision::Retriage {
             previous: "cheap".to_string()
         }
@@ -773,12 +778,13 @@ fn the_turn_bound_reconsiders_routing_without_dropping_the_previous_route() {
     let bounds = StickyBounds {
         absolute_ttl: None,
         max_turns: Some(3),
+        drift_below: 0.0,
     };
     for _ in 0..3 {
-        routes.insert(9, "cheap".to_string(), 600, 16);
+        routes.insert(9, "cheap".to_string(), 600, 16, None);
     }
     assert_eq!(
-        routes.lookup(9, bounds),
+        routes.lookup(9, bounds, None),
         StickyDecision::Retriage {
             previous: "cheap".to_string()
         }
@@ -791,16 +797,17 @@ fn re_pinning_a_different_route_restarts_the_decision_clock() {
     let bounds = StickyBounds {
         absolute_ttl: None,
         max_turns: Some(2),
+        drift_below: 0.0,
     };
-    routes.insert(11, "cheap".to_string(), 600, 16);
-    routes.insert(11, "cheap".to_string(), 600, 16);
+    routes.insert(11, "cheap".to_string(), 600, 16, None);
+    routes.insert(11, "cheap".to_string(), 600, 16, None);
     assert!(matches!(
-        routes.lookup(11, bounds),
+        routes.lookup(11, bounds, None),
         StickyDecision::Retriage { .. }
     ));
-    routes.insert(11, "strong".to_string(), 600, 16);
+    routes.insert(11, "strong".to_string(), 600, 16, None);
     assert_eq!(
-        routes.lookup(11, bounds),
+        routes.lookup(11, bounds, None),
         StickyDecision::Reuse("strong".to_string())
     );
 }
@@ -808,13 +815,13 @@ fn re_pinning_a_different_route_restarts_the_decision_clock() {
 #[test]
 fn an_idle_gap_drops_the_entry_and_carries_nothing_forward() {
     let routes = StickyRoutes::default();
-    routes.insert(13, "cheap".to_string(), 0, 16);
+    routes.insert(13, "cheap".to_string(), 0, 16, None);
     assert_eq!(
-        routes.lookup(13, StickyBounds::default()),
+        routes.lookup(13, StickyBounds::default(), None),
         StickyDecision::Fresh
     );
     assert_eq!(
-        routes.lookup(13, StickyBounds::default()),
+        routes.lookup(13, StickyBounds::default(), None),
         StickyDecision::Fresh
     );
 }
@@ -1175,4 +1182,90 @@ fn unhealthy_routes_are_withheld_from_triage_but_never_all_of_them() {
     // With nothing healthy left, an optimistic list beats an empty one.
     health.record_rate_limit("healthy", Some(Duration::from_secs(60)));
     assert_eq!(routable_targets(&config, &health), vec!["bad", "good"]);
+}
+
+#[test]
+fn material_drift_reconsiders_a_route_that_is_otherwise_still_in_bounds() {
+    let routes = StickyRoutes::default();
+    let pinned = crate::route_cache::normalize(vec![1.0, 0.0]).expect("vector");
+    routes.insert(21, "cheap".to_string(), 600, 16, Some(pinned.clone()));
+    let bounds = StickyBounds {
+        absolute_ttl: None,
+        max_turns: None,
+        drift_below: 0.5,
+    };
+
+    // The same subject keeps the pin.
+    let similar = crate::route_cache::normalize(vec![0.98, 0.2]).expect("vector");
+    assert_eq!(
+        routes.lookup(21, bounds, Some(&similar)),
+        StickyDecision::Reuse("cheap".to_string())
+    );
+
+    // A different subject reconsiders, carrying the previous route forward.
+    let different = crate::route_cache::normalize(vec![0.0, 1.0]).expect("vector");
+    assert_eq!(
+        routes.lookup(21, bounds, Some(&different)),
+        StickyDecision::Retriage {
+            previous: "cheap".to_string()
+        }
+    );
+
+    // Without a vector, or with drift checking off, nothing changes.
+    assert_eq!(
+        routes.lookup(21, bounds, None),
+        StickyDecision::Reuse("cheap".to_string())
+    );
+    assert_eq!(
+        routes.lookup(
+            21,
+            StickyBounds {
+                drift_below: 0.0,
+                ..bounds
+            },
+            Some(&different)
+        ),
+        StickyDecision::Reuse("cheap".to_string())
+    );
+}
+
+#[test]
+fn escalation_picks_the_weakest_route_that_is_still_stronger() {
+    let mut targets = BTreeMap::new();
+    for (name, strength) in [("cheap", 1), ("mid", 5), ("strong", 9)] {
+        targets.insert(name.to_string(), target_named("openai", Some(strength)));
+    }
+    targets.insert("unranked".to_string(), target_named("openai", None));
+    let config = IntegratedConfig {
+        targets,
+        ..IntegratedConfig::default()
+    };
+    assert_eq!(config.stronger_than("cheap"), Some("mid".to_string()));
+    assert_eq!(config.stronger_than("mid"), Some("strong".to_string()));
+    // Nothing is stronger than the strongest route, so a re-ask stays put.
+    assert_eq!(config.stronger_than("strong"), None);
+    // An unranked route counts as the weakest.
+    assert_eq!(config.stronger_than("unranked"), Some("cheap".to_string()));
+}
+
+#[test]
+fn only_replayable_decisions_are_cached() {
+    assert_eq!(
+        cacheable_decision(&CompletionDecision::Local),
+        Some(CachedDecision::Local)
+    );
+    assert_eq!(
+        cacheable_decision(&CompletionDecision::DefaultRoute),
+        Some(CachedDecision::DefaultRoute)
+    );
+    assert_eq!(
+        cacheable_decision(&CompletionDecision::Redirect("backend".to_string())),
+        Some(CachedDecision::Redirect("backend".to_string()))
+    );
+    // A rejection or a malformed control must always be re-derived.
+    assert_eq!(cacheable_decision(&CompletionDecision::Reject), None);
+    assert_eq!(
+        cacheable_decision(&CompletionDecision::InvalidControl),
+        None
+    );
 }

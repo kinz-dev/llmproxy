@@ -266,6 +266,8 @@ pub(crate) struct ProxyStats {
     intercept_pass: AtomicU64,
     intercept_redirect: AtomicU64,
     intercept_failover: AtomicU64,
+    route_cache_hits: AtomicU64,
+    retry_escalations: AtomicU64,
     speculation_used: AtomicU64,
     speculation_discarded: AtomicU64,
     intercept_fallback: AtomicU64,
@@ -344,6 +346,17 @@ impl ProxyStats {
             .lock()
             .expect("redirect stats poisoned");
         *redirects.entry(target.to_string()).or_default() += 1;
+    }
+
+    /// A past decision with a near-identical embedding was replayed, so the
+    /// triage model was not called at all.
+    pub(crate) fn record_route_cache_hit(&self) {
+        self.route_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A re-asked request moved up to a stronger route.
+    pub(crate) fn record_retry_escalation(&self) {
+        self.retry_escalations.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A speculative default-route request was already in flight when triage
@@ -480,6 +493,8 @@ impl ProxyStats {
             &self.intercept_pass,
             &self.intercept_redirect,
             &self.intercept_failover,
+            &self.route_cache_hits,
+            &self.retry_escalations,
             &self.speculation_used,
             &self.speculation_discarded,
             &self.intercept_fallback,
@@ -672,6 +687,8 @@ impl ProxyStats {
                 "pass": load(&self.intercept_pass),
                 "redirect": load(&self.intercept_redirect),
                 "failover": load(&self.intercept_failover),
+                "route_cache_hits": load(&self.route_cache_hits),
+                "retry_escalations": load(&self.retry_escalations),
                 "speculation_used": load(&self.speculation_used),
                 "speculation_discarded": load(&self.speculation_discarded),
                 "fallback": load(&self.intercept_fallback),

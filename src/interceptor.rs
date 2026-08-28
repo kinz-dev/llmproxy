@@ -21,6 +21,7 @@ use crate::first_chat_choice_message;
 use crate::normalize_chat_completion_request;
 use crate::request_id_from_headers;
 use crate::rewrite_request_roles;
+use crate::route_cache::CachedDecision;
 use crate::routing_verbs::RoutingVerb;
 use crate::stats::{
     RouteClass, RoutingDecisionAudit, TokenUsage, log_request_value, log_response_text,
@@ -144,6 +145,9 @@ pub(crate) struct IntegratedConfig {
     /// Recognise in-band routing verbs at the start of the newest user
     /// message. Disable to pass every message through byte-for-byte.
     pub(crate) verbs: bool,
+    /// Embedding-cached routing, sticky drift detection, and retry-driven
+    /// escalation, all of which need one vector per request.
+    pub(crate) embedding: crate::route_cache::EmbeddingConfig,
     /// Default failover chain for targets that do not define their own.
     /// Quota exhaustion and outages are absorbed here rather than reported to
     /// the caller mid-task.
@@ -190,6 +194,7 @@ impl Default for IntegratedConfig {
             sticky_policy: StickyPolicy::Escalate,
             sticky_capacity: 1024,
             verbs: true,
+            embedding: crate::route_cache::EmbeddingConfig::default(),
             failover: Vec::new(),
             speculative: false,
             instructions: String::new(),
@@ -204,7 +209,25 @@ impl IntegratedConfig {
             absolute_ttl: (self.sticky_absolute_ttl_secs > 0)
                 .then(|| Duration::from_secs(self.sticky_absolute_ttl_secs)),
             max_turns: (self.sticky_max_turns > 0).then_some(self.sticky_max_turns),
+            drift_below: if self.embedding.is_active() {
+                self.embedding.retriage_below
+            } else {
+                0.0
+            },
         }
+    }
+
+    /// The next route up from `current`: the weakest target that is still
+    /// stronger than it. Used when a retry says the answer was unsatisfying.
+    fn stronger_than(&self, current: &str) -> Option<String> {
+        let floor = self.strength(current);
+        self.targets
+            .iter()
+            .filter(|(name, target)| {
+                name.as_str() != current && target.strength.unwrap_or(0) > floor
+            })
+            .min_by_key(|(name, target)| (target.strength.unwrap_or(0), (*name).clone()))
+            .map(|(name, _)| name.clone())
     }
 
     /// Routing strength of a target, defaulting to the weakest rank so an
@@ -450,6 +473,13 @@ impl RoutingAuditDraft {
             .map(str::to_string);
     }
 
+    fn note_escalation(&mut self, from: &str, to: &str) {
+        self.audit.reason = format!(
+            "{} The request repeated a recent one with no intervening tool use, so it was escalated from {from:?} to {to:?}.",
+            self.audit.reason
+        );
+    }
+
     /// Record what the failover chain did, so the admin Decisions view shows
     /// an absorbed outage rather than an unexplained provider change.
     fn note_failover(&mut self, skipped: &[String], failed: &[String]) {
@@ -588,6 +618,12 @@ pub(crate) fn validate_integrated_config(
             );
         }
     }
+    if let Err(error) = config
+        .embedding
+        .validate(|name| providers.contains_key(name))
+    {
+        bail!(error);
+    }
     for candidate in &config.failover {
         if !config.targets.contains_key(candidate) {
             bail!("integrated.failover references unknown target {candidate:?}");
@@ -669,6 +705,26 @@ pub(crate) fn validate_integrated_config(
     Ok(())
 }
 
+/// Whether a cached decision still names something this config can route to.
+fn cached_decision_is_live(state: &AppState, decision: &CachedDecision) -> bool {
+    match decision {
+        CachedDecision::Local => true,
+        CachedDecision::DefaultRoute => true,
+        CachedDecision::Redirect(target) => state.config.integrated.targets.contains_key(target),
+    }
+}
+
+/// Outcomes that are safe to replay. A rejection or an invalid control must
+/// always be re-derived, never remembered.
+fn cacheable_decision(decision: &CompletionDecision) -> Option<CachedDecision> {
+    match decision {
+        CompletionDecision::Local => Some(CachedDecision::Local),
+        CompletionDecision::DefaultRoute => Some(CachedDecision::DefaultRoute),
+        CompletionDecision::Redirect(target) => Some(CachedDecision::Redirect(target.clone())),
+        CompletionDecision::Reject | CompletionDecision::InvalidControl => None,
+    }
+}
+
 /// Targets worth advertising to the triage model right now.
 ///
 /// A route whose provider is rate-limited or circuit-open is withheld, so
@@ -747,6 +803,9 @@ fn valid_target_name(name: &str) -> bool {
 #[derive(Clone)]
 struct StickyRoute {
     target: String,
+    /// The request that pinned this route. Kept so a later turn can be tested
+    /// for material drift rather than only for elapsed time.
+    vector: Option<crate::route_cache::Vector>,
     /// When the route was first chosen. Deliberately *not* refreshed, so the
     /// absolute bound measures the age of the decision rather than the age of
     /// the last message.
@@ -762,6 +821,9 @@ struct StickyRoute {
 struct StickyBounds {
     absolute_ttl: Option<Duration>,
     max_turns: Option<u32>,
+    /// Similarity to the pinning request below which the conversation has
+    /// changed subject enough to deserve re-triage. Zero disables the check.
+    drift_below: f32,
 }
 
 /// What the store has to say about a conversation.
@@ -782,7 +844,12 @@ struct StickyRoutes {
 }
 
 impl StickyRoutes {
-    fn lookup(&self, key: u64, bounds: StickyBounds) -> StickyDecision {
+    fn lookup(
+        &self,
+        key: u64,
+        bounds: StickyBounds,
+        vector: Option<&crate::route_cache::Vector>,
+    ) -> StickyDecision {
         let now = Instant::now();
         let mut routes = self.entries.lock().expect("sticky route store poisoned");
         let (entries, _) = &mut *routes;
@@ -801,7 +868,16 @@ impl StickyRoutes {
             .absolute_ttl
             .is_some_and(|ttl| now.duration_since(route.created_at) >= ttl);
         let turned_out = bounds.max_turns.is_some_and(|max| route.turns >= max);
-        if aged_out || turned_out {
+        // Material change: the conversation has moved far enough from the
+        // request that chose this route that the choice is worth revisiting.
+        let drifted = bounds.drift_below > 0.0
+            && match (vector, route.vector.as_ref()) {
+                (Some(current), Some(pinned)) => {
+                    crate::route_cache::dot(current, pinned) < bounds.drift_below
+                }
+                _ => false,
+            };
+        if aged_out || turned_out || drifted {
             return StickyDecision::Retriage {
                 previous: route.target.clone(),
             };
@@ -809,7 +885,14 @@ impl StickyRoutes {
         StickyDecision::Reuse(route.target.clone())
     }
 
-    fn insert(&self, key: u64, target: String, ttl_secs: u64, capacity: usize) {
+    fn insert(
+        &self,
+        key: u64,
+        target: String,
+        ttl_secs: u64,
+        capacity: usize,
+        vector: Option<crate::route_cache::Vector>,
+    ) {
         let mut routes = self.entries.lock().expect("sticky route store poisoned");
         let (entries, order) = &mut *routes;
         let now = Instant::now();
@@ -832,6 +915,7 @@ impl StickyRoutes {
             key,
             StickyRoute {
                 target,
+                vector,
                 created_at,
                 expires_at: now + Duration::from_secs(ttl_secs),
                 turns,
@@ -943,6 +1027,17 @@ pub(crate) async fn maybe_intercept(
     let conversation_key =
         integrated.then(|| conversation_key(incoming_headers, &local_chat_request));
 
+    // Sensitive screening must precede anything that leaves this process and
+    // anything that can skip triage, so embeddings and the route cache are
+    // both off whenever it is enabled.
+    let embedding = &state.config.integrated.embedding;
+    let embeddings_active = integrated && embedding.is_active() && !config.reject_sensitive;
+    let route_context = if embeddings_active {
+        build_route_context(state, &local_chat_request, embedding).await
+    } else {
+        RouteContext::default()
+    };
+
     // An explicit verb is the user overruling the router, so it takes
     // precedence over a pinned route. `unstick` also drops the pin itself.
     if matches!(verb, Some(RoutingVerb::Unstick))
@@ -957,7 +1052,11 @@ pub(crate) async fn maybe_intercept(
         && !verb_overrides_sticky
         && let Some(key) = conversation_key
     {
-        match sticky_routes().lookup(key, state.config.integrated.sticky_bounds()) {
+        match sticky_routes().lookup(
+            key,
+            state.config.integrated.sticky_bounds(),
+            route_context.vector.as_ref(),
+        ) {
             StickyDecision::Reuse(target)
                 if state.config.integrated.targets.contains_key(&target) =>
             {
@@ -987,6 +1086,7 @@ pub(crate) async fn maybe_intercept(
                     client_model,
                     client_streaming,
                     Some(key),
+                    &route_context,
                     audit,
                 )
                 .await;
@@ -1034,6 +1134,7 @@ pub(crate) async fn maybe_intercept(
             client_model,
             client_streaming,
             conversation_key,
+            &route_context,
             audit,
         )
         .await;
@@ -1046,9 +1147,86 @@ pub(crate) async fn maybe_intercept(
         proxy_stats().record_intercept_pass();
         return InterceptionOutcome::Continue(audit);
     }
-    let force_local = matches!(verb, Some(RoutingVerb::Local));
+    let mut force_local = matches!(verb, Some(RoutingVerb::Local));
 
     let redirect_request = local_chat_request.clone();
+
+    // Embedding-cached routing. A request near-identical to one already
+    // decided routes the same way by construction, without calling the triage
+    // model at all. An explicit verb outranks the cache, because the user
+    // asking for re-triage is asking for exactly what the cache skips.
+    if embeddings_active
+        && verb.is_none()
+        && let Some(vector) = route_context.vector.clone()
+        && let Some(hit) = crate::route_cache::route_cache().lookup(
+            &vector,
+            &state.config.integrated.embedding,
+            |decision| cached_decision_is_live(state, decision),
+        )
+    {
+        proxy_stats().record_route_cache_hit();
+        let reason = format!(
+            "A cached decision {:.1}% similar to this request was replayed without triage. {}",
+            hit.similarity * 100.0,
+            hit.reason
+        );
+        info!(
+            request_id,
+            protocol = protocol.as_str(),
+            decision = hit.decision.as_str(),
+            similarity = hit.similarity,
+            route = "cached",
+            "routing cache hit"
+        );
+        match hit.decision {
+            CachedDecision::Redirect(target) => {
+                let target_config = &state.config.integrated.targets[&target];
+                audit.set_decision("cached", reason);
+                audit.set_target(&target, target_config);
+                return execute_integrated_redirect(
+                    state,
+                    &target,
+                    redirect_request,
+                    protocol,
+                    client_model,
+                    client_streaming,
+                    conversation_key,
+                    &route_context,
+                    audit,
+                )
+                .await;
+            }
+            CachedDecision::DefaultRoute => {
+                if let Some((name, _)) = default_target(&state.config.integrated) {
+                    let name = name.to_string();
+                    let target_config = &state.config.integrated.targets[&name];
+                    audit.set_decision("cached", reason);
+                    audit.set_target(&name, target_config);
+                    return execute_integrated_redirect(
+                        state,
+                        &name,
+                        redirect_request,
+                        protocol,
+                        client_model,
+                        client_streaming,
+                        conversation_key,
+                        &route_context,
+                        audit,
+                    )
+                    .await;
+                }
+                audit.set_decision("cached", reason);
+                proxy_stats().record_intercept_pass();
+                return InterceptionOutcome::Continue(audit);
+            }
+            CachedDecision::Local => {
+                // The local tier still has to produce the answer; what the
+                // cache saved is the decision about whether to route at all.
+                audit.set_decision("cached", reason);
+                force_local = true;
+            }
+        }
+    }
 
     // Speculative triage: issue the presumed-default route concurrently with
     // the triage call and cancel the loser. Never with sensitive screening on,
@@ -1296,6 +1474,22 @@ pub(crate) async fn maybe_intercept(
                     .to_string(),
         }
     });
+    // Remember what triage decided so a near-identical request can replay it.
+    // A forced or cached turn is not a triage judgement, so it is not stored.
+    if embeddings_active
+        && verb.is_none()
+        && !force_local
+        && let Some(vector) = route_context.vector.clone()
+        && let Some(cached) = cacheable_decision(&classification.decision)
+    {
+        crate::route_cache::route_cache().insert(
+            vector,
+            cached,
+            reason.clone(),
+            &state.config.integrated.embedding,
+        );
+    }
+
     if let Some(speculation) = speculation {
         let wanted = match &classification.decision {
             CompletionDecision::Redirect(target) => target == &speculation.target,
@@ -1315,6 +1509,7 @@ pub(crate) async fn maybe_intercept(
                             speculation.target.clone(),
                             state.config.integrated.sticky_ttl_secs,
                             state.config.integrated.sticky_capacity,
+                            route_context.vector.clone(),
                         );
                     }
                     let target = &state.config.integrated.targets[&speculation.target];
@@ -1362,6 +1557,7 @@ pub(crate) async fn maybe_intercept(
             client_model,
             client_streaming,
             conversation_key,
+            &route_context,
             audit,
         )
         .await;
@@ -1430,6 +1626,7 @@ pub(crate) async fn maybe_intercept(
                     client_model,
                     client_streaming,
                     conversation_key,
+                    &route_context,
                     audit,
                 )
                 .await;
@@ -1485,6 +1682,7 @@ pub(crate) async fn maybe_intercept(
                 client_model,
                 client_streaming,
                 conversation_key,
+                &route_context,
                 audit,
             )
             .await
@@ -1536,6 +1734,99 @@ pub(crate) async fn maybe_intercept(
             ))
         }
     }
+}
+
+/// One embedding of the newest user turn, plus the retry check that reuses it.
+///
+/// Both answers come from the same provider round trip wherever possible: the
+/// newest turn is embedded once and compared against the previous turn only
+/// when retry escalation is switched on.
+async fn build_route_context(
+    state: &AppState,
+    chat_request: &Value,
+    config: &crate::route_cache::EmbeddingConfig,
+) -> RouteContext {
+    let newest = request_prompt_preview(chat_request);
+    let Some(vector) = embed_text(state, config, &newest).await else {
+        return RouteContext::default();
+    };
+    let mut context = RouteContext {
+        vector: Some(vector.clone()),
+        escalate: false,
+    };
+    if !config.retry_escalation {
+        return context;
+    }
+    // A repeat only counts when nothing happened in between: intervening tool
+    // use means the agent made progress, so a similar follow-up is
+    // continuation rather than dissatisfaction.
+    let Some(window) = crate::route_cache::retry_window(chat_request) else {
+        return context;
+    };
+    let Some(previous) = embed_text(state, config, &window.previous).await else {
+        return context;
+    };
+    let similarity = crate::route_cache::dot(&vector, &previous);
+    context.escalate = similarity >= config.retry_threshold;
+    context
+}
+
+/// Embed one string through the configured embeddings provider. Every failure
+/// is a soft failure: routing must never depend on the cache being reachable.
+async fn embed_text(
+    state: &AppState,
+    config: &crate::route_cache::EmbeddingConfig,
+    text: &str,
+) -> Option<crate::route_cache::Vector> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    let provider = state.providers.get(&config.provider)?;
+    let headers = HeaderMap::new();
+    let meta = UpstreamRequestMeta::new(
+        &provider.name,
+        &headers,
+        Method::POST,
+        "embeddings",
+        UpstreamResponseKind::Json,
+        false,
+    );
+    let request = json!({ "model": config.model, "input": text });
+    let response = tokio::time::timeout(
+        Duration::from_millis(config.timeout_ms),
+        upstream_json(provider, &headers, &meta, Some(&request)),
+    )
+    .await;
+    match response {
+        Ok(Ok(response)) => crate::route_cache::vector_from_response(&response),
+        Ok(Err(error)) => {
+            info!(
+                provider = %provider.name,
+                error = %error,
+                "embedding request failed; routing continues without the cache"
+            );
+            None
+        }
+        Err(_) => {
+            info!(
+                provider = %provider.name,
+                timeout_ms = config.timeout_ms,
+                "embedding request timed out; routing continues without the cache"
+            );
+            None
+        }
+    }
+}
+
+/// Per-request routing extras that several paths need but that would
+/// otherwise be threaded through every signature individually.
+#[derive(Default, Clone)]
+struct RouteContext {
+    /// Embedding of the newest user request, when embeddings are active.
+    vector: Option<crate::route_cache::Vector>,
+    /// The user re-asked the same question a different way, so the chosen
+    /// route moves up one rank if a stronger one exists.
+    escalate: bool,
 }
 
 /// A default-route request already in flight while triage runs.
@@ -1631,8 +1922,30 @@ async fn execute_integrated_redirect(
     client_model: Option<String>,
     client_streaming: bool,
     conversation_key: Option<u64>,
+    context: &RouteContext,
     mut audit: RoutingAuditDraft,
 ) -> InterceptionOutcome {
+    // Retry-driven escalation applies here, at the one point every routing
+    // path funnels through, so a re-ask is upgraded however the route was
+    // chosen: by triage, by the sticky pin, or by the embedding cache.
+    let escalated = context
+        .escalate
+        .then(|| state.config.integrated.stronger_than(target_name))
+        .flatten();
+    let target_name = match escalated {
+        Some(stronger) => {
+            proxy_stats().record_retry_escalation();
+            info!(
+                from = target_name,
+                to = stronger,
+                "escalating a re-asked request to a stronger route"
+            );
+            audit.note_escalation(target_name, &stronger);
+            stronger
+        }
+        None => target_name.to_string(),
+    };
+    let target_name = target_name.as_str();
     let chain = failover_chain(&state.config.integrated, target_name);
     let mut skipped: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
@@ -1701,6 +2014,7 @@ async fn execute_integrated_redirect(
                     name.clone(),
                     state.config.integrated.sticky_ttl_secs,
                     state.config.integrated.sticky_capacity,
+                    context.vector.clone(),
                 );
             }
             if !skipped.is_empty() || !failed.is_empty() {

@@ -64,8 +64,8 @@ use interceptor::{
     InterceptorProtocol, maybe_intercept,
 };
 use stats::{
-    RemapKind, ResponseTracking, log_request_value, proxy_stats, route_class_for_base_url,
-    track_response,
+    ModelPrice, RemapKind, RequestPricing, ResponseTracking, RouteClass, log_request_value,
+    proxy_stats, route_class_for_base_url, track_response,
 };
 
 #[cfg(unix)]
@@ -248,6 +248,9 @@ struct Config {
     responses: ResponsesConfig,
     models: ModelsConfig,
     admin: AdminConfig,
+    /// Deterministic routes evaluated before any triage request, in order.
+    routing_rules: Vec<RoutingRule>,
+    pricing: PricingConfig,
     /// The one routing behavior for this instance. Legacy configs without this
     /// key migrate from the per-section `enabled` flags in `parse_config`.
     routing_mode: RoutingMode,
@@ -274,6 +277,8 @@ impl Default for Config {
             responses: ResponsesConfig::default(),
             models: ModelsConfig::default(),
             admin: AdminConfig::default(),
+            routing_rules: Vec::new(),
+            pricing: PricingConfig::default(),
             routing_mode: RoutingMode::Proxy,
             model_routing: ModelRoutingMode::Remap,
             anthropic_mode: AnthropicMode::ChatCompletions,
@@ -282,6 +287,28 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Read-only views for the admin API. Config internals stay private so the
+    /// admin cannot accidentally become a second source of truth for them.
+    pub(crate) fn pricing_baseline_model(&self) -> Option<&str> {
+        self.pricing.baseline_model.as_deref()
+    }
+
+    pub(crate) fn pricing_models(&self) -> Map<String, Value> {
+        self.pricing
+            .models
+            .iter()
+            .map(|(model, price)| {
+                (
+                    model.clone(),
+                    json!({
+                        "input_per_mtok": price.input_per_mtok,
+                        "output_per_mtok": price.output_per_mtok,
+                    }),
+                )
+            })
+            .collect()
+    }
+
     /// `routing_mode` is authoritative: the per-section `enabled` flags are
     /// derived from it so every downstream check stays consistent with it.
     fn set_routing_mode(&mut self, mode: RoutingMode) {
@@ -303,6 +330,175 @@ enum AnthropicMode {
     #[default]
     ChatCompletions,
     Passthrough,
+}
+
+/// A deterministic route decided without asking the triage model. Every
+/// condition that is present must hold; an empty rule matches everything.
+/// Rules exist because triage costs a full extra model round-trip on requests
+/// whose destination was never actually in question.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+struct RoutingRule {
+    /// Shown in the decision audit so a route can be traced to its rule.
+    name: String,
+    min_input_tokens: Option<u64>,
+    max_input_tokens: Option<u64>,
+    has_tools: Option<bool>,
+    /// Case-insensitive substrings; any one matching satisfies the condition.
+    contains_any: Vec<String>,
+    requested_model: Option<String>,
+    /// `PASS` for normal routing, an integrated target name, or
+    /// `provider/model`.
+    route: String,
+}
+
+impl Default for RoutingRule {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            min_input_tokens: None,
+            max_input_tokens: None,
+            has_tools: None,
+            contains_any: Vec::new(),
+            requested_model: None,
+            route: ROUTING_RULE_PASS.to_string(),
+        }
+    }
+}
+
+pub(crate) const ROUTING_RULE_PASS: &str = "PASS";
+
+impl RoutingRule {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn route(&self) -> &str {
+        &self.route
+    }
+
+    pub(crate) fn min_input_tokens(&self) -> Option<u64> {
+        self.min_input_tokens
+    }
+
+    pub(crate) fn max_input_tokens(&self) -> Option<u64> {
+        self.max_input_tokens
+    }
+
+    pub(crate) fn has_tools(&self) -> Option<bool> {
+        self.has_tools
+    }
+
+    pub(crate) fn contains_any(&self) -> &[String] {
+        &self.contains_any
+    }
+
+    pub(crate) fn requested_model(&self) -> Option<&str> {
+        self.requested_model.as_deref()
+    }
+
+    /// Every condition the rule declares must hold. Conditions left unset are
+    /// not constraints, so a rule with only a `route` matches everything —
+    /// which is what makes a final catch-all rule expressible.
+    pub(crate) fn matches(
+        &self,
+        estimated_tokens: u64,
+        has_tools: bool,
+        lowercase_text: &str,
+        client_model: Option<&str>,
+    ) -> bool {
+        if self
+            .min_input_tokens
+            .is_some_and(|min| estimated_tokens < min)
+        {
+            return false;
+        }
+        if self
+            .max_input_tokens
+            .is_some_and(|max| estimated_tokens > max)
+        {
+            return false;
+        }
+        if self.has_tools.is_some_and(|expected| expected != has_tools) {
+            return false;
+        }
+        if let Some(expected) = self.requested_model.as_deref()
+            && client_model != Some(expected)
+        {
+            return false;
+        }
+        if !self.contains_any.is_empty()
+            && !self
+                .contains_any
+                .iter()
+                .any(|needle| lowercase_text.contains(&needle.to_lowercase()))
+        {
+            return false;
+        }
+        true
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct PricingConfig {
+    /// Model whose rates answer "what would this have cost otherwise".
+    baseline_model: Option<String>,
+    /// Rates keyed by `model` or `provider/model`; the namespaced key wins.
+    models: HashMap<String, ModelPriceConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default)]
+struct ModelPriceConfig {
+    input_per_mtok: f64,
+    output_per_mtok: f64,
+}
+
+impl From<ModelPriceConfig> for ModelPrice {
+    fn from(value: ModelPriceConfig) -> Self {
+        Self {
+            input_per_mtok: value.input_per_mtok,
+            output_per_mtok: value.output_per_mtok,
+        }
+    }
+}
+
+impl PricingConfig {
+    /// A namespaced rate is more specific than a bare model name, so it wins.
+    /// The same model served by two providers rarely costs the same.
+    fn price_for(&self, provider: &str, model: &str) -> ModelPrice {
+        self.models
+            .get(&format!("{provider}/{model}"))
+            .or_else(|| self.models.get(model))
+            .copied()
+            .map(ModelPrice::from)
+            .unwrap_or_default()
+    }
+
+    fn baseline(&self) -> ModelPrice {
+        self.baseline_model
+            .as_deref()
+            .and_then(|model| {
+                self.models.get(model).or_else(|| {
+                    model
+                        .split_once('/')
+                        .and_then(|(_, bare)| self.models.get(bare))
+                })
+            })
+            .copied()
+            .map(ModelPrice::from)
+            .unwrap_or_default()
+    }
+}
+
+/// What one completed request should be billed at, and what the same tokens
+/// would have cost on the baseline model.
+fn request_pricing(config: &Config, provider: &str, model: &str) -> RequestPricing {
+    RequestPricing {
+        actual: config.pricing.price_for(provider, model),
+        baseline: config.pricing.baseline(),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -345,6 +541,13 @@ struct UpstreamConfig {
     connect_timeout_secs: u64,
     pool_max_idle_per_host: usize,
     pool_idle_timeout_secs: u64,
+    /// Providers to try when this one is unavailable, in order. Each entry is
+    /// a provider name, or `provider/model` to also switch model.
+    fallback: Vec<String>,
+    /// Consecutive availability failures that open the breaker. 0 disables it.
+    circuit_breaker_threshold: u32,
+    /// How long an open breaker refuses traffic before one probe is allowed.
+    circuit_breaker_cooldown_secs: u64,
 }
 
 impl Default for UpstreamConfig {
@@ -363,6 +566,9 @@ impl Default for UpstreamConfig {
             connect_timeout_secs: 10,
             pool_max_idle_per_host: 64,
             pool_idle_timeout_secs: 90,
+            fallback: Vec::new(),
+            circuit_breaker_threshold: 5,
+            circuit_breaker_cooldown_secs: 30,
         }
     }
 }
@@ -572,6 +778,94 @@ struct ProviderState {
     client: Client,
     model_cache: Arc<ModelCache>,
     model_refresh: Arc<AsyncMutex<()>>,
+    breaker: Arc<CircuitBreaker>,
+}
+
+/// Per-provider availability gate. A provider that is refusing traffic should
+/// be skipped outright rather than made to time out on every single request,
+/// and it needs a way back once it recovers, so one probe is admitted after
+/// the cooldown instead of reopening the floodgates.
+#[derive(Debug)]
+struct CircuitBreaker {
+    threshold: u32,
+    cooldown: Duration,
+    state: Mutex<BreakerState>,
+}
+
+#[derive(Debug, Default)]
+struct BreakerState {
+    consecutive_failures: u32,
+    opened_at: Option<Instant>,
+    /// A half-open probe is already in flight; everyone else keeps skipping.
+    probing: bool,
+}
+
+impl CircuitBreaker {
+    fn new(threshold: u32, cooldown: Duration) -> Self {
+        Self {
+            threshold,
+            cooldown,
+            state: Mutex::new(BreakerState::default()),
+        }
+    }
+
+    fn disabled(&self) -> bool {
+        self.threshold == 0
+    }
+
+    /// Whether to send. Claims the single half-open probe as a side effect, so
+    /// a recovering provider gets one request rather than the whole backlog.
+    fn allow(&self) -> bool {
+        if self.disabled() {
+            return true;
+        }
+        let mut state = self.state.lock().expect("circuit breaker poisoned");
+        let Some(opened_at) = state.opened_at else {
+            return true;
+        };
+        if opened_at.elapsed() < self.cooldown || state.probing {
+            return false;
+        }
+        state.probing = true;
+        true
+    }
+
+    fn record_success(&self) {
+        let mut state = self.state.lock().expect("circuit breaker poisoned");
+        *state = BreakerState::default();
+    }
+
+    fn record_failure(&self) {
+        if self.disabled() {
+            return;
+        }
+        let mut state = self.state.lock().expect("circuit breaker poisoned");
+        state.probing = false;
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= self.threshold {
+            // A failed probe restarts the cooldown rather than retrying at once.
+            state.opened_at = Some(Instant::now());
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        if self.disabled() {
+            return "disabled";
+        }
+        let state = self.state.lock().expect("circuit breaker poisoned");
+        match state.opened_at {
+            None => "closed",
+            Some(opened_at) if opened_at.elapsed() >= self.cooldown => "half_open",
+            Some(_) => "open",
+        }
+    }
+
+    fn consecutive_failures(&self) -> u32 {
+        self.state
+            .lock()
+            .expect("circuit breaker poisoned")
+            .consecutive_failures
+    }
 }
 
 #[derive(Default)]
@@ -791,6 +1085,17 @@ impl UpstreamFailure {
             message: format!("failed to decode upstream JSON response: {error}"),
             upstream_status: Some(status),
         }
+    }
+
+    /// Whether this failure proves the request produced no output, so sending
+    /// it to another provider cannot duplicate generation that already ran.
+    /// Body and decode failures are deliberately excluded: those mean the
+    /// upstream did generate, and a second call would bill for it twice.
+    fn is_failover_safe(&self) -> bool {
+        matches!(
+            self.kind,
+            UpstreamErrorKind::Connect | UpstreamErrorKind::Timeout | UpstreamErrorKind::Request
+        ) || self.upstream_status.is_some_and(is_failover_status)
     }
 
     fn is_retryable(&self) -> bool {
@@ -1314,12 +1619,17 @@ fn build_provider_state(name: String, upstream: UpstreamConfig) -> Result<Provid
         .tcp_nodelay(true)
         .build()
         .with_context(|| format!("failed to build HTTP client for provider {name}"))?;
+    let breaker = Arc::new(CircuitBreaker::new(
+        upstream.circuit_breaker_threshold,
+        Duration::from_secs(upstream.circuit_breaker_cooldown_secs),
+    ));
     Ok(ProviderState {
         name,
         config: Arc::new(upstream),
         client,
         model_cache: Arc::new(ModelCache::default()),
         model_refresh: Arc::new(AsyncMutex::new(())),
+        breaker,
     })
 }
 
@@ -1961,6 +2271,8 @@ const CONFIG_KEYS: &[&str] = &[
     "responses",
     "models",
     "admin",
+    "routing_rules",
+    "pricing",
 ];
 const PROVIDER_KEYS: &[&str] = &[
     "kind",
@@ -1974,6 +2286,9 @@ const PROVIDER_KEYS: &[&str] = &[
     "connect_timeout_secs",
     "pool_max_idle_per_host",
     "pool_idle_timeout_secs",
+    "fallback",
+    "circuit_breaker_threshold",
+    "circuit_breaker_cooldown_secs",
 ];
 const INTERCEPTOR_KEYS: &[&str] = &[
     "enabled",
@@ -2000,6 +2315,17 @@ const CHAT_KEYS: &[&str] = &["disable_thinking"];
 const RESPONSES_KEYS: &[&str] = &["mode"];
 const MODELS_KEYS: &[&str] = &["expose_aliases", "expose_upstream", "cache_ttl_secs"];
 const ADMIN_KEYS: &[&str] = &["enable", "enabled", "listen_address", "ui_dir"];
+const ROUTING_RULE_KEYS: &[&str] = &[
+    "name",
+    "min_input_tokens",
+    "max_input_tokens",
+    "has_tools",
+    "contains_any",
+    "requested_model",
+    "route",
+];
+const PRICING_KEYS: &[&str] = &["baseline_model", "models"];
+const MODEL_PRICE_KEYS: &[&str] = &["input_per_mtok", "output_per_mtok"];
 
 /// Collect dotted paths of config keys no struct claims, and log each one.
 /// Free-form tables (`role_map`, provider `headers`) are never descended into
@@ -2056,6 +2382,37 @@ fn warn_on_unknown_config_keys(document: &toml::Table, source: &str, found: &mut
                     MODEL_ALIAS_KEYS,
                     found,
                 );
+            }
+        }
+    }
+    // `[[routing_rules]]` is an array of tables, not a table.
+    if let Some(rules) = document
+        .get("routing_rules")
+        .and_then(toml::Value::as_array)
+    {
+        for (index, item) in rules.iter().enumerate() {
+            if let Some(rule) = item.as_table() {
+                check(
+                    rule,
+                    &format!("routing_rules[{index}]"),
+                    ROUTING_RULE_KEYS,
+                    found,
+                );
+            }
+        }
+    }
+    if let Some(pricing) = table(document, "pricing") {
+        check(pricing, "pricing", PRICING_KEYS, found);
+        if let Some(models) = table(pricing, "models") {
+            for (name, item) in models {
+                if let Some(price) = item.as_table() {
+                    check(
+                        price,
+                        &format!("pricing.models.{name}"),
+                        MODEL_PRICE_KEYS,
+                        found,
+                    );
+                }
             }
         }
     }
@@ -2513,7 +2870,8 @@ async fn completions_impl(
             started,
             model_started,
             estimated_input_tokens,
-        ),
+        )
+        .with_pricing(request_pricing(&state.config, &provider.name, &model)),
         response,
     )
 }
@@ -2569,7 +2927,8 @@ async fn embeddings_impl(
             model_started,
             estimated_input_tokens,
         )
-        .without_output_estimation(),
+        .without_output_estimation()
+        .with_pricing(request_pricing(&state.config, &provider.name, &model)),
         response,
     )
 }
@@ -2652,23 +3011,31 @@ async fn chat_completions_impl(
     let estimated_input_tokens = estimate_tokens(&body) as u64;
     log_request_value(class, &provider.name, &body);
     let model_started = Instant::now();
-    let response = if state.launcher_kind == Some(LauncherKind::Copilot)
+    let (response, served) = if state.launcher_kind == Some(LauncherKind::Copilot)
         && state.config.model_routing == ModelRoutingMode::Passthrough
     {
-        proxy_json(&provider, &provider_headers, "chat/completions", &body).await
+        (
+            proxy_json(&provider, &provider_headers, "chat/completions", &body).await,
+            ServedBy::routed(&provider, &model),
+        )
     } else {
-        proxy_chat(&provider, &provider_headers, &body).await
+        proxy_chat_failover(&state, &provider, &headers, &body, ChatWire::Chat, None).await
     };
     track_response(
         ResponseTracking::new(
-            class,
-            &provider.name,
-            &model,
+            served.class,
+            &served.provider,
+            &served.model,
             "chat_completions",
             started,
             model_started,
             estimated_input_tokens,
-        ),
+        )
+        .with_pricing(request_pricing(
+            &state.config,
+            &served.provider,
+            &served.model,
+        )),
         response,
     )
 }
@@ -2762,39 +3129,42 @@ async fn responses_impl(
     log_request_value(class, &provider.name, &rewritten);
 
     let model_started = Instant::now();
-    let response = if passthrough {
-        proxy_json(&provider, &provider_headers, "responses", &rewritten).await
+    let (response, served) = if passthrough {
+        (
+            proxy_json(&provider, &provider_headers, "responses", &rewritten).await,
+            ServedBy::routed(&provider, &model),
+        )
     } else {
         let mut chat_request = responses_to_chat_request(&rewritten);
         normalize_chat_completion_request(&mut chat_request, &state.config);
-        if chat_request
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+        if request_is_streaming(&chat_request) {
             ensure_chat_stream_include_usage(&mut chat_request);
-            proxy_responses_stream_via_chat(
-                &provider,
-                &provider_headers,
-                &chat_request,
-                client_model,
-            )
-            .await
-        } else {
-            proxy_responses_once_via_chat(&provider, &provider_headers, &chat_request, client_model)
-                .await
         }
+        proxy_chat_failover(
+            &state,
+            &provider,
+            &headers,
+            &chat_request,
+            ChatWire::Responses,
+            client_model,
+        )
+        .await
     };
     track_response(
         ResponseTracking::new(
-            class,
-            &provider.name,
-            &model,
+            served.class,
+            &served.provider,
+            &served.model,
             "responses",
             started,
             model_started,
             estimated_input_tokens,
-        ),
+        )
+        .with_pricing(request_pricing(
+            &state.config,
+            &served.provider,
+            &served.model,
+        )),
         response,
     )
 }
@@ -2905,7 +3275,8 @@ async fn anthropic_messages_impl(
                 started,
                 model_started,
                 estimated_input_tokens,
-            ),
+            )
+            .with_pricing(request_pricing(&state.config, &provider.name, &model)),
             response,
         );
     }
@@ -2913,28 +3284,33 @@ async fn anthropic_messages_impl(
     normalize_chat_completion_request(&mut chat_request, &state.config);
 
     let model_started = Instant::now();
-    let response = if chat_request
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    if request_is_streaming(&chat_request) {
         ensure_chat_stream_include_usage(&mut chat_request);
-        proxy_anthropic_stream_via_chat(&provider, &provider_headers, &chat_request, client_model)
-            .await
-    } else {
-        proxy_anthropic_once_via_chat(&provider, &provider_headers, &chat_request, client_model)
-            .await
-    };
+    }
+    let (response, served) = proxy_chat_failover(
+        &state,
+        &provider,
+        &headers,
+        &chat_request,
+        ChatWire::Anthropic,
+        client_model,
+    )
+    .await;
     track_response(
         ResponseTracking::new(
-            class,
-            &provider.name,
-            &model,
+            served.class,
+            &served.provider,
+            &served.model,
             "anthropic_messages",
             started,
             model_started,
             estimated_input_tokens,
-        ),
+        )
+        .with_pricing(request_pricing(
+            &state.config,
+            &served.provider,
+            &served.model,
+        )),
         response,
     )
 }
@@ -3976,6 +4352,240 @@ async fn proxy_chat(
     }
 }
 
+/// One destination in a request's failover chain.
+struct FailoverHop<'a> {
+    provider: &'a ProviderState,
+    /// Model to use on this hop; `None` keeps the request's own model.
+    model: Option<&'a str>,
+}
+
+/// Which provider and model actually served a request. Failover means the
+/// routed destination and the serving destination can differ, and statistics
+/// must record what happened rather than what was intended.
+pub(crate) struct ServedBy {
+    provider: String,
+    model: String,
+    class: RouteClass,
+}
+
+impl ServedBy {
+    /// The routed destination, for paths that never fail over: native
+    /// passthrough wires are bound to the provider that owns them.
+    fn routed(provider: &ProviderState, model: &str) -> Self {
+        Self {
+            provider: provider.name.clone(),
+            model: model.to_string(),
+            class: route_class_for_base_url(&provider.config.base_url),
+        }
+    }
+}
+
+/// The routed provider first, then its configured fallbacks. Fallbacks are
+/// deliberately not followed recursively: one level keeps the worst-case
+/// latency of a request bounded and makes a misconfigured cycle impossible.
+fn failover_chain<'a>(state: &'a AppState, routed: &'a ProviderState) -> Vec<FailoverHop<'a>> {
+    let mut hops = vec![FailoverHop {
+        provider: routed,
+        model: None,
+    }];
+    let mut seen = HashSet::from([routed.name.as_str()]);
+    for entry in &routed.config.fallback {
+        let (name, model) = match entry.split_once('/') {
+            Some((name, model)) => (name, Some(model)),
+            None => (entry.as_str(), None),
+        };
+        if !seen.insert(name) {
+            continue;
+        }
+        if let Some(provider) = state.providers.get(name) {
+            hops.push(FailoverHop { provider, model });
+        }
+    }
+    hops
+}
+
+/// How a successful upstream chat result is rendered back to the caller. All
+/// three client protocols share one upstream pipeline, so they can share one
+/// failover driver too.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatWire {
+    Chat,
+    Responses,
+    Anthropic,
+}
+
+impl ChatWire {
+    fn render_json(self, upstream: Value, client_model: Option<String>) -> Response {
+        match self {
+            Self::Chat => Json(upstream).into_response(),
+            Self::Responses => {
+                Json(chat_completion_to_response(upstream, client_model)).into_response()
+            }
+            Self::Anthropic => {
+                Json(chat_completion_to_anthropic_message(upstream, client_model)).into_response()
+            }
+        }
+    }
+
+    async fn render_stream(
+        self,
+        response: reqwest::Response,
+        meta: UpstreamRequestMeta,
+        client_model: Option<String>,
+    ) -> Response {
+        match self {
+            Self::Chat => relay_response(&meta, response).await,
+            Self::Responses => {
+                stream_chat_as_responses(response, client_model, Some(meta)).into_response()
+            }
+            Self::Anthropic => {
+                stream_chat_as_anthropic(response, client_model, Some(meta)).into_response()
+            }
+        }
+    }
+}
+
+fn is_failover_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+/// Send one chat request to one provider. When another hop is still available,
+/// a failover-worthy streaming status becomes an error instead of being
+/// relayed, because nothing has reached the caller yet and that is exactly the
+/// window in which switching providers is still safe. With no hop left the
+/// original relay behavior is preserved so the caller still sees the upstream's
+/// own error.
+async fn attempt_chat(
+    provider: &ProviderState,
+    provider_headers: &HeaderMap,
+    chat_request: &Value,
+    wire: ChatWire,
+    client_model: Option<String>,
+    can_failover: bool,
+) -> std::result::Result<Response, UpstreamFailure> {
+    if !request_is_streaming(chat_request) {
+        let upstream = upstream_chat_json(provider, provider_headers, chat_request).await?;
+        return Ok(wire.render_json(upstream, client_model));
+    }
+
+    let (response, meta) = upstream_chat_stream(provider, provider_headers, chat_request).await?;
+    let status = response.status();
+    if !status.is_success() {
+        if can_failover && is_failover_status(status) {
+            let bytes = response.bytes().await.unwrap_or_default();
+            return Err(UpstreamFailure::status_with_body(&meta, status, &bytes));
+        }
+        return Ok(relay_response(&meta, response).await);
+    }
+    Ok(wire.render_stream(response, meta, client_model).await)
+}
+
+/// Run a chat request through its failover chain. Returns the response and the
+/// destination that produced it.
+async fn proxy_chat_failover(
+    state: &AppState,
+    routed: &ProviderState,
+    incoming_headers: &HeaderMap,
+    chat_request: &Value,
+    wire: ChatWire,
+    client_model: Option<String>,
+) -> (Response, ServedBy) {
+    let hops = failover_chain(state, routed);
+    let last_index = hops.len().saturating_sub(1);
+    let mut exhausted: Option<UpstreamFailure> = None;
+
+    for (index, hop) in hops.iter().enumerate() {
+        let provider = hop.provider;
+        if !provider.breaker.allow() {
+            proxy_stats().record_breaker_skip();
+            warn!(
+                provider = %provider.name,
+                consecutive_failures = provider.breaker.consecutive_failures(),
+                "skipping provider with an open circuit breaker"
+            );
+            continue;
+        }
+
+        let mut request = chat_request.clone();
+        if index > 0 {
+            // A different provider must not receive another provider's signed
+            // reasoning artifacts, and may not recognize the original model.
+            sanitize_cross_provider_chat_request(&mut request);
+            if let Some(model) = hop.model
+                && let Some(object) = request.as_object_mut()
+            {
+                object.insert("model".to_string(), Value::String(model.to_string()));
+            }
+            normalize_chat_completion_request(&mut request, &state.config);
+        }
+        let served = ServedBy {
+            provider: provider.name.clone(),
+            model: request_model(&request).to_string(),
+            class: route_class_for_base_url(&provider.config.base_url),
+        };
+        let provider_headers = provider_request_headers(state, incoming_headers, provider);
+
+        match attempt_chat(
+            provider,
+            &provider_headers,
+            &request,
+            wire,
+            client_model.clone(),
+            index < last_index,
+        )
+        .await
+        {
+            Ok(response) => {
+                provider.breaker.record_success();
+                if index > 0 {
+                    proxy_stats().record_failover();
+                    info!(
+                        routed_provider = %routed.name,
+                        served_provider = %provider.name,
+                        served_model = %served.model,
+                        hop = index,
+                        "failed over to a fallback provider"
+                    );
+                }
+                return (response, served);
+            }
+            Err(error) => {
+                provider.breaker.record_failure();
+                let can_continue = error.is_failover_safe() && index < last_index;
+                log_upstream_failure(&error, if can_continue { "failover" } else { "send" });
+                if !can_continue {
+                    return (upstream_error_response(&error), served);
+                }
+                exhausted = Some(error);
+            }
+        }
+    }
+
+    // Every hop either failed a safe failure or was skipped by its breaker.
+    let served = ServedBy {
+        provider: routed.name.clone(),
+        model: request_model(chat_request).to_string(),
+        class: route_class_for_base_url(&routed.config.base_url),
+    };
+    match exhausted {
+        Some(error) => (upstream_error_response(&error), served),
+        None => (
+            internal_error_response(format!(
+                "every provider for {} has an open circuit breaker",
+                routed.name
+            )),
+            served,
+        ),
+    }
+}
+
 async fn proxy_json(
     provider: &ProviderState,
     incoming_headers: &HeaderMap,
@@ -4170,7 +4780,8 @@ pub(crate) async fn proxy_integrated_chat(
             started,
             model_started,
             estimated_input_tokens,
-        ),
+        )
+        .with_pricing(request_pricing(config, &provider.name, target_model)),
         response,
     )
 }
@@ -4267,6 +4878,10 @@ impl AppState {
         external_config.api_key_env = None;
         external_config.headers.clear();
         external_config.reasoning_effort = None;
+        // The agent's own upstream is the only valid destination for a native
+        // session, so it inherits neither fallbacks nor a breaker.
+        external_config.fallback.clear();
+        external_config.circuit_breaker_threshold = 0;
         external_config.kind = match session.kind() {
             LauncherKind::Codex => ProviderKind::OpenAi,
             LauncherKind::Claude => ProviderKind::Anthropic,
@@ -4282,6 +4897,7 @@ impl AppState {
                 client: template_provider.client.clone(),
                 model_cache: Arc::new(ModelCache::default()),
                 model_refresh: Arc::new(AsyncMutex::new(())),
+                breaker: Arc::new(CircuitBreaker::new(0, Duration::from_secs(0))),
             },
         );
 
@@ -4296,6 +4912,14 @@ impl AppState {
 }
 
 impl ProviderState {
+    pub(crate) fn breaker_status(&self) -> &'static str {
+        self.breaker.status()
+    }
+
+    pub(crate) fn breaker_failures(&self) -> u32 {
+        self.breaker.consecutive_failures()
+    }
+
     fn upstream_url(&self, upstream_path: &str) -> String {
         format!(
             "{}/{}",
@@ -7027,6 +7651,70 @@ fn validate_config(config: &Config) -> Result<()> {
         if route.model().trim().is_empty() {
             bail!("model alias {alias:?} has an empty upstream model");
         }
+    }
+    for (name, provider) in &providers {
+        for entry in &provider.fallback {
+            let target = entry
+                .split_once('/')
+                .map_or(entry.as_str(), |(name, _)| name);
+            if target == name {
+                bail!("provider {name:?} lists itself as its own fallback");
+            }
+            if !providers.contains_key(target) {
+                bail!(
+                    "provider {name:?} fallback {entry:?} references unknown provider {target:?}"
+                );
+            }
+        }
+        if provider.circuit_breaker_threshold > 0 && provider.circuit_breaker_cooldown_secs == 0 {
+            bail!(
+                "provider {name:?} circuit_breaker_cooldown_secs must be greater than zero when the breaker is enabled"
+            );
+        }
+    }
+    for (index, rule) in config.routing_rules.iter().enumerate() {
+        let label = if rule.name.is_empty() {
+            format!("routing_rules[{index}]")
+        } else {
+            format!("routing rule {:?}", rule.name)
+        };
+        if rule.name.trim().is_empty() {
+            bail!("{label} must have a name; the decision audit reports routes by rule name");
+        }
+        if let (Some(min), Some(max)) = (rule.min_input_tokens, rule.max_input_tokens)
+            && min > max
+        {
+            bail!("{label} has min_input_tokens greater than max_input_tokens");
+        }
+        if rule.route.eq_ignore_ascii_case(ROUTING_RULE_PASS) {
+            continue;
+        }
+        if config.integrated.targets.contains_key(&rule.route) {
+            continue;
+        }
+        match rule.route.split_once('/') {
+            Some((provider, model)) if !model.trim().is_empty() => {
+                if !providers.contains_key(provider) {
+                    bail!("{label} routes to unknown provider {provider:?}");
+                }
+            }
+            _ => bail!(
+                "{label} route {:?} must be {ROUTING_RULE_PASS:?}, an [integrated.targets.*] name, or provider/model",
+                rule.route
+            ),
+        }
+    }
+    for (model, price) in &config.pricing.models {
+        if price.input_per_mtok < 0.0 || price.output_per_mtok < 0.0 {
+            bail!("pricing for {model:?} cannot be negative");
+        }
+    }
+    if let Some(baseline) = &config.pricing.baseline_model
+        && config.pricing.baseline().is_zero()
+    {
+        bail!(
+            "pricing.baseline_model {baseline:?} has no entry in [pricing.models]; a baseline with no rate cannot answer what traffic would have cost"
+        );
     }
     let mut routing_interceptor = config.interceptor.clone();
     routing_interceptor.enabled = config.routing_mode != RoutingMode::Proxy;

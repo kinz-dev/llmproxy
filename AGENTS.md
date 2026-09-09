@@ -93,6 +93,46 @@ Without a launcher, preserve these rules:
 - Provider `kind` selects OpenAI-compatible, OpenAI, Anthropic, or Copilot
   upstream adaptation. OpenAI Chat Completions remains the canonical format.
 
+## Failover And Rules
+
+- A provider's `fallback` list names the providers to try when it is
+  unavailable. Entries are a provider name or `provider/model`. Chains are one
+  level deep and deduplicated; fallbacks are never followed recursively.
+- Failover is allowed only for availability failures (connect, timeout, 408,
+  429, 502, 503, 504) and only while no bytes have reached the caller. Body and
+  decode failures and 5xx other than the listed gateway codes are never failed
+  over, because the upstream may already have generated and billed.
+- Hops after the first strip cross-provider artifacts and re-normalize the
+  request. Every hop recomputes provider credentials; a fallback never inherits
+  the previous provider's headers.
+- Statistics and pricing record the provider and model that actually served,
+  not the one originally routed to.
+- Each provider has a circuit breaker. After
+  `circuit_breaker_threshold` consecutive failures it opens, is skipped for
+  `circuit_breaker_cooldown_secs`, then admits exactly one probe. A failed
+  probe restarts the cooldown. Threshold 0 disables it. Native launcher
+  external providers carry no fallbacks and no breaker.
+- Integrated redirects do not fail over: the destination is an audited triage
+  decision, and silently serving it elsewhere would make that audit false.
+- `[[routing_rules]]` are evaluated in order before any triage request, and the
+  first match wins. Conditions left unset are not constraints, so a rule with
+  only a `route` is a catch-all. `route` is `PASS`, an `[integrated.targets.*]`
+  name, or `provider/model`; unknown routes fail validation.
+- Rules never run before sensitive screening. When `reject_sensitive` is on,
+  the prompt is classified before anything decides where it goes.
+- A rule match is recorded in the decision audit under its rule name, with no
+  triage provider or latency, so a deterministic route is distinguishable from
+  a model-chosen one.
+
+## Cost
+
+- `[pricing.models]` holds USD per million tokens, keyed by `model` or
+  `provider/model`; the namespaced key wins. `pricing.baseline_model` must
+  itself be priced.
+- A model with no rate is counted as unpriced, never as free, so a partial
+  price table cannot understate spend. Triage requests are priced like any
+  other call because intercept mode really does add one per screened request.
+
 ## Upstream And Streaming
 
 - Extend the shared request pipeline in `src/main.rs`; do not create parallel
@@ -179,7 +219,8 @@ Without a launcher, preserve these rules:
 - `src/*_launcher.rs`: agent-specific discovery and environment injection.
 - `src/admin.rs`: loopback admin API, UI serving, and runtime config swaps.
 - `src/stats.rs`: request classification, latency, attempted frontend/provider/
-  model routes, completed token and cumulative-time usage, traffic logs, and
+  model routes, completed token and cumulative-time usage, per-model cost
+  against configured rates, failover/breaker counters, traffic logs, and
   bounded routing decision audits.
 - `ui/`: task-oriented admin interface organized as Overview, Activity,
   Routing, Models, Providers, and Settings; Activity and Routing use focused

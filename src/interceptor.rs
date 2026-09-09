@@ -136,6 +136,71 @@ impl Default for IntegratedConfig {
     }
 }
 
+/// What a matching routing rule decided.
+pub(crate) enum RuleOutcome {
+    /// Normal provider routing, with no triage request at all.
+    Pass,
+    /// A concrete destination, named for the audit.
+    Route(String, IntegratedTarget),
+}
+
+/// The first rule whose conditions all hold, if any. Rules are ordered, and
+/// the first match wins, so a specific rule belongs above a general one.
+pub(crate) fn match_routing_rule(
+    state: &AppState,
+    chat_request: &Value,
+    client_model: Option<&str>,
+) -> Option<(String, RuleOutcome)> {
+    let estimated_tokens = crate::estimate_tokens(chat_request) as u64;
+    let has_tools = chat_request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    let text = rule_match_text(chat_request);
+
+    for rule in &state.config.routing_rules {
+        if !rule.matches(estimated_tokens, has_tools, &text, client_model) {
+            continue;
+        }
+        let outcome = if rule.route.eq_ignore_ascii_case(crate::ROUTING_RULE_PASS) {
+            RuleOutcome::Pass
+        } else if let Some(target) = state.config.integrated.targets.get(&rule.route) {
+            RuleOutcome::Route(rule.route.clone(), target.clone())
+        } else if let Some((provider, model)) = rule.route.split_once('/') {
+            RuleOutcome::Route(
+                rule.route.clone(),
+                IntegratedTarget {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    hint: format!("routing rule {:?}", rule.name),
+                    reasoning_effort: None,
+                },
+            )
+        } else {
+            // validate_config rejects unknown routes, so this only happens if
+            // config changed underneath us. Fall through to triage.
+            continue;
+        };
+        return Some((rule.name.clone(), outcome));
+    }
+    None
+}
+
+/// The user-authored text a rule matches against: the last user turn, which is
+/// the request the agent is actually making. Earlier turns are context.
+fn rule_match_text(chat_request: &Value) -> String {
+    chat_request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .map(|message| crate::text_from_value(message.get("content").unwrap_or(&Value::Null)))
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
 fn integrated_routing_requested(config: &IntegratedConfig, client_model: Option<&str>) -> bool {
     config.enabled && client_model == Some(INTEGRATED_AUTO_MODEL)
 }
@@ -718,6 +783,60 @@ pub(crate) async fn maybe_intercept(
         .await;
     }
 
+    // Deterministic rules run before any triage request. Screening is the one
+    // thing they must never skip: when reject_sensitive is on, the prompt has
+    // to be classified before anything decides where it goes.
+    if !config.reject_sensitive
+        && let Some((rule_name, outcome)) =
+            match_routing_rule(state, &local_chat_request, client_model.as_deref())
+    {
+        proxy_stats().record_rule_match();
+        match outcome {
+            RuleOutcome::Pass => {
+                info!(
+                    request_id,
+                    protocol = protocol.as_str(),
+                    rule = rule_name,
+                    route = "normal_provider",
+                    "routing rule passed the request through without triage"
+                );
+                proxy_stats().record_intercept_pass();
+                audit.set_decision(
+                    "rule",
+                    format!("Routing rule {rule_name:?} selected normal provider routing."),
+                );
+                return InterceptionOutcome::Continue(Box::new(audit));
+            }
+            RuleOutcome::Route(target_name, target) => {
+                info!(
+                    request_id,
+                    protocol = protocol.as_str(),
+                    rule = rule_name,
+                    target = target_name,
+                    provider = target.provider,
+                    model = target.model,
+                    route = "rule_redirect",
+                    "routing rule selected a destination without triage"
+                );
+                audit.set_decision(
+                    "rule",
+                    format!("Routing rule {rule_name:?} selected {target_name}."),
+                );
+                audit.set_target(&target_name, &target);
+                return execute_target_redirect(
+                    state,
+                    &target_name,
+                    &target,
+                    local_chat_request,
+                    ClientResponseContext::new(protocol, client_model, client_streaming),
+                    conversation_key,
+                    audit,
+                )
+                .await;
+            }
+        }
+    }
+
     let redirect_request = local_chat_request.clone();
 
     let local_request = match build_local_request(
@@ -854,7 +973,15 @@ pub(crate) async fn maybe_intercept(
         crate::estimate_tokens(&completion) as u64,
     );
     audit.set_triage(provider, &config.model, local_elapsed);
-    proxy_stats().record_model_usage(&provider.name, &config.model, local_elapsed, local_usage);
+    // Triage is a real billable call, not overhead that disappears from the
+    // ledger: intercept mode adds one of these to every request it screens.
+    proxy_stats().record_model_usage(
+        &provider.name,
+        &config.model,
+        local_elapsed,
+        local_usage,
+        crate::request_pricing(&state.config, &provider.name, &config.model),
+    );
     if !config.reject_sensitive {
         log_response_value(triage_class, &provider.name, &completion);
     }
@@ -1042,7 +1169,7 @@ async fn execute_integrated_redirect(
     chat_request: Value,
     client: ClientResponseContext,
     conversation_key: Option<u64>,
-    mut audit: RoutingAuditDraft,
+    audit: RoutingAuditDraft,
 ) -> InterceptionOutcome {
     let target = state
         .config
@@ -1050,6 +1177,30 @@ async fn execute_integrated_redirect(
         .targets
         .get(target_name)
         .expect("validated integrated target missing");
+    execute_target_redirect(
+        state,
+        target_name,
+        target,
+        chat_request,
+        client,
+        conversation_key,
+        audit,
+    )
+    .await
+}
+
+/// Send a request to one concrete destination. Integrated targets come from
+/// config; routing rules can also synthesize a `provider/model` destination
+/// that was never declared as a target.
+async fn execute_target_redirect(
+    state: &AppState,
+    target_name: &str,
+    target: &IntegratedTarget,
+    chat_request: Value,
+    client: ClientResponseContext,
+    conversation_key: Option<u64>,
+    mut audit: RoutingAuditDraft,
+) -> InterceptionOutcome {
     let provider: &ProviderState = state
         .providers
         .get(&target.provider)

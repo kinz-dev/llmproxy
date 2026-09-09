@@ -23,6 +23,18 @@ timeout_secs = 600
 connect_timeout_secs = 10
 pool_max_idle_per_host = 64
 pool_idle_timeout_secs = 90
+# Providers to try when this one is unavailable, in order. Each entry is a
+# provider name, or provider/model to switch model as well. Fallbacks are not
+# followed recursively, so one hop cannot cascade into a chain of timeouts.
+# Failover only happens for availability failures (connect, timeout, 408, 429,
+# 502, 503, 504) and only before any bytes reach the caller, so a request that
+# may already have been generated is never silently sent twice.
+# fallback = ["triage/local-fast"]
+# Consecutive availability failures that stop this provider from being tried at
+# all, and how long it stays skipped before one probe is allowed through.
+# Set the threshold to 0 to disable the breaker.
+circuit_breaker_threshold = 5
+circuit_breaker_cooldown_secs = 30
 
 # Optional agent interceptor. The triage provider receives a dynamic
 # Chat Completions copy of /chat/completions, /responses, or /messages requests.
@@ -137,6 +149,52 @@ hint = "routine deterministic execution when confidence is greater than 80%"
 # the first id returned by the default upstream /v1/models. Inline route tables
 # select both a named provider and its upstream model. Any configured provider
 # can also be selected dynamically as provider/model without declaring an alias.
+# Deterministic routes, evaluated in order before any triage request. The
+# first rule whose conditions all hold wins, and a rule with no conditions
+# matches everything, so a catch-all belongs last. Rules exist because triage
+# costs a full extra model round-trip on requests whose destination was never
+# in question; a matched rule skips it entirely and is recorded in the decision
+# audit under its name. Sensitive screening is never skipped: when
+# interceptor.reject_sensitive is on, rules are not consulted until the prompt
+# has been classified.
+#
+# route is "PASS" for normal provider routing, an [integrated.targets.*] name,
+# or provider/model.
+#
+# [[routing_rules]]
+# name = "small no-tool work stays on the default provider"
+# max_input_tokens = 800
+# has_tools = false
+# route = "PASS"
+#
+# [[routing_rules]]
+# name = "long context needs the big model"
+# min_input_tokens = 40000
+# route = "DETERMINISTIC"
+#
+# [[routing_rules]]
+# name = "explanations"
+# contains_any = ["explain", "why does"]
+# requested_model = "Auto"
+# route = "triage/local-fast"
+
+# Optional per-model rates in USD per one million tokens. Keys are "model" or
+# "provider/model"; the namespaced key wins, because the same model served by
+# two providers rarely costs the same. Models with no entry are reported as
+# unpriced rather than counted as free. baseline_model answers "what would this
+# traffic have cost otherwise", which is the number local routing exists to
+# move.
+# [pricing]
+# baseline_model = "openai/gpt-4o"
+#
+# [pricing.models."openai/gpt-4o"]
+# input_per_mtok = 2.50
+# output_per_mtok = 10.00
+#
+# [pricing.models."local-fast"]
+# input_per_mtok = 0.0
+# output_per_mtok = 0.0
+
 [model_aliases]
 # codex-qwen = "Qwen/Qwen2.5-Coder-32B-Instruct"
 # claude-sonnet = "Qwen/Qwen2.5-Coder-32B-Instruct"

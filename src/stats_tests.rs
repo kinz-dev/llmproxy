@@ -209,6 +209,7 @@ fn stats_counters_and_snapshot_shape() {
         "triage-model",
         Duration::from_millis(100),
         local_usage,
+        RequestPricing::default(),
     );
     stats.record_intercept_local(
         RouteClass::Local,
@@ -235,6 +236,7 @@ fn stats_counters_and_snapshot_shape() {
             output_tokens: 30,
             estimated: false,
         },
+        RequestPricing::default(),
     );
     stats.record_routing_destination("responses", "openai", "gpt-test", false);
     stats.record_routing_destination("responses", "openai", "gpt-test", true);

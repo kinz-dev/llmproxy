@@ -60,6 +60,14 @@ function fmtCount(n) {
   return fmtInt.format(n);
 }
 
+// Sub-cent spend still matters when a run is thousands of small calls, so
+// small totals keep more precision instead of rounding away to $0.00.
+function fmtUsd(value) {
+  const amount = Number(value) || 0;
+  if (amount > 0 && amount < 0.01) return "<$0.01";
+  return `$${amount.toFixed(amount < 100 ? 2 : 0)}`;
+}
+
 function fmtMs(ms) {
   if (ms === null || ms === undefined) return "—";
   if (ms >= 10_000) return (ms / 1000).toFixed(1) + " s";
@@ -283,6 +291,8 @@ function renderStats(stats) {
   $("#stat-external").textContent = fmtCount(served.external);
   $("#stat-tokens").textContent = "≈ " + fmtCount(tokens.total);
   $("#stat-tokens-sub").textContent = `prompt ${fmtCount(tokens.prompt)} · completion ${fmtCount(tokens.completion)}`;
+  renderCost(stats.cost);
+  renderResilience(stats.resilience);
   renderRoutingMatrix(served.matrix || {});
   renderProviderCalls(served.providers || {});
   renderRoutingDestinations(served.destinations || []);
@@ -319,6 +329,36 @@ function renderStats(stats) {
   const maxP99 = Math.max(stats.latency.local.p99_ms || 0, stats.latency.external.p99_ms || 0, 1);
   setLatencyRow("#lat-local-bar", "#lat-local-figures", stats.latency.local, maxP99);
   setLatencyRow("#lat-ext-bar", "#lat-ext-figures", stats.latency.external, maxP99);
+}
+
+// Cost and resilience only earn a tile once they have something to say: an
+// unpriced instance should not stare at a permanent $0.00.
+function renderCost(cost) {
+  const tile = $("#stat-cost-tile");
+  if (!cost || (!cost.priced_requests && !cost.spend_usd)) {
+    tile.hidden = true;
+    return;
+  }
+  tile.hidden = false;
+  $("#stat-cost").textContent = fmtUsd(cost.spend_usd);
+  const parts = [];
+  if (cost.saved_usd > 0) parts.push(`${fmtUsd(cost.saved_usd)} saved vs baseline`);
+  if (cost.unpriced_requests) parts.push(`${fmtCount(cost.unpriced_requests)} unpriced`);
+  $("#stat-cost-sub").textContent = parts.join(" · ") || "\u00a0";
+}
+
+function renderResilience(resilience) {
+  const tile = $("#stat-resilience-tile");
+  if (!resilience || (!resilience.failovers && !resilience.breaker_skips && !resilience.rule_matches)) {
+    tile.hidden = true;
+    return;
+  }
+  tile.hidden = false;
+  $("#stat-resilience").textContent = fmtCount(resilience.failovers);
+  const parts = [];
+  if (resilience.breaker_skips) parts.push(`${fmtCount(resilience.breaker_skips)} breaker skips`);
+  if (resilience.rule_matches) parts.push(`${fmtCount(resilience.rule_matches)} by rule`);
+  $("#stat-resilience-sub").textContent = parts.join(" · ") || "\u00a0";
 }
 
 function renderRoutingMatrix(matrix) {
@@ -398,11 +438,14 @@ function renderModelUsage(models) {
   const body = $("#model-usage tbody");
   body.replaceChildren();
   if (!models.length) {
-    body.append(el("tr", {}, [el("td", { colspan: "6", text: "no completed model calls yet" })]));
+    body.append(el("tr", {}, [el("td", { colspan: "7", text: "no completed model calls yet" })]));
     return;
   }
   for (const entry of models) {
     const estimated = entry.estimated_requests ? "≈ " : "";
+    // An unpriced model shows a dash rather than $0.00, which would claim the
+    // calls were free instead of admitting the rate is simply unknown.
+    const cost = entry.priced_requests ? fmtUsd(entry.cost_usd) : "—";
     body.append(
       el("tr", {}, [
         el("td", { class: "mono", text: entry.provider }),
@@ -411,6 +454,7 @@ function renderModelUsage(models) {
         el("td", { class: "mono", text: estimated + fmtCount(entry.input_tokens) }),
         el("td", { class: "mono", text: estimated + fmtCount(entry.output_tokens) }),
         el("td", { class: "mono", text: fmtMs(entry.total_time_ms) }),
+        el("td", { class: "mono", text: cost }),
       ])
     );
   }

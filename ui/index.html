@@ -190,6 +190,16 @@
             <span class="stat-label mono">downstream tokens avoided</span>
             <span class="stat-sub" id="stat-tokens-sub">prompt 0 · completion 0</span>
           </div>
+          <div class="stat" id="stat-cost-tile" hidden>
+            <span class="stat-value mono is-external" id="stat-cost">$0.00</span>
+            <span class="stat-label mono">spend</span>
+            <span class="stat-sub" id="stat-cost-sub">&nbsp;</span>
+          </div>
+          <div class="stat" id="stat-resilience-tile" hidden>
+            <span class="stat-value mono" id="stat-resilience">0</span>
+            <span class="stat-label mono">failovers</span>
+            <span class="stat-sub" id="stat-resilience-sub">&nbsp;</span>
+          </div>
         </div>
       </section>
     </div>
@@ -254,7 +264,7 @@
           <div class="table-scroll bounded-table">
             <table class="data-table" id="model-usage">
               <thead>
-                <tr><th>provider</th><th>model</th><th class="mono">calls</th><th class="mono">input</th><th class="mono">output</th><th class="mono">total time</th></tr>
+                <tr><th>provider</th><th>model</th><th class="mono">calls</th><th class="mono">input</th><th class="mono">output</th><th class="mono">total time</th><th class="mono">cost</th></tr>
               </thead>
               <tbody></tbody>
             </table>

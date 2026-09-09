@@ -38,6 +38,57 @@ sensitive screening rejects likely credentials or personal data before
 routing; proxy mode remains prompt-free. Credentials are stripped from local
 triage and cross-provider routes use proxy-owned credentials.
 
+## Failover
+
+A provider can name the providers to try when it is unavailable:
+
+```toml
+[providers.remote]
+fallback = ["local/qwen3-coder"]
+circuit_breaker_threshold = 5
+circuit_breaker_cooldown_secs = 30
+```
+
+Failover applies to availability failures only (connect, timeout, 408, 429,
+502, 503, 504) and only before any bytes reach the caller, so a request that
+may already have generated is never sent twice. Fallbacks are not followed
+recursively. After enough consecutive failures a provider's breaker opens and
+it stops being tried at all until one probe succeeds again.
+
+## Routing rules
+
+Deterministic routes run before any triage request, so an obvious destination
+costs no extra model round-trip:
+
+```toml
+[[routing_rules]]
+name = "small no-tool work stays local"
+max_input_tokens = 800
+has_tools = false
+route = "PASS"
+```
+
+Rules are ordered and the first match wins; `route` is `PASS`, an
+`[integrated.targets.*]` name, or `provider/model`. Matches appear in the
+decision audit under the rule name. Sensitive screening is never skipped.
+
+## Cost
+
+Per-model rates turn the token counters into spend:
+
+```toml
+[pricing]
+baseline_model = "openai/gpt-4o"
+
+[pricing.models."openai/gpt-4o"]
+input_per_mtok = 2.50
+output_per_mtok = 10.00
+```
+
+Keys are `model` or `provider/model`, the namespaced key winning. Unpriced
+models are reported as unpriced rather than counted as free, and
+`baseline_model` gives the counterfactual local routing is trying to move.
+
 ```sh
 llmproxy             # start or reuse
 llmproxy --restart   # replace

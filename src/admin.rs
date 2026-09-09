@@ -844,10 +844,39 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
                     "class": class_str(&upstream.base_url),
                     "is_default": *name == config.default_provider,
                     "from_upstream_section": from_upstream_section,
+                    "fallback": upstream.fallback,
+                    "circuit_breaker_threshold": upstream.circuit_breaker_threshold,
+                    "circuit_breaker_cooldown_secs": upstream.circuit_breaker_cooldown_secs,
+                    // Live breaker state, so an operator can see which
+                    // providers are currently being skipped and why.
+                    "breaker_status": snapshot
+                        .providers
+                        .get(name)
+                        .map_or("unknown", |provider| provider.breaker_status()),
+                    "breaker_failures": snapshot
+                        .providers
+                        .get(name)
+                        .map_or(0, |provider| provider.breaker_failures()),
                 }),
             )
         })
         .collect::<serde_json::Map<_, _>>();
+
+    let routing_rules = config
+        .routing_rules
+        .iter()
+        .map(|rule| {
+            json!({
+                "name": rule.name(),
+                "route": rule.route(),
+                "min_input_tokens": rule.min_input_tokens(),
+                "max_input_tokens": rule.max_input_tokens(),
+                "has_tools": rule.has_tools(),
+                "contains_any": rule.contains_any(),
+                "requested_model": rule.requested_model(),
+            })
+        })
+        .collect::<Vec<_>>();
 
     let aliases = config
         .model_aliases
@@ -891,6 +920,11 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
         "routing_mode": config.routing_mode.as_str(),
         "providers": providers,
         "model_aliases": aliases,
+        "routing_rules": routing_rules,
+        "pricing": {
+            "baseline_model": config.pricing_baseline_model(),
+            "models": config.pricing_models(),
+        },
         "interceptor": {
             "enabled": config.interceptor.enabled,
             "reject_sensitive": config.interceptor.reject_sensitive,

@@ -163,6 +163,41 @@ struct ModelUsage {
     output_tokens: u64,
     total_time_ms: u64,
     estimated_requests: u64,
+    cost_usd: f64,
+    /// What this traffic would have cost at the configured baseline price.
+    /// Local providers are the reason the proxy exists, so the counterfactual
+    /// is worth as much as the bill itself.
+    baseline_usd: f64,
+    priced_requests: u64,
+}
+
+/// USD per one million tokens, as published by providers. Rates are per model
+/// because a provider's cheap and expensive models differ by orders of
+/// magnitude; a per-provider average would be meaningless.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct ModelPrice {
+    pub(crate) input_per_mtok: f64,
+    pub(crate) output_per_mtok: f64,
+}
+
+impl ModelPrice {
+    pub(crate) fn is_zero(self) -> bool {
+        self.input_per_mtok == 0.0 && self.output_per_mtok == 0.0
+    }
+
+    pub(crate) fn cost_usd(self, usage: TokenUsage) -> f64 {
+        const PER_MTOK: f64 = 1_000_000.0;
+        (usage.input_tokens as f64 / PER_MTOK) * self.input_per_mtok
+            + (usage.output_tokens as f64 / PER_MTOK) * self.output_per_mtok
+    }
+}
+
+/// The prices a single completed request is measured against: what it actually
+/// cost, and what the same tokens would have cost on the baseline model.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RequestPricing {
+    pub(crate) actual: ModelPrice,
+    pub(crate) baseline: ModelPrice,
 }
 
 #[derive(Default)]
@@ -172,8 +207,15 @@ struct RoutingDestination {
 }
 
 impl ModelUsage {
-    fn record(&mut self, elapsed: Duration, usage: TokenUsage) {
+    fn record(&mut self, elapsed: Duration, usage: TokenUsage, pricing: RequestPricing) {
         self.requests = self.requests.saturating_add(1);
+        // A model with no configured price contributes nothing rather than
+        // silently counting as free, so a partial price table stays honest.
+        if !pricing.actual.is_zero() || !pricing.baseline.is_zero() {
+            self.cost_usd += pricing.actual.cost_usd(usage);
+            self.baseline_usd += pricing.baseline.cost_usd(usage);
+            self.priced_requests = self.priced_requests.saturating_add(1);
+        }
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
         self.total_time_ms = self
@@ -197,6 +239,9 @@ pub(crate) struct ProxyStats {
     intercept_local: AtomicU64,
     intercept_reject: AtomicU64,
     intercept_pass: AtomicU64,
+    failovers: AtomicU64,
+    breaker_skips: AtomicU64,
+    rule_matches: AtomicU64,
     intercept_redirect: AtomicU64,
     intercept_fallback: AtomicU64,
     intercept_errors: AtomicU64,
@@ -316,13 +361,14 @@ impl ProxyStats {
         model: &str,
         elapsed: Duration,
         usage: TokenUsage,
+        pricing: RequestPricing,
     ) {
         self.model_usage
             .lock()
             .expect("model usage stats poisoned")
             .entry((provider.to_string(), model.to_string()))
             .or_default()
-            .record(elapsed, usage);
+            .record(elapsed, usage, pricing);
     }
 
     fn record_routing_destination(
@@ -362,6 +408,21 @@ impl ProxyStats {
             ))
             .or_default();
         destination.errors = destination.errors.saturating_add(1);
+    }
+
+    /// A request routed by a deterministic rule, skipping the triage call.
+    pub(crate) fn record_rule_match(&self) {
+        self.rule_matches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A request that a fallback provider rescued.
+    pub(crate) fn record_failover(&self) {
+        self.failovers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A provider skipped because its breaker was open.
+    pub(crate) fn record_breaker_skip(&self) {
+        self.breaker_skips.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_tokens_saved(&self, prompt: u64, completion: u64, estimated: bool) {
@@ -471,9 +532,35 @@ impl ProxyStats {
                     "total_tokens": usage.input_tokens.saturating_add(usage.output_tokens),
                     "total_time_ms": usage.total_time_ms,
                     "estimated_requests": usage.estimated_requests,
+                    "cost_usd": usage.cost_usd,
+                    "baseline_usd": usage.baseline_usd,
+                    "priced_requests": usage.priced_requests,
                 })
             })
             .collect::<Vec<_>>();
+        // Roll the per-model ledger up once: the dashboard wants a single
+        // spend figure, and recomputing it per poll from the JSON would be
+        // both slower and easy to drift from the per-model rows.
+        // `Sum` for f64 uses -0.0 as its identity, so an empty ledger would
+        // otherwise be published as a negative zero. Adding 0.0 normalizes it.
+        let spend_usd = model_usage
+            .iter()
+            .filter_map(|row| row["cost_usd"].as_f64())
+            .sum::<f64>()
+            + 0.0;
+        let baseline_usd = model_usage
+            .iter()
+            .filter_map(|row| row["baseline_usd"].as_f64())
+            .sum::<f64>()
+            + 0.0;
+        let priced_requests = model_usage
+            .iter()
+            .filter_map(|row| row["priced_requests"].as_u64())
+            .sum::<u64>();
+        let total_requests = model_usage
+            .iter()
+            .filter_map(|row| row["requests"].as_u64())
+            .sum::<u64>();
         model_usage.sort_by(|left, right| {
             left["provider"]
                 .as_str()
@@ -550,6 +637,18 @@ impl ProxyStats {
                 "external": latency(&self.latency_external),
             },
             "model_usage": model_usage,
+            "resilience": {
+                "failovers": load(&self.failovers),
+                "breaker_skips": load(&self.breaker_skips),
+                "rule_matches": load(&self.rule_matches),
+            },
+            "cost": {
+                "spend_usd": spend_usd,
+                "baseline_usd": baseline_usd,
+                "saved_usd": (baseline_usd - spend_usd).max(0.0),
+                "priced_requests": priced_requests,
+                "unpriced_requests": total_requests.saturating_sub(priced_requests),
+            },
             "tokens_saved": {
                 "prompt": saved_prompt,
                 "completion": saved_completion,
@@ -630,6 +729,7 @@ pub(crate) struct ResponseTracking<'a> {
     model_started: Instant,
     estimated_input_tokens: u64,
     estimate_output_tokens: bool,
+    pricing: RequestPricing,
 }
 
 impl<'a> ResponseTracking<'a> {
@@ -651,11 +751,17 @@ impl<'a> ResponseTracking<'a> {
             model_started,
             estimated_input_tokens,
             estimate_output_tokens: true,
+            pricing: RequestPricing::default(),
         }
     }
 
     pub(crate) fn without_output_estimation(mut self) -> Self {
         self.estimate_output_tokens = false;
+        self
+    }
+
+    pub(crate) fn with_pricing(mut self, pricing: RequestPricing) -> Self {
+        self.pricing = pricing;
         self
     }
 }
@@ -672,6 +778,7 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
         model_started,
         estimated_input_tokens,
         estimate_output_tokens,
+        pricing,
     } = tracking;
     let provider = provider.to_string();
     let model = model.to_string();
@@ -772,7 +879,13 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
         if success && completed {
             let usage = sniffer.finish(estimated_input_tokens, estimate_output_tokens);
             proxy_stats().record_served(class, &provider, &frontend, request_started.elapsed());
-            proxy_stats().record_model_usage(&provider, &model, model_started.elapsed(), usage);
+            proxy_stats().record_model_usage(
+                &provider,
+                &model,
+                model_started.elapsed(),
+                usage,
+                pricing,
+            );
             if class == RouteClass::Local {
                 proxy_stats().record_tokens_saved(
                     usage.input_tokens,

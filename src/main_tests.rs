@@ -560,6 +560,8 @@ fn test_state_with_config(config: Config) -> AppState {
     let providers = provider_configs
         .into_iter()
         .map(|(name, upstream)| {
+            let upstream_threshold = upstream.circuit_breaker_threshold;
+            let upstream_cooldown = upstream.circuit_breaker_cooldown_secs;
             (
                 name.clone(),
                 ProviderState {
@@ -568,6 +570,10 @@ fn test_state_with_config(config: Config) -> AppState {
                     client: Client::new(),
                     model_cache: Arc::new(ModelCache::default()),
                     model_refresh: Arc::new(AsyncMutex::new(())),
+                    breaker: Arc::new(CircuitBreaker::new(
+                        upstream_threshold,
+                        Duration::from_secs(upstream_cooldown),
+                    )),
                 },
             )
         })
@@ -4134,6 +4140,7 @@ fn model_discovery_timeout_caps_the_generation_timeout() {
         client: Client::new(),
         model_cache: Arc::new(ModelCache::default()),
         model_refresh: Arc::new(AsyncMutex::new(())),
+        breaker: Arc::new(CircuitBreaker::new(0, Duration::from_secs(0))),
     };
     assert_eq!(model_discovery_timeout(&make(2)), Duration::from_secs(2));
     assert_eq!(model_discovery_timeout(&make(600)), Duration::from_secs(15));
@@ -5147,4 +5154,571 @@ async fn collect_sse_events(response: Response) -> Vec<(String, Value)> {
         }
     }
     events
+}
+
+// Tier-1 features: provider failover, deterministic pre-routing, cost.
+
+use interceptor::{RuleOutcome, match_routing_rule};
+use stats::TokenUsage;
+
+#[test]
+fn circuit_breaker_opens_after_threshold_and_admits_one_probe() {
+    let breaker = CircuitBreaker::new(2, Duration::from_millis(80));
+    assert!(breaker.allow());
+    assert_eq!(breaker.status(), "closed");
+
+    breaker.record_failure();
+    assert!(breaker.allow(), "one failure is below the threshold");
+    breaker.record_failure();
+    assert_eq!(breaker.status(), "open");
+    assert!(!breaker.allow(), "an open breaker refuses traffic");
+    assert!(!breaker.allow());
+
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(breaker.status(), "half_open");
+    assert!(breaker.allow(), "one probe is admitted after the cooldown");
+    assert!(
+        !breaker.allow(),
+        "only one probe: the rest keep being skipped"
+    );
+
+    breaker.record_success();
+    assert_eq!(breaker.status(), "closed");
+    assert_eq!(breaker.consecutive_failures(), 0);
+    assert!(breaker.allow());
+}
+
+#[test]
+fn a_failed_probe_restarts_the_cooldown() {
+    let breaker = CircuitBreaker::new(1, Duration::from_millis(60));
+    breaker.record_failure();
+    assert_eq!(breaker.status(), "open");
+    std::thread::sleep(Duration::from_millis(80));
+    assert!(breaker.allow(), "probe admitted");
+    breaker.record_failure();
+    assert_eq!(
+        breaker.status(),
+        "open",
+        "a failed probe reopens rather than retrying immediately"
+    );
+    assert!(!breaker.allow());
+}
+
+#[test]
+fn a_zero_threshold_disables_the_breaker() {
+    let breaker = CircuitBreaker::new(0, Duration::from_secs(1));
+    for _ in 0..50 {
+        breaker.record_failure();
+        assert!(breaker.allow());
+    }
+    assert_eq!(breaker.status(), "disabled");
+}
+
+#[test]
+fn failover_is_only_safe_when_no_output_was_produced() {
+    let meta = UpstreamRequestMeta::new(
+        "p",
+        &HeaderMap::new(),
+        Method::POST,
+        "chat/completions",
+        UpstreamResponseKind::Json,
+        false,
+    );
+    let safe = [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::BAD_GATEWAY,
+        StatusCode::GATEWAY_TIMEOUT,
+        StatusCode::REQUEST_TIMEOUT,
+    ];
+    for status in safe {
+        assert!(
+            UpstreamFailure::status_with_body(&meta, status, b"{}").is_failover_safe(),
+            "{status} should fail over"
+        );
+    }
+    // A 500 can follow partial generation, and a decode failure means the
+    // upstream did generate. Re-sending either would bill for the work twice.
+    assert!(
+        !UpstreamFailure::status_with_body(&meta, StatusCode::INTERNAL_SERVER_ERROR, b"{}")
+            .is_failover_safe()
+    );
+    assert!(
+        !UpstreamFailure::decode(&meta, StatusCode::OK, "bad json").is_failover_safe(),
+        "a decoded-but-broken body means generation already happened"
+    );
+    assert!(UpstreamFailure::timeout(&meta, "no headers").is_failover_safe());
+}
+
+#[test]
+fn failover_chain_follows_one_level_and_ignores_cycles() {
+    let mut config = Config::default();
+    config.upstream.base_url = "http://127.0.0.1:9/v1".to_string();
+    config.default_provider = "a".to_string();
+    for name in ["a", "b", "c"] {
+        config.providers.insert(
+            name.to_string(),
+            UpstreamConfig {
+                base_url: format!("http://127.0.0.1:9/{name}"),
+                ..UpstreamConfig::default()
+            },
+        );
+    }
+    // "a" points at b and c; the duplicate and the self-reference are dropped.
+    config.providers.get_mut("a").unwrap().fallback =
+        vec!["b/small".to_string(), "c".to_string(), "b".to_string()];
+    // "b" has its own fallback, which must NOT be followed transitively.
+    config.providers.get_mut("b").unwrap().fallback = vec!["c".to_string()];
+    let state = test_state_with_config(config);
+
+    let routed = state.providers.get("a").unwrap();
+    let chain = failover_chain(&state, routed);
+    let names = chain
+        .iter()
+        .map(|hop| (hop.provider.name.as_str(), hop.model))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![("a", None), ("b", Some("small")), ("c", None)],
+        "one level only, in order, deduplicated"
+    );
+}
+
+#[test]
+fn validate_config_rejects_unusable_failover_and_rules() {
+    // test_config() serves its default provider from the [upstream] section,
+    // so failover cases need a named provider to hang the chain on.
+    let with_named_provider = || {
+        let mut config = test_config();
+        config.providers.insert(
+            "default".to_string(),
+            UpstreamConfig {
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                ..UpstreamConfig::default()
+            },
+        );
+        config
+    };
+
+    let mut config = with_named_provider();
+    config.providers.get_mut("default").unwrap().fallback = vec!["ghost".to_string()];
+    assert!(
+        validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown provider")
+    );
+
+    let mut config = with_named_provider();
+    config.providers.get_mut("default").unwrap().fallback = vec!["default".to_string()];
+    assert!(
+        validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("itself")
+    );
+
+    let mut config = test_config();
+    config.routing_rules = vec![RoutingRule {
+        name: "unnamed".to_string(),
+        route: "nowhere".to_string(),
+        ..RoutingRule::default()
+    }];
+    assert!(
+        validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("must be")
+    );
+
+    let mut config = test_config();
+    config.routing_rules = vec![RoutingRule {
+        name: String::new(),
+        route: ROUTING_RULE_PASS.to_string(),
+        ..RoutingRule::default()
+    }];
+    assert!(
+        validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("must have a name")
+    );
+
+    let mut config = test_config();
+    config.routing_rules = vec![RoutingRule {
+        name: "backwards".to_string(),
+        min_input_tokens: Some(100),
+        max_input_tokens: Some(10),
+        route: ROUTING_RULE_PASS.to_string(),
+        ..RoutingRule::default()
+    }];
+    assert!(validate_config(&config).is_err());
+
+    // A valid rule pointing at provider/model passes.
+    let mut config = test_config();
+    config.routing_rules = vec![RoutingRule {
+        name: "ok".to_string(),
+        route: "default/some-model".to_string(),
+        ..RoutingRule::default()
+    }];
+    assert!(validate_config(&config).is_ok());
+}
+
+#[test]
+fn validate_config_requires_a_priced_baseline_model() {
+    let mut config = test_config();
+    config.pricing.baseline_model = Some("unpriced-model".to_string());
+    assert!(
+        validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("no entry")
+    );
+
+    config.pricing.models.insert(
+        "unpriced-model".to_string(),
+        ModelPriceConfig {
+            input_per_mtok: 1.0,
+            output_per_mtok: 2.0,
+        },
+    );
+    assert!(validate_config(&config).is_ok());
+
+    config.pricing.models.insert(
+        "negative".to_string(),
+        ModelPriceConfig {
+            input_per_mtok: -1.0,
+            output_per_mtok: 0.0,
+        },
+    );
+    assert!(validate_config(&config).is_err());
+}
+
+#[test]
+fn routing_rules_match_in_order_and_the_first_match_wins() {
+    let mut config = test_config();
+    config.set_routing_mode(RoutingMode::Intercept);
+    config.routing_rules = vec![
+        RoutingRule {
+            name: "tiny no-tool work stays local".to_string(),
+            max_input_tokens: Some(50),
+            has_tools: Some(false),
+            route: ROUTING_RULE_PASS.to_string(),
+            ..RoutingRule::default()
+        },
+        RoutingRule {
+            name: "explanations".to_string(),
+            contains_any: vec!["EXPLAIN".to_string()],
+            route: "default/teacher".to_string(),
+            ..RoutingRule::default()
+        },
+        RoutingRule {
+            name: "catch-all".to_string(),
+            route: "default/fallback-model".to_string(),
+            ..RoutingRule::default()
+        },
+    ];
+    let state = test_state_with_config(config);
+
+    let tiny = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+    let (name, outcome) = match_routing_rule(&state, &tiny, None).expect("first rule matches");
+    assert_eq!(name, "tiny no-tool work stays local");
+    assert!(matches!(outcome, RuleOutcome::Pass));
+
+    // Tools present, so the first rule cannot match; the substring is matched
+    // case-insensitively against the last user turn.
+    let explain = json!({
+        "messages": [
+            { "role": "user", "content": "ignore me" },
+            { "role": "assistant", "content": "sure" },
+            { "role": "user", "content": "Please Explain this function" }
+        ],
+        "tools": [{ "type": "function", "function": { "name": "read" } }]
+    });
+    let (name, outcome) = match_routing_rule(&state, &explain, None).expect("second rule matches");
+    assert_eq!(name, "explanations");
+    match outcome {
+        RuleOutcome::Route(label, target) => {
+            assert_eq!(label, "default/teacher");
+            assert_eq!(target.provider, "default");
+            assert_eq!(target.model, "teacher");
+        }
+        RuleOutcome::Pass => panic!("expected a route"),
+    }
+
+    // Nothing specific matches, so the unconditional rule catches it.
+    let other = json!({
+        "messages": [{ "role": "user", "content": "something else entirely" }],
+        "tools": [{ "type": "function", "function": { "name": "read" } }]
+    });
+    let (name, _) = match_routing_rule(&state, &other, None).expect("catch-all matches");
+    assert_eq!(name, "catch-all");
+}
+
+#[test]
+fn routing_rules_respect_model_and_token_conditions() {
+    let mut config = test_config();
+    config.set_routing_mode(RoutingMode::Intercept);
+    config.routing_rules = vec![RoutingRule {
+        name: "big auto requests".to_string(),
+        min_input_tokens: Some(20),
+        requested_model: Some(INTEGRATED_AUTO_MODEL.to_string()),
+        route: ROUTING_RULE_PASS.to_string(),
+        ..RoutingRule::default()
+    }];
+    let state = test_state_with_config(config);
+
+    let big = json!({
+        "messages": [{ "role": "user", "content": "x".repeat(400) }]
+    });
+    assert!(
+        match_routing_rule(&state, &big, Some("gpt-test")).is_none(),
+        "the requested model must match"
+    );
+    assert!(match_routing_rule(&state, &big, Some(INTEGRATED_AUTO_MODEL)).is_some());
+
+    let small = json!({ "messages": [{ "role": "user", "content": "x" }] });
+    assert!(
+        match_routing_rule(&state, &small, Some(INTEGRATED_AUTO_MODEL)).is_none(),
+        "below min_input_tokens"
+    );
+}
+
+#[test]
+fn pricing_prefers_the_namespaced_rate_and_computes_cost() {
+    let mut config = Config::default();
+    config.pricing.models.insert(
+        "gpt-test".to_string(),
+        ModelPriceConfig {
+            input_per_mtok: 1.0,
+            output_per_mtok: 2.0,
+        },
+    );
+    config.pricing.models.insert(
+        "openai/gpt-test".to_string(),
+        ModelPriceConfig {
+            input_per_mtok: 10.0,
+            output_per_mtok: 20.0,
+        },
+    );
+    config.pricing.baseline_model = Some("openai/gpt-test".to_string());
+
+    // The same model on another provider falls back to the bare rate.
+    assert_eq!(
+        config.pricing.price_for("local", "gpt-test").input_per_mtok,
+        1.0
+    );
+    assert_eq!(
+        config
+            .pricing
+            .price_for("openai", "gpt-test")
+            .input_per_mtok,
+        10.0
+    );
+    assert!(config.pricing.price_for("local", "unknown").is_zero());
+
+    let pricing = request_pricing(&config, "local", "gpt-test");
+    let usage = TokenUsage {
+        input_tokens: 1_000_000,
+        output_tokens: 500_000,
+        estimated: false,
+    };
+    // 1.0 for a million input tokens plus half of 2.0 for the output.
+    assert!((pricing.actual.cost_usd(usage) - 2.0).abs() < 1e-9);
+    // The same tokens on the baseline model would have cost ten times more.
+    assert!((pricing.baseline.cost_usd(usage) - 20.0).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn a_refusing_provider_fails_over_to_its_backup() {
+    let primary_hits = Arc::new(AtomicU64::new(0));
+    let hits = primary_hits.clone();
+    let primary = spawn_test_upstream(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": { "message": "overloaded" } })),
+                )
+            }
+        }),
+    ))
+    .await;
+    let backup = spawn_test_upstream(Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Json(json!({
+                "id": "chatcmpl-backup",
+                "object": "chat.completion",
+                "model": "backup-model",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "served by the backup" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7 }
+            }))
+        }),
+    ))
+    .await;
+
+    let mut config = Config {
+        default_provider: "primary".to_string(),
+        ..Config::default()
+    };
+    config.upstream.base_url = primary.0.clone();
+    config.providers.insert(
+        "primary".to_string(),
+        UpstreamConfig {
+            base_url: primary.0.clone(),
+            fallback: vec!["backup/backup-model".to_string()],
+            ..UpstreamConfig::default()
+        },
+    );
+    config.providers.insert(
+        "backup".to_string(),
+        UpstreamConfig {
+            base_url: backup.0.clone(),
+            ..UpstreamConfig::default()
+        },
+    );
+    // An alias keeps the request off model discovery; these upstreams only
+    // implement the completion endpoint.
+    config.model_aliases.insert(
+        "primary-model".to_string(),
+        ModelAlias::Model("primary-model".to_string()),
+    );
+    let state = test_state_with_config(config);
+
+    let response = chat_completions(
+        State(SharedState::new(state.clone())),
+        HeaderMap::new(),
+        Json(json!({
+            "model": "primary-model",
+            "stream": false,
+            "messages": [{ "role": "user", "content": "hello" }]
+        })),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        value["choices"][0]["message"]["content"], "served by the backup",
+        "the caller should get the backup's answer, not the 503"
+    );
+    assert_eq!(
+        primary_hits.load(Ordering::SeqCst),
+        1,
+        "the primary is tried once before the chain moves on"
+    );
+    // The fallback entry carried a model, so the backup was asked for its own.
+    assert_eq!(value["model"], "backup-model");
+
+    primary.1.abort();
+    backup.1.abort();
+}
+
+#[tokio::test]
+async fn an_open_breaker_skips_the_provider_entirely() {
+    let hits = Arc::new(AtomicU64::new(0));
+    let counted = hits.clone();
+    let dead = spawn_test_upstream(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": { "message": "down" } })),
+                )
+            }
+        }),
+    ))
+    .await;
+    let healthy = spawn_test_upstream(Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Json(json!({
+                "id": "chatcmpl-ok",
+                "object": "chat.completion",
+                "model": "healthy-model",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop"
+                }]
+            }))
+        }),
+    ))
+    .await;
+
+    let mut config = Config {
+        default_provider: "dead".to_string(),
+        ..Config::default()
+    };
+    config.upstream.base_url = dead.0.clone();
+    config.providers.insert(
+        "dead".to_string(),
+        UpstreamConfig {
+            base_url: dead.0.clone(),
+            fallback: vec!["healthy".to_string()],
+            // Open after a single failure so the second request skips it.
+            circuit_breaker_threshold: 1,
+            circuit_breaker_cooldown_secs: 300,
+            ..UpstreamConfig::default()
+        },
+    );
+    config.providers.insert(
+        "healthy".to_string(),
+        UpstreamConfig {
+            base_url: healthy.0.clone(),
+            ..UpstreamConfig::default()
+        },
+    );
+    config
+        .model_aliases
+        .insert("m".to_string(), ModelAlias::Model("m".to_string()));
+    let state = test_state_with_config(config);
+
+    let send = || {
+        let state = state.clone();
+        async move {
+            chat_completions(
+                State(SharedState::new(state)),
+                HeaderMap::new(),
+                Json(json!({
+                    "model": "m",
+                    "stream": false,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                })),
+            )
+            .await
+        }
+    };
+
+    assert_eq!(send().await.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.providers.get("dead").unwrap().breaker_status(),
+        "open"
+    );
+
+    // The breaker is open, so the dead provider is not contacted again.
+    assert_eq!(send().await.status(), StatusCode::OK);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "an open breaker must not spend another request on a provider that is down"
+    );
+
+    dead.1.abort();
+    healthy.1.abort();
 }

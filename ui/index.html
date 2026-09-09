@@ -22,7 +22,8 @@
     <div class="masthead-meta mono">
       <span class="meta-item"><span class="lamp" id="lamp-proxy" aria-hidden="true"></span><span id="meta-proxy-addr">—</span></span>
       <span class="meta-item" id="meta-uptime" title="proxy uptime">—</span>
-      <span class="meta-item" id="meta-interceptor">interceptor —</span>
+      <span class="meta-item" id="meta-routing-mode">mode —</span>
+      <button class="button button-quiet masthead-restart" id="restart-proxy" type="button">Restart</button>
     </div>
   </div>
 </header>
@@ -74,22 +75,14 @@
       <div class="grid-two overview-grid">
         <section class="panel" aria-labelledby="launch-label">
           <h3 class="panel-label" id="launch-label">Start an agent</h3>
-          <p class="panel-intro">Run Codex, Claude Code, or Copilot CLI through a request-scoped proxy,
-          interceptor, or integrated routing session.</p>
+          <p class="panel-intro">Every launcher inherits the running instance mode:
+          <strong class="mono" id="launch-mode">loading</strong>.</p>
 
           <fieldset class="choice-row" id="agent-choice">
             <legend class="choice-legend mono">agent</legend>
             <label class="choice"><input type="radio" name="agent" value="codex" checked> Codex</label>
             <label class="choice"><input type="radio" name="agent" value="claude"> Claude Code</label>
             <label class="choice"><input type="radio" name="agent" value="copilot"> Copilot CLI</label>
-          </fieldset>
-
-          <fieldset class="choice-row" id="style-choice">
-            <legend class="choice-legend mono">method</legend>
-            <label class="choice"><input type="radio" name="style" value="proxy"> Proxy <span class="choice-note">default provider, no interception</span></label>
-            <label class="choice"><input type="radio" name="style" value="launcher" checked> Intercept <span class="choice-note">local first, existing login on PASS</span></label>
-            <label class="choice"><input type="radio" name="style" value="integrated"> Integrated <span class="choice-note">triage across configured providers</span></label>
-            <label class="choice"><input type="radio" name="style" value="env"> Manual <span class="choice-note">env / profile against this proxy</span></label>
           </fieldset>
 
           <div class="command-block">
@@ -131,7 +124,7 @@
           <div class="pulse-flow">
             <div class="flow-wrap">
               <svg class="flow" id="flow-strip" viewBox="0 0 760 168" role="img"
-                   aria-label="Request flow from agent through llmproxy to local and external models">
+                   aria-label="Request flow from agent through llmproxy by provider network scope">
                 <text class="flow-node-label mono" x="24" y="88">agent</text>
                 <path id="flow-in" class="flow-line neutral drift" d="M 92 84 H 268"/>
                 <text class="flow-count mono neutral" id="flow-in-count" x="180" y="72" text-anchor="middle">0</text>
@@ -139,26 +132,26 @@
                 <text class="flow-node-label mono" x="328" y="88" text-anchor="middle">llmproxy</text>
                 <path id="flow-local" class="flow-line local drift" d="M 388 76 C 470 76 490 40 570 40"/>
                 <path id="flow-ext" class="flow-line external drift" d="M 388 92 C 470 92 490 128 570 128"/>
-                <text class="flow-count mono local" id="flow-local-count" x="584" y="45">0 local</text>
-                <text class="flow-count mono external" id="flow-ext-count" x="584" y="133">0 external</text>
+                <text class="flow-count mono local" id="flow-local-count" x="584" y="45">0 private</text>
+                <text class="flow-count mono external" id="flow-ext-count" x="584" y="133">0 remote</text>
               </svg>
             </div>
-            <div class="split-band" id="split-band" role="img" aria-label="Share of responses served locally">
+            <div class="split-band" id="split-band" role="img" aria-label="Share of responses served on the private network">
               <div class="split-local" id="split-local" style="width:0%"></div>
             </div>
             <p class="split-caption mono" id="split-caption">no responses yet</p>
           </div>
 
           <div class="latency-card">
-            <h4 class="sub-label mono">response latency <span class="sub-note">p50 → p99</span></h4>
+            <h4 class="sub-label mono">latency by network scope <span class="sub-note">p50 → p99</span></h4>
             <div class="latency-rows" id="latency-rows">
               <div class="latency-row">
-                <span class="latency-name mono is-local">local</span>
+                <span class="latency-name mono is-local">private</span>
                 <div class="latency-track"><div class="latency-bar is-local" id="lat-local-bar"><i class="dot d50"></i><i class="dot d99"></i></div></div>
                 <span class="latency-figures mono" id="lat-local-figures">no samples</span>
               </div>
               <div class="latency-row">
-                <span class="latency-name mono is-external">external</span>
+                <span class="latency-name mono is-external">remote</span>
                 <div class="latency-track"><div class="latency-bar is-external" id="lat-ext-bar"><i class="dot d50"></i><i class="dot d99"></i></div></div>
                 <span class="latency-figures mono" id="lat-ext-figures">no samples</span>
               </div>
@@ -184,17 +177,17 @@
           </div>
           <div class="stat">
             <span class="stat-value mono is-local" id="stat-local">0</span>
-            <span class="stat-label mono">served locally</span>
+            <span class="stat-label mono">private responses</span>
             <span class="stat-sub" id="stat-local-sub">&nbsp;</span>
           </div>
           <div class="stat">
             <span class="stat-value mono is-external" id="stat-external">0</span>
-            <span class="stat-label mono">forwarded external</span>
+            <span class="stat-label mono">remote responses</span>
             <span class="stat-sub" id="stat-external-sub">&nbsp;</span>
           </div>
           <div class="stat">
             <span class="stat-value mono is-local" id="stat-tokens">≈ 0</span>
-            <span class="stat-label mono">tokens saved</span>
+            <span class="stat-label mono">downstream tokens avoided</span>
             <span class="stat-sub" id="stat-tokens-sub">prompt 0 · completion 0</span>
           </div>
         </div>
@@ -257,7 +250,7 @@
 
         <section class="panel" aria-labelledby="model-usage-label">
           <h3 class="panel-label" id="model-usage-label">Model usage</h3>
-          <p class="panel-intro">All completed invocations, including local triage.</p>
+          <p class="panel-intro">All completed invocations, including the triage provider.</p>
           <div class="table-scroll bounded-table">
             <table class="data-table" id="model-usage">
               <thead>
@@ -284,8 +277,8 @@
             <label class="field decision-outcome"><span class="field-name mono">outcome</span>
               <select class="input mono" id="decision-outcome">
                 <option value="">all outcomes</option>
-                <option value="local">local</option>
-                <option value="external">external</option>
+                <option value="local">private network scope</option>
+                <option value="external">remote network scope</option>
                 <option value="reject">rejected</option>
                 <option value="bypass">bypass</option>
                 <option value="error">error / fallback</option>
@@ -333,8 +326,8 @@
       <header class="page-head">
         <div>
           <p class="page-kicker mono">Route / Routing</p>
-          <h2>Shape local-first decisions</h2>
-          <p>Configure the triage model and targets, then edit and test the policy they use.</p>
+          <h2>Shape provider decisions</h2>
+          <p>Configure the triage provider and execution targets, then edit and test their routing policy.</p>
         </div>
       </header>
       <nav class="subtabs" role="tablist" aria-label="Routing views">
@@ -343,13 +336,30 @@
       </nav>
 
       <div id="subview-routing-triage" class="subview" role="tabpanel" aria-labelledby="subtab-routing-triage">
+        <section class="panel" aria-labelledby="routing-mode-label">
+          <h3 class="panel-label" id="routing-mode-label">Instance routing mode</h3>
+          <p class="panel-intro">One mode applies to direct API traffic and every Codex, Claude Code, or Copilot launcher.</p>
+          <form class="field-form" id="routing-mode-form">
+            <div class="field-row">
+              <label class="field"><span class="field-name mono">routing_mode</span>
+                <select class="input mono" id="routing-mode">
+                  <option value="proxy">proxy · default provider only</option>
+                  <option value="intercept">intercept · triage answer or PASS</option>
+                  <option value="integrated">integrated · provider routing for Auto</option>
+                </select></label>
+            </div>
+            <div class="form-actions">
+              <span class="hint form-note">Changing mode applies immediately. Relaunch active agents so they inherit it.</span>
+              <button class="button button-primary" type="submit">Save mode</button>
+            </div>
+          </form>
+        </section>
+
         <section class="panel" aria-labelledby="cfg-int-label">
-          <h3 class="panel-label" id="cfg-int-label">Local interceptor</h3>
-          <p class="panel-intro">The local model sees each eligible request first and can answer deterministic work itself.</p>
+          <h3 class="panel-label" id="cfg-int-label">Triage provider</h3>
+          <p class="panel-intro">This provider sees each eligible request first and executes deterministic work only above the policy threshold.</p>
           <form class="field-form" id="interceptor-form">
             <div class="field-row">
-              <label class="field field-check field-check-inline">
-                <input type="checkbox" id="int-enabled"><span>Enabled</span></label>
               <label class="field"><span class="field-name mono">provider</span>
                 <select class="input mono" id="int-provider"></select></label>
               <label class="field"><span class="field-name mono">model</span>
@@ -369,13 +379,13 @@
                 <label class="field field-check sensitive-reject"><input type="checkbox" id="int-reject-sensitive">
                   <span>Reject sensitive prompts before routing <span class="choice-note">fail closed if screening is unavailable</span></span></label>
                 <label class="field field-check"><input type="checkbox" id="int-fallback">
-                  <span>Fall back to external routing on local errors</span></label>
+                  <span>Fall back to normal provider routing on triage errors</span></label>
                 <label class="field field-check"><input type="checkbox" id="int-parallel">
                   <span>Allow parallel tool calls <span class="choice-note">off keeps triage to one call</span></span></label>
               </div>
             </details>
             <div class="form-actions">
-              <span class="hint form-note">Launcher <code class="mono">--intercept</code> enables triage for that session.</span>
+              <span class="hint form-note">Used by intercept and integrated modes.</span>
               <a class="button button-link" href="#/routing/policy">Edit policy</a>
               <button class="button button-primary" type="submit">Save interceptor</button>
             </div>
@@ -385,13 +395,9 @@
         <section class="panel" aria-labelledby="cfg-integrated-label">
           <h3 class="panel-label" id="cfg-integrated-label">Integrated targets</h3>
           <p class="panel-intro">Model <code class="mono">Auto</code> enables target tools and
-          <code class="mono">ROUTE_DEFAULT</code>. Explicit models bypass integrated triage;
-          standalone interception remains controlled separately above.</p>
+          <code class="mono">PASS</code>. Explicit models bypass integrated triage;
+          they continue through normal provider routing.</p>
           <form class="field-form" id="integrated-form">
-            <div class="field-row">
-              <label class="field field-check"><input type="checkbox" id="integrated-enabled">
-                <span>Enabled</span></label>
-            </div>
             <div class="table-scroll bounded-table">
               <table class="data-table edit-table" id="integrated-targets">
                 <thead><tr><th>tool target</th><th>provider</th><th>model</th><th>effort</th><th>routing hint</th><th></th></tr></thead>
@@ -416,7 +422,7 @@
               </div>
             </details>
             <div class="form-actions">
-              <span class="hint form-note">External targets need proxy-owned API credentials.</span>
+              <span class="hint form-note">Remote targets need proxy-owned API credentials.</span>
               <button class="button button-primary" type="submit">Save targets</button>
             </div>
           </form>
@@ -426,7 +432,7 @@
       <div id="subview-routing-policy" class="subview" role="tabpanel" aria-labelledby="subtab-routing-policy" hidden>
         <section class="panel" aria-labelledby="sys-label">
           <h3 class="panel-label" id="sys-label">Routing policy</h3>
-          <p class="panel-intro">Each mode sends its own system prompt to the local triage model. Changes save independently.</p>
+          <p class="panel-intro">Each mode sends its own system prompt to the triage provider. Changes save independently.</p>
           <p class="hint">When sensitive rejection is enabled, its mandatory fail-closed rule is appended after this editable policy.</p>
 
           <div class="mode-row">
@@ -454,16 +460,16 @@
           </div>
 
           <details class="adv policy-revision">
-            <summary>Revise with the local model</summary>
+            <summary>Revise with the triage provider</summary>
             <p class="hint">Describe a change and review the rewritten policy before saving.</p>
             <div class="inline-form">
               <textarea class="input mono" id="revise-input" rows="2" spellcheck="false"
-                placeholder="e.g. also answer git status / diff / log requests locally"
+                placeholder="e.g. raise the deterministic execution threshold for git commands"
                 aria-label="Describe the revision"></textarea>
               <button class="button" type="button" id="revise-run">Revise</button>
               <button class="button" type="button" id="revise-undo" hidden>Undo revision</button>
             </div>
-            <p class="hint" id="revise-running" hidden>asking the local model…</p>
+            <p class="hint" id="revise-running" hidden>asking the triage provider…</p>
           </details>
         </section>
 
@@ -475,7 +481,7 @@
             placeholder="e.g. rename the variable `foo` to `bar` in src/main.rs and run the tests"
             aria-label="Test user prompt"></textarea>
           <div class="form-actions">
-            <span class="hint test-running" id="test-running" hidden>asking the local model…</span>
+            <span class="hint test-running" id="test-running" hidden>asking the triage provider…</span>
             <button class="button button-primary" type="button" id="test-run">Test in intercept mode</button>
           </div>
           <div id="test-results"></div>

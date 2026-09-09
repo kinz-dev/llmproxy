@@ -98,10 +98,16 @@ code.mono { font-size: 0.85em; color: var(--muted); }
 
 .masthead-meta {
   display: flex;
+  align-items: center;
   gap: 18px;
   font-size: 12.5px;
   color: var(--muted);
   flex-wrap: wrap;
+}
+
+.masthead-restart {
+  padding: 5px 9px;
+  font-size: 10.5px;
 }
 
 .meta-item { display: inline-flex; align-items: center; gap: 7px; }
@@ -808,8 +814,6 @@ code.mono { font-size: 0.85em; color: var(--muted); }
 
 /* Routing decision audit */
 
-.decision-panel { overflow: hidden; }
-
 .decision-head,
 .decision-card-top,
 .decision-card-foot,
@@ -832,8 +836,8 @@ code.mono { font-size: 0.85em; color: var(--muted); }
   flex-wrap: wrap;
 }
 
-.decision-search { flex: 1 1 320px; }
-.decision-outcome { flex: 0 1 190px; }
+.decision-controls .decision-search { flex: 1 1 320px; }
+.decision-controls .decision-outcome { flex: 0 1 190px; }
 .decision-controls .button { margin-left: auto; }
 
 .decision-ledger {
@@ -921,6 +925,9 @@ code.mono { font-size: 0.85em; color: var(--muted); }
   .decision-head,
   .decision-card-top,
   .decision-card-foot { align-items: flex-start; flex-direction: column; }
+  .decision-controls .decision-search,
+  .decision-controls .decision-outcome { flex: 1 0 100%; width: 100%; }
+  .decision-controls .button { margin-left: 0; width: 100%; }
   .decision-time { margin-left: 0; }
   .decision-test { width: 100%; }
 }
@@ -1029,7 +1036,7 @@ code.mono { font-size: 0.85em; color: var(--muted); }
   margin-top: 12px;
 }
 
-.test-result.verdict-local { border-left-color: var(--local); }
+.test-result.verdict-direct { border-left-color: var(--local); }
 .test-result.verdict-external,
 .test-result.verdict-redirect { border-left-color: var(--external); }
 .test-result.verdict-default_route { border-left-color: var(--line-strong); }
@@ -1044,7 +1051,7 @@ code.mono { font-size: 0.85em; color: var(--muted); }
   text-transform: uppercase;
 }
 
-.verdict-local .test-verdict { color: var(--local); }
+.verdict-direct .test-verdict { color: var(--local); }
 .verdict-external .test-verdict,
 .verdict-redirect .test-verdict { color: var(--external); }
 .verdict-default_route .test-verdict { color: var(--muted); }

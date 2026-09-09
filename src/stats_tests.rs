@@ -211,6 +211,7 @@ fn stats_counters_and_snapshot_shape() {
         local_usage,
     );
     stats.record_intercept_local(
+        RouteClass::Local,
         "local",
         "responses",
         Duration::from_millis(120),

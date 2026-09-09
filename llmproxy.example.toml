@@ -1,4 +1,5 @@
 listen_addr = "127.0.0.1:8080"
+routing_mode = "integrated" # proxy | intercept | integrated
 # Timestamped trace logs are written under ~/.llmproxy. Set 0 to retain them indefinitely.
 max_logging_retention_days = 7
 
@@ -11,7 +12,7 @@ max_logging_retention_days = 7
 enable = false
 # listen_address = "127.0.0.1:11180"
 
-[upstream]
+[providers.default]
 kind = "openai-compatible"
 base_url = "http://127.0.0.1:8000/v1"
 # api_key_env = "VLLM_API_KEY"
@@ -23,19 +24,12 @@ connect_timeout_secs = 10
 pool_max_idle_per_host = 64
 pool_idle_timeout_secs = 90
 
-[providers.embeddings]
-kind = "openai-compatible"
-base_url = "http://127.0.0.1:18000/v1"
-timeout_secs = 600
-connect_timeout_secs = 10
-pool_max_idle_per_host = 64
-pool_idle_timeout_secs = 90
-
-# Optional local-first agent interceptor. The local provider receives a dynamic
+# Optional agent interceptor. The triage provider receives a dynamic
 # Chat Completions copy of /chat/completions, /responses, or /messages requests.
-# A normal completion is returned to the client; a sole PASS function call sends
-# the untouched original request through the existing provider/model remapping.
-[providers.local_interceptor]
+# It directly completes deterministic work above the built-in 80% likelihood
+# threshold; a sole PASS function call sends the untouched original request
+# through the existing provider/model remapping.
+[providers.triage]
 kind = "openai-compatible"
 base_url = "http://127.0.0.1:11434/v1"
 # api_key_env = "LOCAL_LLM_API_KEY"
@@ -45,35 +39,32 @@ pool_max_idle_per_host = 16
 pool_idle_timeout_secs = 90
 
 [interceptor]
-enabled = false
-provider = "local_interceptor"
+provider = "triage"
 model = "qwen3:4b"
 timeout_ms = 60000
 fallback_on_error = true
-# Optional fail-closed screening before local answers or external routes.
-# The safe REJECT response never repeats the detected value. Pure --proxy
-# launcher sessions remain prompt-free and disable this setting for the session.
+# Optional fail-closed screening before provider execution or routing. The
+# triage provider must be loopback/private-network because it sees the prompt
+# before deciding REJECT at the built-in 75% likelihood threshold.
+# The safe REJECT response never repeats the detected value. Proxy mode remains
+# prompt-free and ignores this setting until the instance uses a triage mode.
 reject_sensitive = false
-# Sampling for the local triage request. Completions that hit max_tokens fall
-# back to external routing instead of serving a clipped answer; max_tokens = 0
+# Sampling for the triage request. Completions that hit max_tokens fall back to
+# normal provider routing instead of serving a clipped answer; max_tokens = 0
 # leaves the client's own limits in place.
 # temperature = 0.0
 # max_tokens = 512
 # parallel_tool_calls = false
-# instructions = """Override the default local routing instructions here."""
-# Native launchers borrow only the matching CLI provider login:
-# llmproxy --config llmproxy.example.toml --intercept --codex
-# llmproxy --config llmproxy.example.toml --intercept --claude
-# llmproxy --config llmproxy.example.toml --intercept --copilot
-# Pure proxy launchers skip interception and use only the default provider:
-# llmproxy --config llmproxy.example.toml --proxy --codex
-# llmproxy --config llmproxy.example.toml --proxy --claude
-# llmproxy --config llmproxy.example.toml --proxy --copilot
+# instructions = """Override the default triage instructions here."""
+# Launchers inherit the one instance routing_mode:
+# llmproxy --config llmproxy.example.toml --codex
+# llmproxy --config llmproxy.example.toml --claude
+# llmproxy --config llmproxy.example.toml --copilot
 
 # Provider kinds select the upstream wire protocol and authentication shape.
 # Cross-provider routes require an explicit proxy-owned API credential, OR a
 # borrowed CLI login via auth = "codex-oauth"/"claude-oauth" (see below). These
-# examples stay commented so this file starts without contacting external APIs.
+# examples stay commented so this file starts without contacting remote APIs.
 # [providers.openai]
 # kind = "openai"
 # base_url = "https://api.openai.com/v1"
@@ -112,22 +103,19 @@ reject_sensitive = false
 # base_url = "https://api.anthropic.com/v1"
 # reasoning_effort = "high"
 
-# Integrated mode is selected per request with model "Auto". The local triager
-# then receives ROUTE_DEFAULT plus the zero-argument route tools below. Any
-# other model bypasses integrated triage; standalone interception can still be
-# enabled independently. Unmatched model IDs stay unchanged on the default
-# provider. Redirects are sticky per hashed conversation key for the configured
-# TTL; no message or session text is kept.
+# Integrated mode routes model "Auto" through the target tools below. Any other
+# model bypasses integrated triage. Unmatched model IDs stay unchanged on the
+# default provider. Redirects are sticky per hashed conversation key for the
+# configured TTL; no message or session text is kept.
 [integrated]
-enabled = true
 sticky_ttl_secs = 1800
 sticky_capacity = 1024
 # instructions = """Override the integrated routing policy here; empty uses the built-in default."""
 #
-[integrated.targets.PROVIDER_DEFAULT]
+[integrated.targets.DETERMINISTIC]
 provider = "default"
 model = "Qwen/Qwen2.5-Coder-32B-Instruct"
-hint = "all non-routine work not claimed by a more specific route (default route)"
+hint = "routine deterministic execution when confidence is greater than 80%"
 
 # [integrated.targets.backend]
 # provider = "openai"
@@ -143,7 +131,7 @@ hint = "all non-routine work not claimed by a more specific route (default route
 # [integrated.targets.routine]
 # provider = "copilot"
 # model = "gpt-5.4"
-# hint = "routine external work assigned to the Copilot backend"
+# hint = "routine work assigned to the Copilot provider"
 
 # Optional manual overrides. Without these, every incoming model is mapped to
 # the first id returned by the default upstream /v1/models. Inline route tables
@@ -152,7 +140,9 @@ hint = "all non-routine work not claimed by a more specific route (default route
 [model_aliases]
 # codex-qwen = "Qwen/Qwen2.5-Coder-32B-Instruct"
 # claude-sonnet = "Qwen/Qwen2.5-Coder-32B-Instruct"
-embedding = { provider = "embeddings", model = "Qwen/Qwen3-Embedding-0.6B" }
+# Embeddings have no special provider type; expose any embedding model as an
+# ordinary alias routed to whichever provider serves it.
+# embedding = { provider = "default", model = "Qwen/Qwen3-Embedding-0.6B" }
 
 [role_map]
 # Qwen/vLLM chat templates often reject Codex/OpenAI's newer roles.

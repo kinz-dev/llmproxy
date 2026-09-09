@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::{env, fs};
@@ -15,9 +16,10 @@ use std::{env, fs};
 use anyhow::{Context, Result, bail};
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, ORIGIN};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use bytes::Bytes;
@@ -32,9 +34,10 @@ use tracing::{error, info, warn};
 use crate::interceptor::{IntegratedTarget, InterceptorConfig};
 use crate::stats::{proxy_stats, route_class_for_base_url, routing_decision_log, traffic_log};
 use crate::{
-    AdminConfig, AnthropicMode, AppState, Config, ModelAlias, ModelRoutingMode, ResponsesMode,
-    SharedState, build_provider_state, effective_provider_configs, finalize_config_keys,
-    refresh_upstream_models, update_runtime_integrated, validate_config,
+    AdminConfig, AnthropicMode, AppState, Config, INTEGRATED_AUTO_MODEL, ModelAlias,
+    ModelRoutingMode, ResponsesMode, RoutingMode, SharedState, build_provider_state,
+    configure_daemon_process, effective_provider_configs, finalize_config_keys, parse_config,
+    refresh_upstream_models, update_runtime_mode, validate_config,
 };
 
 /// Effective bind address: missing config means loopback on a random port.
@@ -140,6 +143,8 @@ fn router(state: AdminState) -> Router {
         .route("/api/decisions/clear", post(api_decisions_clear))
         .route("/api/launch", get(api_launch))
         .route("/api/config", get(api_config))
+        .route("/api/routing-mode", put(api_routing_mode_put))
+        .route("/api/restart", post(api_restart))
         .route(
             "/api/config/raw",
             get(api_config_raw_get).put(api_config_raw_put),
@@ -158,7 +163,100 @@ fn router(state: AdminState) -> Router {
         )
         .route("/api/settings", put(api_settings_put))
         .fallback(get(ui_asset))
-        .with_state(state)
+        .with_state(state.clone())
+        .route_layer(middleware::from_fn_with_state(state, require_local_origin))
+}
+
+/// True when `host` is a literal loopback `ip:port` matching this listener.
+/// Literals only: a hostname (even `localhost`) fails, which is what stops
+/// DNS-rebinding from presenting the admin's own origin to itself.
+fn loopback_host_matches(host: &str, bound_port: u16) -> bool {
+    let Some((host_part, port_part)) = host.rsplit_once(':') else {
+        return false;
+    };
+    let Ok(port) = port_part.parse::<u16>() else {
+        return false;
+    };
+    let host_ip = host_part
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host_part);
+    let Ok(ip) = host_ip.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    ip.is_loopback() && port == bound_port
+}
+
+fn is_same_loopback_origin(origin: &str, bound_port: u16) -> bool {
+    let Some(rest) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    loopback_host_matches(rest, bound_port)
+}
+
+fn is_json_content_type(content_type: Option<&str>) -> bool {
+    let Some(ct) = content_type else {
+        return false;
+    };
+    let ct = ct.split(';').next().unwrap_or("").trim();
+    ct.eq_ignore_ascii_case("application/json")
+}
+
+/// Rejects cross-site and DNS-rebinding requests before any handler runs.
+///
+/// Loopback binding alone does not stop a web page the user visits: a simple
+/// bodyless POST from any origin reaches the clear/reset routes, and rebinding
+/// a short-TTL domain to 127.0.0.1 makes the browser treat the admin as
+/// same-origin, exposing the raw config (plaintext keys) and its writer. The
+/// Host check is the one that bites under rebinding, because the header then
+/// carries the attacker's hostname.
+async fn require_local_origin(
+    State(state): State<AdminState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+
+    let bound_port = state
+        .context
+        .admin_addr
+        .get()
+        .map(|addr| addr.port())
+        .unwrap_or(0);
+    let host_ok = headers
+        .get(HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|host| loopback_host_matches(host, bound_port));
+    if !host_ok {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "request Host must be the loopback admin address",
+        );
+    }
+
+    if let Some(origin) = headers.get(ORIGIN).and_then(|v| v.to_str().ok())
+        && !is_same_loopback_origin(origin, bound_port)
+    {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "cross-origin admin requests are not allowed",
+        );
+    }
+
+    // A bodyless, non-simple request could still be forged once Host/Origin
+    // checks pass, so require a JSON content type on every mutating method.
+    // The bundled UI already sends it on all mutating calls.
+    let method = request.method().clone();
+    if (method != Method::GET && method != Method::HEAD)
+        && !is_json_content_type(headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()))
+    {
+        return api_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "mutating admin requests require Content-Type: application/json",
+        );
+    }
+
+    next.run(request).await
 }
 
 // Static UI serving
@@ -345,6 +443,7 @@ async fn api_overview(State(state): State<AdminState>) -> Response {
         "config_persistable": context.config_path.is_some(),
         "launcher": context.launcher,
         "default_provider": config.default_provider,
+        "routing_mode": config.routing_mode.as_str(),
         "providers": snapshot.providers.len(),
         "model_routing": match config.model_routing {
             ModelRoutingMode::Remap => "remap",
@@ -466,7 +565,7 @@ async fn api_model_list(State(state): State<AdminState>) -> Response {
     let snapshot = state.shared.snapshot();
     let catalog = crate::models_catalog_json(&snapshot).await;
     Json(json!({
-        "routing_mode": match snapshot.config.model_routing {
+        "model_mapping": match snapshot.config.model_routing {
             ModelRoutingMode::Remap => "remap",
             ModelRoutingMode::Passthrough => "passthrough",
         },
@@ -527,7 +626,7 @@ async fn api_interceptor_test(
 
 #[derive(Deserialize)]
 struct InterceptorReviseBody {
-    /// The requested change, e.g. "also handle git commands locally".
+    /// The requested change, e.g. "raise the deterministic execution threshold".
     request: String,
     /// The editor's current policy text; empty means the built-in default
     /// for the mode.
@@ -574,14 +673,7 @@ async fn api_launch(State(state): State<AdminState>) -> Response {
         .map(|path| format!(" --config {}", path.display()))
         .unwrap_or_default();
 
-    let mut alias_names = config.model_aliases.keys().cloned().collect::<Vec<_>>();
-    alias_names.sort();
-    // Suggest a chat-suitable alias; embedding aliases make a poor default.
-    let claude_model = alias_names
-        .iter()
-        .find(|name| !name.to_ascii_lowercase().contains("embed"))
-        .cloned()
-        .unwrap_or_else(|| "local".to_string());
+    let claude_model = INTEGRATED_AUTO_MODEL;
 
     let codex_env = format!(
         "# ~/.codex/config.toml\n\
@@ -607,6 +699,7 @@ async fn api_launch(State(state): State<AdminState>) -> Response {
     Json(json!({
         "proxy_addr": proxy_addr,
         "default_provider": config.default_provider,
+        "routing_mode": config.routing_mode.as_str(),
         "config_path": context.config_path.as_ref().map(|path| path.display().to_string()),
         "interceptor_enabled": config.interceptor.enabled,
         "interceptor_configured": !config.interceptor.provider.trim().is_empty()
@@ -615,18 +708,12 @@ async fn api_launch(State(state): State<AdminState>) -> Response {
         "integrated_enabled": config.integrated.enabled,
         "integrated_targets": config.integrated.targets.len(),
         "commands": {
-            "codex_proxy": format!("llmproxy{config_flag} --proxy --codex"),
-            "claude_proxy": format!("llmproxy{config_flag} --proxy --claude"),
-            "copilot_proxy": format!("llmproxy{config_flag} --proxy --copilot"),
-            "codex_launcher": format!("llmproxy{config_flag} --intercept --codex"),
-            "claude_launcher": format!("llmproxy{config_flag} --intercept --claude"),
-            "copilot_launcher": format!("llmproxy{config_flag} --intercept --copilot"),
-            "codex_integrated": format!("llmproxy{config_flag} --codex"),
-            "claude_integrated": format!("llmproxy{config_flag} --claude"),
-            "copilot_integrated": format!("llmproxy{config_flag} --copilot"),
+            "codex": format!("llmproxy{config_flag} --codex"),
+            "claude": format!("llmproxy{config_flag} --claude"),
+            "copilot": format!("llmproxy{config_flag} --copilot"),
             "codex_env": codex_env,
             "claude_env": claude_env,
-            "copilot_env": "Native Copilot CAPI routing requires --intercept --copilot",
+            "copilot_env": "Native Copilot CAPI routing requires the managed launcher",
         },
     }))
     .into_response()
@@ -635,6 +722,97 @@ async fn api_launch(State(state): State<AdminState>) -> Response {
 async fn api_config(State(state): State<AdminState>) -> Response {
     let snapshot = state.shared.snapshot();
     Json(config_view(&snapshot, &state.context)).into_response()
+}
+
+#[derive(Deserialize)]
+struct RoutingModePutBody {
+    mode: RoutingMode,
+}
+
+async fn api_routing_mode_put(
+    State(state): State<AdminState>,
+    Json(body): Json<RoutingModePutBody>,
+) -> Response {
+    apply_config_change(
+        &state,
+        move |config| {
+            config.set_routing_mode(body.mode);
+            Ok(())
+        },
+        Persist::Edit(Box::new(move |doc| {
+            doc.insert("routing_mode", value(body.mode.as_str()));
+            for section in ["interceptor", "integrated"] {
+                if let Some(table) = doc.get_mut(section).and_then(Item::as_table_mut) {
+                    table.remove("enabled");
+                }
+            }
+            Ok(())
+        })),
+    )
+    .await
+}
+
+async fn api_restart(State(state): State<AdminState>, Json(_body): Json<Value>) -> Response {
+    let Some(proxy_addr) = state.context.proxy_addr.get().copied() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "proxy listener is not ready",
+        );
+    };
+    let snapshot = state.shared.snapshot();
+    let target_addr = match snapshot.config.listen_addr.parse::<SocketAddr>() {
+        Ok(addr) => addr,
+        Err(error) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("configured listen address is invalid: {error}"),
+            );
+        }
+    };
+    if target_addr.port() == 0 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "a managed restart requires a fixed configured listen port",
+        );
+    }
+    let executable = match env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to locate llmproxy executable: {error}"),
+            );
+        }
+    };
+    let config_path = state.context.config_path.clone();
+    let routing_mode = snapshot.config.routing_mode;
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let mut command = Command::new(executable);
+        command
+            .arg("--restart")
+            .arg("--restart-from")
+            .arg(proxy_addr.to_string())
+            .arg("--listen")
+            .arg(target_addr.to_string())
+            .arg("--mode")
+            .arg(routing_mode.as_str())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(config_path) = config_path {
+            command.arg("--config").arg(config_path);
+        }
+        configure_daemon_process(&mut command);
+        if let Err(error) = command.spawn() {
+            error!(error = %error, "failed to launch managed restart helper");
+        }
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "accepted": true, "message": "llmproxy restart scheduled" })),
+    )
+        .into_response()
 }
 
 fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
@@ -710,6 +888,7 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
         "listen_addr": config.listen_addr,
         "max_logging_retention_days": config.max_logging_retention_days,
         "default_provider": config.default_provider,
+        "routing_mode": config.routing_mode.as_str(),
         "providers": providers,
         "model_aliases": aliases,
         "interceptor": {
@@ -814,7 +993,7 @@ async fn apply_config_change(
 
     let auto_mapping = config.model_routing == ModelRoutingMode::Remap;
     let new_state = AppState {
-        forward_caller_credentials: !config.integrated.enabled,
+        forward_caller_credentials: config.routing_mode != RoutingMode::Integrated,
         config: Arc::new(config),
         providers: Arc::new(providers),
         launcher_kind: None,
@@ -822,7 +1001,7 @@ async fn apply_config_change(
     };
     state.shared.replace(new_state.clone());
     if let Some(addr) = state.context.proxy_addr.get()
-        && let Err(error) = update_runtime_integrated(*addr, new_state.config.integrated.enabled)
+        && let Err(error) = update_runtime_mode(*addr, new_state.config.routing_mode)
     {
         error!(error = %error, "failed to update daemon mode metadata");
     }
@@ -984,7 +1163,6 @@ async fn api_alias_delete(
 
 #[derive(Deserialize)]
 struct InterceptorPutBody {
-    enabled: Option<bool>,
     reject_sensitive: Option<bool>,
     provider: Option<String>,
     model: Option<String>,
@@ -1011,7 +1189,6 @@ async fn api_interceptor_put(
         );
     }
     let doc_body = InterceptorPutBody {
-        enabled: body.enabled,
         reject_sensitive: body.reject_sensitive,
         provider: body.provider.clone(),
         model: body.model.clone(),
@@ -1026,9 +1203,6 @@ async fn api_interceptor_put(
         &state,
         move |config| {
             let interceptor = &mut config.interceptor;
-            if let Some(enabled) = body.enabled {
-                interceptor.enabled = enabled;
-            }
             if let Some(reject_sensitive) = body.reject_sensitive {
                 interceptor.reject_sensitive = reject_sensitive;
             }
@@ -1064,9 +1238,6 @@ async fn api_interceptor_put(
         },
         Persist::Edit(Box::new(move |doc| {
             let table = ensure_table(doc, "interceptor")?;
-            if let Some(enabled) = doc_body.enabled {
-                table.insert("enabled", value(enabled));
-            }
             if let Some(reject_sensitive) = doc_body.reject_sensitive {
                 table.insert("reject_sensitive", value(reject_sensitive));
             }
@@ -1108,7 +1279,6 @@ async fn api_interceptor_put(
 
 #[derive(Clone, Deserialize)]
 struct IntegratedPutBody {
-    enabled: Option<bool>,
     sticky_ttl_secs: Option<u64>,
     sticky_capacity: Option<usize>,
     /// Empty string resets to the built-in integrated routing policy.
@@ -1118,9 +1288,6 @@ struct IntegratedPutBody {
 
 impl IntegratedPutBody {
     fn apply(&self, config: &mut Config) {
-        if let Some(enabled) = self.enabled {
-            config.integrated.enabled = enabled;
-        }
         if let Some(ttl) = self.sticky_ttl_secs {
             config.integrated.sticky_ttl_secs = ttl;
         }
@@ -1142,9 +1309,6 @@ impl IntegratedPutBody {
     fn apply_to_doc(&self, doc: &mut DocumentMut) -> Result<(), String> {
         let table = ensure_table(doc, "integrated")?;
         table.remove("respect_explicit_model");
-        if let Some(enabled) = self.enabled {
-            table.insert("enabled", value(enabled));
-        }
         if let Some(ttl) = self.sticky_ttl_secs {
             table.insert("sticky_ttl_secs", value(ttl as i64));
         }
@@ -1548,25 +1712,20 @@ async fn api_config_raw_put(
             "no config file was loaded at startup; the raw editor is unavailable",
         );
     }
-    let parsed: Config = match toml::from_str(&body.toml) {
+    let parsed = match parse_config(&body.toml, "admin editor") {
         Ok(parsed) => parsed,
-        Err(error) => return api_error(StatusCode::BAD_REQUEST, format!("invalid TOML: {error}")),
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error.to_string()),
     };
     apply_config_change(
         &state,
         move |config| {
-            // Launcher-selected runtime modes and the bound listeners are not
-            // part of the file; carry them over from the running config.
+            // Bound listeners and wire adapters are process state; carry them
+            // over while applying the routing mode and editable configuration.
             let model_routing = config.model_routing;
             let anthropic_mode = config.anthropic_mode;
-            let interceptor_forced = config.interceptor.enabled && !parsed.interceptor.enabled;
             *config = parsed;
             config.model_routing = model_routing;
             config.anthropic_mode = anthropic_mode;
-            if interceptor_forced && model_routing == ModelRoutingMode::Passthrough {
-                // --intercept launcher sessions keep interception on.
-                config.interceptor.enabled = true;
-            }
             Ok(())
         },
         Persist::Raw(body.toml),

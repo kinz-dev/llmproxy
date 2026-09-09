@@ -141,53 +141,34 @@ let launchData = null;
 
 function launchSelection() {
   const agent = document.querySelector('input[name="agent"]:checked')?.value || "codex";
-  const style = document.querySelector('input[name="style"]:checked')?.value || "launcher";
-  return { agent, style };
+  return { agent };
 }
 
 function renderLaunch() {
   if (!launchData) return;
-  const { agent, style } = launchSelection();
-  const key = `${agent}_${style}`;
-  $("#launch-command").textContent = launchData.commands[key] || "—";
+  const { agent } = launchSelection();
+  $("#launch-command").textContent = launchData.commands[agent] || "—";
+  $("#launch-mode").textContent = launchData.routing_mode;
 
   const hints = [];
-  if (style === "proxy") {
+  if (launchData.routing_mode === "proxy") {
     hints.push(
       `Routes every model request to ${launchData.default_provider}; only protocol and message structure are remapped.`
     );
     hints.push("No interceptor prompt, routing controls, or integrated provider tools are added.");
-  } else if (style === "launcher") {
-    const agentLabel = agent === "codex" ? "Codex" : agent === "claude" ? "Claude Code" : "Copilot CLI";
-    hints.push(
-      `Starts the proxy and ${agentLabel} together; ` +
-      "the agent keeps its own login and the proxy daemon stays running."
-    );
+  } else if (launchData.routing_mode === "intercept") {
     hints.push(
       launchData.interceptor_configured
-        ? `--intercept routes deterministic tasks to ${launchData.interceptor_model} for this session.`
-        : "Configure the interceptor provider and model under Routing first — the launcher requires them."
+        ? `The triage provider uses ${launchData.interceptor_model}; PASS continues through the agent's native provider.`
+        : "Configure the triage provider and model under Routing before launching."
     );
-  } else if (style === "integrated") {
+  } else {
     hints.push(
       launchData.integrated_targets
         ? `Model Auto routes through ${launchData.integrated_targets} configured integrated target${launchData.integrated_targets === 1 ? "" : "s"}; explicit models bypass integrated triage.`
         : "Add integrated targets before launching; integrated mode will reject an empty target map."
     );
     hints.push("Cross-provider calls use only credentials owned by llmproxy.");
-  } else if (agent === "codex") {
-    hints.push("Add the profile to ~/.codex/config.toml, then start Codex with the last line.");
-  } else if (agent === "claude") {
-    hints.push("Points Claude Code at this already-running proxy via environment variables.");
-  } else {
-    hints.push("Native Copilot CAPI routing is request-scoped; use the launcher method.");
-  }
-  if (style === "env") {
-    hints.push(
-      launchData.interceptor_enabled
-        ? "The interceptor is enabled, so eligible requests are answered locally."
-        : "The interceptor is currently disabled; requests follow normal model remapping."
-    );
   }
   $("#launch-hint").textContent = hints.join(" ");
 }
@@ -212,14 +193,7 @@ async function copyLaunchCommand() {
   }
 }
 
-/* Provider name → local/external class, cached from /api/models so the
-   per-provider stats table can reuse the locality colors. */
-let providerClasses = {};
-
 function renderRouting(data) {
-  providerClasses = Object.fromEntries(
-    data.providers.map((provider) => [provider.name, provider.class])
-  );
   const list = $("#provider-list");
   list.replaceChildren();
   for (const provider of data.providers) {
@@ -230,7 +204,6 @@ function renderRouting(data) {
     list.append(
       el("li", { class: "provider-item" }, [
         el("span", { class: "provider-name", text: provider.name }),
-        el("span", { class: `badge badge-${provider.class}`, text: provider.class }),
         provider.is_default ? el("span", { class: "badge badge-neutral", text: "default" }) : null,
         provider.is_interceptor ? el("span", { class: "badge badge-neutral", text: "interceptor" }) : null,
         el("span", { class: "provider-url", text: provider.base_url }),
@@ -278,7 +251,7 @@ function setLatencyRow(barId, figuresId, entry, maxP99) {
     return;
   }
   bar.classList.remove("hidden");
-  // sqrt scale keeps fast local bars visible next to slow external ones.
+  // A square-root scale keeps fast providers visible next to slower ones.
   const pos = (v) => Math.sqrt(Math.min(v, maxP99) / maxP99) * 100;
   const left = pos(entry.p50_ms);
   const right = Math.max(pos(entry.p99_ms), left + 1);
@@ -318,8 +291,8 @@ function renderStats(stats) {
   // Flow strip: stroke weight follows each branch's share of responses.
   const totalServed = served.local + served.external;
   $("#flow-in-count").textContent = fmtCount(requests.total);
-  $("#flow-local-count").textContent = `${fmtCount(served.local)} local`;
-  $("#flow-ext-count").textContent = `${fmtCount(served.external)} external`;
+  $("#flow-local-count").textContent = `${fmtCount(served.local)} private`;
+  $("#flow-ext-count").textContent = `${fmtCount(served.external)} remote`;
   const width = (n) => (totalServed ? 2 + 5 * (n / totalServed) : 2).toFixed(2);
   const flowLocal = $("#flow-local");
   const flowExt = $("#flow-ext");
@@ -336,7 +309,7 @@ function renderStats(stats) {
     const share = (served.local / totalServed) * 100;
     $("#split-local").style.width = share.toFixed(1) + "%";
     $("#split-caption").textContent =
-      `${share.toFixed(share >= 10 ? 0 : 1)}% of ${fmtCount(totalServed)} responses stayed local`;
+      `${share.toFixed(share >= 10 ? 0 : 1)}% of ${fmtCount(totalServed)} responses stayed on the private network`;
   } else {
     band.classList.add("is-empty");
     $("#split-local").style.width = "0%";
@@ -386,13 +359,11 @@ function renderProviderCalls(providers) {
   const total = names.reduce((sum, name) => sum + (providers[name].count || 0), 0);
   for (const name of names) {
     const entry = providers[name];
-    const cls = providerClasses[name];
     const share = total ? (entry.count / total) * 100 : 0;
     body.append(
       el("tr", {}, [
         el("td", { class: "mono" }, [
           `${name} `,
-          cls ? el("span", { class: `badge badge-${cls}`, text: cls }) : null,
         ]),
         el("td", { class: "mono", text: fmtCount(entry.count) }),
         el("td", { class: "mono", text: share.toFixed(share >= 10 ? 0 : 1) + "%" }),
@@ -569,11 +540,11 @@ function decisionGroup(entry) {
   if (entry.decision === "reject") return "reject";
   if (entry.error || ["error", "fallback", "invalid"].includes(entry.decision)) return "error";
   if (entry.decision === "bypass") return "bypass";
-  return entry.class || (entry.decision === "local" ? "local" : "external");
+  return entry.class || (entry.decision === "direct" ? "local" : "external");
 }
 
 function destinationLabel(entry) {
-  if (entry.decision === "reject") return "no external call";
+  if (entry.decision === "reject") return "no execution-provider call";
   if (!entry.provider && !entry.model) return "destination unresolved";
   return [entry.provider || "unknown", entry.model || "unknown"].join(" / ");
 }
@@ -634,7 +605,7 @@ function renderDecisions() {
       .join(" · ");
     const destinationMeta = [
       destinationLabel(entry),
-      entry.class,
+      entry.class && `${entry.class} network scope`,
       entry.reasoning_effort && `${entry.reasoning_effort} reasoning`,
       entry.target && `target ${entry.target}`,
     ]
@@ -643,7 +614,10 @@ function renderDecisions() {
     ledger.append(
       el("article", { class: `decision-card decision-${group}` }, [
         el("div", { class: "decision-card-top" }, [
-          el("span", { class: `decision-badge decision-badge-${group} mono`, text: entry.decision }),
+          el("span", {
+            class: `decision-badge decision-badge-${group} mono`,
+            text: entry.decision === "direct" ? "triage answer" : entry.decision,
+          }),
           el("span", { class: "decision-destination mono", text: destinationMeta }),
           el("time", { class: "decision-time mono", datetime: new Date(entry.ts_ms).toISOString(), text: time }),
         ]),
@@ -713,11 +687,7 @@ async function loadMonitor() {
     proxyAddr = overview.proxy_addr || overview.listen_addr;
     if (catalogLoaded) renderCatalog();
     $("#meta-proxy-addr").textContent = proxyAddr;
-    $("#meta-interceptor").textContent = overview.interceptor.enabled
-      ? `interceptor on · ${overview.interceptor.model}`
-      : overview.interceptor.reject_sensitive
-        ? `sensitive screening on · ${overview.interceptor.model}`
-        : "interceptor off";
+    $("#meta-routing-mode").textContent = `mode ${overview.routing_mode}`;
     $("#footer-version").textContent = `llmproxy ${overview.version}` +
       (overview.launcher ? ` · ${overview.launcher} session` : "");
     $("#footer-config").textContent = overview.config_path || "no config file (defaults)";
@@ -764,13 +734,11 @@ function renderCatalog() {
     const haystack = `${model.id} ${provider} ${target} ${source} ${model.proxy_tool || ""}`.toLowerCase();
     if (needle && !haystack.includes(needle)) continue;
     shown += 1;
-    const cls = providerClasses[provider];
     body.append(
       el("tr", {}, [
         el("td", { class: "mono", text: model.id }),
         el("td", { class: "mono" }, [
           provider ? `${provider} · ${target} ` : `${target} `,
-          cls ? el("span", { class: `badge badge-${cls}`, text: cls }) : null,
         ]),
         el("td", { class: "mono" }, [
           el("span", { class: "badge badge-neutral", text: source }),
@@ -828,9 +796,9 @@ const sysDrafts = { intercept: null, integrated: null };
 
 const MODE_EXPLAINERS = {
   intercept:
-    "One decision: answer simple deterministic requests locally, or PASS to forward the untouched request to normal external routing.",
+    "The triage provider executes deterministic requests above 80% confidence; otherwise it calls PASS for normal provider routing.",
   integrated:
-    "Three-way routing: answer simple requests locally, hand everything else to the provider route whose hint claims it, or ROUTE_DEFAULT when none fits.",
+    "Router-only mode: REJECT sensitive requests at 75% confidence, choose a provider route above 80%, or PASS to the default provider.",
 };
 
 const TEST_EXAMPLES = [
@@ -930,14 +898,7 @@ function setPromptMode(mode) {
 
 function updateSysStatus() {
   const interceptor = configData.interceptor;
-  const modeState =
-    promptMode === "integrated"
-      ? configData.integrated.enabled
-        ? "on"
-        : "off — launchers enable it per session"
-      : interceptor.enabled
-        ? "on"
-        : "off";
+  const modeState = configData.routing_mode === promptMode ? "active" : "inactive";
   $("#sys-status").textContent =
     `triage ${interceptor.provider} · ${interceptor.model} · ${promptMode} ${modeState}`;
 }
@@ -981,12 +942,12 @@ async function saveSystemPrompt(text, what) {
 
 function verdictLabel(verdict) {
   switch (verdict.decision) {
-    case "local":
-      return "→ local";
+    case "direct":
+      return "→ triage provider answer";
     case "reject":
       return "→ rejected (no action)";
     case "external":
-      return "→ external (PASS)";
+      return "→ normal routing (PASS)";
     case "default_route":
       return "→ default route";
     case "redirect":
@@ -1016,7 +977,7 @@ function renderTestResult(prompt, verdict) {
       : null,
     el("div", { class: "test-meta mono", text: meta }),
     verdict.detail
-      ? el("div", { class: "test-detail", text: `local model said: ${verdict.detail}` })
+      ? el("div", { class: "test-detail", text: `triage provider returned: ${verdict.detail}` })
       : null,
   ]);
   host.prepend(card);
@@ -1086,7 +1047,7 @@ async function runRevision() {
     $("#revise-undo").hidden = false;
     updateSysDirty();
     $("#sys-dirty").textContent =
-      "revised by the local model — review the text, then press Save to persist";
+      "revised by the triage provider — review the text, then press Save to persist";
     toast("Revision ready — review the editor, then save.");
   } catch (error) {
     toast("Revision failed.", "error", error.message);
@@ -1162,7 +1123,7 @@ function renderAliasEditor() {
 
 function renderInterceptorForm() {
   const interceptor = configData.interceptor;
-  $("#int-enabled").checked = interceptor.enabled;
+  $("#routing-mode").value = configData.routing_mode;
   $("#int-reject-sensitive").checked = interceptor.reject_sensitive;
   providerOptions($("#int-provider"), interceptor.provider, false);
   $("#int-model").value = interceptor.model;
@@ -1227,7 +1188,6 @@ function appendIntegratedTargetRow(name, target) {
 
 function renderIntegratedForm() {
   const integrated = configData.integrated;
-  $("#integrated-enabled").checked = integrated.enabled;
   $("#integrated-ttl").value = integrated.sticky_ttl_secs;
   $("#integrated-capacity").value = integrated.sticky_capacity;
   const tbody = $("#integrated-targets tbody");
@@ -1251,17 +1211,20 @@ function renderIntegratedForm() {
 
 function collectIntegratedTargets() {
   const targets = {};
+  const canonicalNames = new Set();
   for (const row of document.querySelectorAll("#integrated-targets tbody tr:not(.integrated-empty)")) {
     const name = row.querySelector(".target-name").value.trim();
     const provider = row.querySelector(".target-provider").value;
     const model = row.querySelector(".target-model").value.trim();
     const reasoningEffort = row.querySelector(".target-effort").value;
     const hint = row.querySelector(".target-hint").value.trim();
-    if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || name === "PASS" || name === "ROUTE_DEFAULT") {
+    const canonicalName = name.replaceAll("-", "_").toUpperCase();
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || ["PASS", "REJECT", "ROUTE_DEFAULT"].includes(canonicalName)) {
       throw new Error(`${name || "target"}: use a non-reserved 1-64 character tool name containing letters, digits, _, or -`);
     }
     if (!provider || !model || !hint || hint.includes("\n")) throw new Error(`${name}: provider, model, and one-line hint are required`);
-    if (targets[name]) throw new Error(`duplicate integrated target ${name}`);
+    if (canonicalNames.has(canonicalName)) throw new Error(`duplicate integrated target ${name} after normalization`);
+    canonicalNames.add(canonicalName);
     targets[name] = { provider, model, reasoning_effort: reasoningEffort || null, hint };
   }
   return targets;
@@ -1330,7 +1293,6 @@ function renderProviderEditors() {
         : null;
     const summary = el("summary", { class: "provider-summary" }, [
       el("span", { class: "provider-name mono", text: name }),
-      el("span", { class: `badge badge-${provider.class}`, text: provider.class }),
       provider.is_default ? el("span", { class: "badge badge-neutral", text: "default" }) : null,
       provider.from_upstream_section ? el("span", { class: "badge badge-neutral", text: "[upstream]" }) : null,
       provider.reasoning_effort ? el("span", { class: "badge badge-neutral", text: `reasoning ${provider.reasoning_effort}` }) : null,
@@ -1493,10 +1455,31 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!document.hidden) pollStats();
   });
 
-  for (const radio of document.querySelectorAll('#agent-choice input, #style-choice input')) {
+  for (const radio of document.querySelectorAll('#agent-choice input')) {
     radio.addEventListener("change", renderLaunch);
   }
   $("#copy-launch").addEventListener("click", copyLaunchCommand);
+  $("#restart-proxy").addEventListener("click", async () => {
+    if (!window.confirm("Restart the managed llmproxy instance now? Active streams will disconnect.")) return;
+    try {
+      await apiSend("/api/restart", "POST", {});
+      toast("Restart scheduled. This page will reconnect shortly.", "warn");
+    } catch (error) {
+      toast("Restart could not be scheduled.", "error", error.message);
+    }
+  });
+
+  $("#routing-mode-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      const result = await apiSend("/api/routing-mode", "PUT", { mode: $("#routing-mode").value });
+      applyToast(result, "Routing mode");
+      refreshFromResult(result);
+      loadMonitor();
+    } catch (error) {
+      toast("Routing mode was not saved.", "error", error.message);
+    }
+  });
 
   $("#reset-stats").addEventListener("click", async () => {
     try {
@@ -1575,7 +1558,6 @@ document.addEventListener("DOMContentLoaded", () => {
   $("#interceptor-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const body = {
-      enabled: $("#int-enabled").checked,
       reject_sensitive: $("#int-reject-sensitive").checked,
       provider: $("#int-provider").value,
       model: $("#int-model").value.trim(),
@@ -1615,7 +1597,6 @@ document.addEventListener("DOMContentLoaded", () => {
     event.preventDefault();
     try {
       const result = await apiSend("/api/integrated", "PUT", {
-        enabled: $("#integrated-enabled").checked,
         sticky_ttl_secs: Number($("#integrated-ttl").value),
         sticky_capacity: Number($("#integrated-capacity").value),
         targets: collectIntegratedTargets(),

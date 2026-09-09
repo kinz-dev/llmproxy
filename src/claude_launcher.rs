@@ -12,7 +12,8 @@ use tracing::info;
 use super::Cli;
 use crate::agent_launcher::{
     LauncherKind, LauncherMode, LauncherSession, configure_proxy_process, contains_arg, home_dir,
-    non_empty_env_value, prepend_args, require_loopback, with_integrated_auto_model,
+    non_empty_env_value, prepend_args, require_loopback, resolve_agent_executable,
+    with_integrated_auto_model,
 };
 
 const ANTHROPIC_API_BASE_URL: &str = "https://api.anthropic.com";
@@ -67,11 +68,13 @@ impl ClaudeLaunch {
             .clone()
             .or_else(|| env::var_os("LLMPROXY_CLAUDE_BIN").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("claude"));
+        let claude_bin =
+            resolve_agent_executable("Claude", claude_bin, "--claude-bin or LLMPROXY_CLAUDE_BIN")?;
         let upstream_base_url = if mode == LauncherMode::Intercept {
             reject_third_party_provider_env()?;
             detect_auth_method(&claude_bin).await?;
             let upstream_base_url = cli
-                .upstream
+                .default_provider_url
                 .clone()
                 .or_else(|| non_empty_env_value("ANTHROPIC_BASE_URL"))
                 .unwrap_or_else(|| ANTHROPIC_API_BASE_URL.to_string());
@@ -170,7 +173,7 @@ fn validate_auth_status(status: &ClaudeAuthStatus) -> Result<()> {
     }
     if status.api_provider != "firstParty" {
         bail!(
-            "Claude provider {:?} is not supported by --intercept --claude; use first-party Anthropic authentication",
+            "Claude provider {:?} is not supported by intercept-mode launchers; use first-party Anthropic authentication",
             status.api_provider
         );
     }
@@ -187,7 +190,7 @@ fn reject_third_party_provider_env() -> Result<()> {
         "CLAUDE_CODE_USE_FOUNDRY",
     ] {
         if env_truthy(name) {
-            bail!("{name} is not supported by --intercept --claude");
+            bail!("{name} is not supported by intercept-mode launchers");
         }
     }
     Ok(())

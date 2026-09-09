@@ -32,6 +32,47 @@ fn non_loopback_admin_listen_address_is_rejected() {
 }
 
 #[test]
+fn loopback_host_check_accepts_only_literal_loopback_ip_port() {
+    assert!(loopback_host_matches("127.0.0.1:11180", 11180));
+    assert!(loopback_host_matches("[::1]:11180", 11180));
+    // Wrong port.
+    assert!(!loopback_host_matches("127.0.0.1:9999", 11180));
+    // DNS rebinding: attacker hostname (even one resolving to loopback) fails
+    // because we require a literal IP, not a name.
+    assert!(!loopback_host_matches("attacker.com:11180", 11180));
+    assert!(!loopback_host_matches("localhost:11180", 11180));
+    // Non-loopback literal.
+    assert!(!loopback_host_matches("10.0.0.5:11180", 11180));
+    // Missing port / malformed.
+    assert!(!loopback_host_matches("127.0.0.1", 11180));
+    assert!(!loopback_host_matches("127.0.0.1:notaport", 11180));
+}
+
+#[test]
+fn same_origin_check_allows_only_own_loopback_origin() {
+    assert!(is_same_loopback_origin("http://127.0.0.1:11180", 11180));
+    assert!(is_same_loopback_origin("http://[::1]:11180", 11180));
+    assert!(!is_same_loopback_origin("http://attacker.com:11180", 11180));
+    assert!(!is_same_loopback_origin("https://127.0.0.1:11180", 11180));
+    assert!(!is_same_loopback_origin("http://127.0.0.1:2222", 11180));
+    assert!(!is_same_loopback_origin("null", 11180));
+}
+
+#[test]
+fn json_content_type_check_is_strict_on_charset() {
+    assert!(is_json_content_type(Some("application/json")));
+    assert!(is_json_content_type(Some(
+        "application/json; charset=utf-8"
+    )));
+    assert!(is_json_content_type(Some("APPLICATION/JSON")));
+    assert!(!is_json_content_type(Some("text/plain")));
+    assert!(!is_json_content_type(Some(
+        "application/x-www-form-urlencoded"
+    )));
+    assert!(!is_json_content_type(None));
+}
+
+#[test]
 fn ui_paths_are_sanitized() {
     assert_eq!(sanitize_ui_path("/").as_deref(), Some("index.html"));
     assert_eq!(sanitize_ui_path("/app.js").as_deref(), Some("app.js"));
@@ -97,14 +138,13 @@ fn alias_doc_edits_preserve_comments() {
 #[test]
 fn ensure_table_creates_missing_sections() {
     let mut doc: DocumentMut = "listen_addr = \"127.0.0.1:4000\"\n".parse().unwrap();
-    ensure_table(&mut doc, "interceptor")
-        .unwrap()
-        .insert("enabled", value(true));
+    doc.insert("routing_mode", value("intercept"));
+    ensure_table(&mut doc, "interceptor").unwrap();
     let rendered = doc.to_string();
     assert!(rendered.contains("[interceptor]"));
-    assert!(rendered.contains("enabled = true"));
+    assert!(rendered.contains("routing_mode = \"intercept\""));
     let config: Config = toml::from_str(&rendered).unwrap();
-    assert!(config.interceptor.enabled);
+    assert_eq!(config.routing_mode, crate::RoutingMode::Intercept);
 }
 
 #[test]
@@ -187,7 +227,6 @@ fn integrated_doc_edit_writes_valid_target_tables() {
             .parse()
             .unwrap();
     let body = IntegratedPutBody {
-        enabled: Some(true),
         sticky_ttl_secs: Some(900),
         sticky_capacity: Some(64),
         instructions: Some("Route GUI work to the visual provider.".to_string()),
@@ -209,8 +248,6 @@ fn integrated_doc_edit_writes_valid_target_tables() {
     assert!(rendered.contains("[integrated.targets.backend]"));
     assert!(rendered.contains("reasoning_effort = \"max\""));
     let config: Config = toml::from_str(&rendered).unwrap();
-    assert!(!config.interceptor.enabled);
-    assert!(config.integrated.enabled);
     assert_eq!(config.integrated.targets["backend"].provider, "openai");
     assert_eq!(
         config.integrated.targets["backend"].reasoning_effort,

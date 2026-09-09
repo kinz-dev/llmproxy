@@ -17,8 +17,8 @@ use tracing::{error, info, trace};
 
 use crate::is_event_stream_content_type;
 
-/// Whether a response was produced by a local model (loopback/LAN provider or
-/// the interceptor) or forwarded to an external provider.
+/// Derived provider network scope used for privacy checks and aggregate
+/// telemetry. This is not a provider type or a routing preference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteClass {
     Local,
@@ -245,17 +245,18 @@ impl ProxyStats {
         self.intercept_bypass.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The interceptor answered locally: counts as a local serve and records
-    /// the local completion latency plus exact usage when present.
+    /// The triage provider answered directly. Network scope is derived from
+    /// that provider rather than assuming every interceptor is local.
     pub(crate) fn record_intercept_local(
         &self,
+        class: RouteClass,
         provider: &str,
         frontend: &str,
         elapsed: Duration,
         usage: TokenUsage,
     ) {
         self.intercept_local.fetch_add(1, Ordering::Relaxed);
-        self.record_served(RouteClass::Local, provider, frontend, elapsed);
+        self.record_served(class, provider, frontend, elapsed);
         self.record_tokens_saved(usage.input_tokens, usage.output_tokens, usage.estimated);
     }
 

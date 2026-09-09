@@ -34,41 +34,35 @@ const PASS_TOOL_NAME: &str = "PASS";
 const ROUTE_DEFAULT_TOOL_NAME: &str = "ROUTE_DEFAULT";
 const REJECT_TOOL_NAME: &str = "REJECT";
 const GENERIC_REJECTION_REASON: &str = "other sensitive information";
-const SENSITIVE_REJECTION_INSTRUCTIONS: &str = r#"Sensitive-data rejection is enabled and takes precedence over every local answer and routing choice. If the original request contains an actual credential, secret, personally identifiable information, or other sensitive information, call REJECT alone. Select only the matching safe reason category; never copy, quote, transform, or summarize the sensitive value. Do not answer the request, call a caller tool, or select any provider route."#;
+const SENSITIVE_REJECTION_INSTRUCTIONS: &str = r#"Sensitive-data rejection is enabled and takes precedence over every execution or routing choice. Estimate the likelihood that the original request contains an actual credential, secret, personally identifiable information, or other sensitive information. At 75% likelihood or higher, call REJECT alone. Select only the matching safe reason category; never copy, quote, transform, or summarize the sensitive value. Below 75%, continue with the normal routing policy. Do not answer the request, call a caller tool, or select any provider route when the rejection threshold is met."#;
 const LOCAL_ROUTE_HEADER: &str = "x-llmproxy-route";
 const CODEX_TURN_METADATA_KEY: &str = "x-codex-turn-metadata";
 const CODEX_REQUEST_KIND_KEY: &str = "request_kind";
 const CODEX_AGENT_TURN_KIND: &str = "turn";
 const CODEX_COMPACTION_KIND: &str = "compaction";
 const COMPACTION_TRIGGER_TYPE: &str = "compaction_trigger";
-const DEFAULT_INSTRUCTIONS: &str = r#"You are the local fast path for agent requests. Decide: handle this request locally, or call PASS to route it to the main model.
+const DEFAULT_INSTRUCTIONS: &str = r#"You are the triage and deterministic-execution provider for agent requests. Estimate whether you can complete the request correctly and deterministically, or must call PASS for normal provider routing.
 
-Handle it locally only when ALL of these hold:
+Complete the request yourself only when the likelihood of correct deterministic execution is greater than 80%, based on ALL of these signals:
 - The request is explicit and unambiguous, and everything needed is already in this conversation.
 - The task is deterministic or routine: formatting, extraction, classification, validation, a simple transformation of supplied content, or a direct operational command.
 - It needs at most one tool call, and the tool and its exact arguments are obvious without discovery.
-- One short response completes it, and you are certain it is correct.
+- One short response completes it without research, planning, comparison, or judgment.
 
-Otherwise call PASS with a brief reason naming the policy condition that matched — including whenever the task needs research, current information, planning, debugging, comparison, recommendation, judgment, or could have financial, legal, medical, security, or operational consequences. When unsure, PASS.
+Otherwise call PASS with a brief reason naming the observable condition that reduced deterministic-execution likelihood — including whenever the task needs research, current information, planning, debugging, comparison, recommendation, judgment, or could have financial, legal, medical, security, or operational consequences. Treat exactly 80% as insufficient. When unsure, PASS.
 
-Never ask clarifying questions or answer partially. The reason is concise audit metadata, not hidden reasoning, and must appear only in the routing tool arguments. Emit only the PASS call, or exactly the assistant message or single tool call that completes the request."#;
+Never ask clarifying questions or answer partially. The reason is concise audit metadata, not hidden reasoning, and must state the estimated likelihood plus the observable condition that matched. It must appear only in the routing tool arguments. Emit only the PASS call, or exactly the assistant message or single tool call that completes the request."#;
 
 /// Base routing policy used instead of [`DEFAULT_INSTRUCTIONS`] when
 /// integrated mode is on and the operator has not overridden the prompt.
 /// The concrete provider routes and their hints are appended dynamically.
-const DEFAULT_INTEGRATED_INSTRUCTIONS: &str = r#"You are the routing tier for agent requests. Give every request exactly one outcome: answer it locally, or hand it to the provider route that owns its kind of work.
+const DEFAULT_INTEGRATED_INSTRUCTIONS: &str = r#"You are the provider-routing tier for agent requests. You route only: never answer the request yourself and never call a caller-supplied tool.
 
-Answer locally only when ALL of these hold:
-- The request is explicit and unambiguous, and everything needed is already in this conversation.
-- The task is deterministic or routine: formatting, extraction, classification, validation, a simple transformation of supplied content, or a direct operational command.
-- It needs at most one tool call, and the tool and its exact arguments are obvious without discovery.
-- One short response completes it, and you are certain it is correct.
+Estimate the ownership likelihood for every available provider route. Call exactly one route when its likelihood is greater than 80%. Route hints define ownership: a deterministic route may claim explicit routine work, a specialized route may claim its stated domain, and a hint marked as the default may claim work that no more-specific route owns. Treat exactly 80% as insufficient. Call PASS when no configured route exceeds the threshold.
 
-Everything else is routed, never answered locally: research, planning, investigation, design, implementation, debugging, comparison, recommendation, judgment, and anything with financial, legal, medical, security, or operational consequences. Call exactly one provider route from the list below, choosing the route whose hint matches the request; a route hinted as the default owns everything no other route clearly claims. Include a brief reason naming the policy condition or route hint that matched. Call ROUTE_DEFAULT only when no route fits.
+Complex online research, current-information investigation, and source-backed multi-step analysis must use the matching dedicated research route at max or xhigh reasoning effort when one is configured. Never execute that work in triage or send it to a weaker general route.
 
-Complex online research, current-information investigation, and source-backed multi-step analysis must use the matching dedicated research route at max or xhigh reasoning effort when one is configured. Never answer that work locally or send it to a weaker general route.
-
-Never ask clarifying questions or answer partially. The reason is concise audit metadata, not hidden reasoning, and must appear only in the routing tool arguments. Emit only one provider route call, the ROUTE_DEFAULT call, or exactly the assistant message or single tool call that completes the request."#;
+Never ask clarifying questions or answer partially. Include a brief reason stating the estimated likelihood and observable route hint or threshold condition that matched; do not provide hidden reasoning. Emit exactly one configured provider route call or PASS."#;
 
 /// The intercept-mode policy: the operator override, or the built-in default
 /// when the override is empty or untouched.
@@ -102,17 +96,17 @@ pub(crate) fn integrated_instructions_are_default(integrated: &IntegratedConfig)
 #[serde(default)]
 pub(crate) struct InterceptorConfig {
     pub(crate) enabled: bool,
-    /// Fail-closed local screening before any normal/local routing outcome.
+    /// Fail-closed private-network screening before any execution or route.
     pub(crate) reject_sensitive: bool,
     pub(crate) provider: String,
     pub(crate) model: String,
     pub(crate) timeout_ms: u64,
     pub(crate) fallback_on_error: bool,
     pub(crate) instructions: String,
-    /// Sampling temperature for the local triage request.
+    /// Sampling temperature for the triage request.
     pub(crate) temperature: f64,
-    /// Completion cap for the local triage request; 0 leaves the client's
-    /// own limits untouched. Capped completions fall back to external
+    /// Completion cap for the triage request; 0 leaves the client's own
+    /// limits untouched. Capped completions fall back to normal provider
     /// routing instead of serving a clipped answer.
     pub(crate) max_tokens: u64,
     pub(crate) parallel_tool_calls: bool,
@@ -281,8 +275,24 @@ struct CompletionClassification {
 }
 
 pub(crate) enum InterceptionOutcome {
-    Continue(RoutingAuditDraft),
+    Continue(Box<RoutingAuditDraft>),
     Respond(Response),
+}
+
+struct ClientResponseContext {
+    protocol: InterceptorProtocol,
+    model: Option<String>,
+    streaming: bool,
+}
+
+impl ClientResponseContext {
+    fn new(protocol: InterceptorProtocol, model: Option<String>, streaming: bool) -> Self {
+        Self {
+            protocol,
+            model,
+            streaming,
+        }
+    }
 }
 
 pub(crate) struct RoutingAuditDraft {
@@ -420,9 +430,17 @@ pub(crate) fn validate_config(
     if config.provider.trim().is_empty() {
         bail!("interceptor.provider cannot be empty when the interceptor is enabled");
     }
-    if !providers.contains_key(&config.provider) {
+    let Some(provider) = providers.get(&config.provider) else {
         bail!(
             "interceptor references unknown provider {:?}",
+            config.provider
+        );
+    };
+    if config.reject_sensitive
+        && crate::stats::route_class_for_base_url(&provider.base_url) == RouteClass::External
+    {
+        bail!(
+            "interceptor.reject_sensitive requires a loopback or private-network triage provider; provider {:?} is remote and would receive the prompt before REJECT",
             config.provider
         );
     }
@@ -458,6 +476,7 @@ pub(crate) fn validate_integrated_config(
     if config.sticky_capacity == 0 {
         bail!("integrated.sticky_capacity must be greater than zero");
     }
+    let mut canonical_names = std::collections::HashSet::new();
     for (name, provider) in providers {
         // Borrowed-OAuth providers carry the local CLI's login instead of a
         // proxy-owned API key, so they are exempt from the key requirement.
@@ -468,15 +487,21 @@ pub(crate) fn validate_integrated_config(
             && !borrows_oauth
         {
             bail!(
-                "integrated external provider {name:?} requires proxy-owned api_key or api_key_env (or auth = \"codex-oauth\"/\"claude-oauth\")"
+                "integrated remote provider {name:?} requires proxy-owned api_key or api_key_env (or auth = \"codex-oauth\"/\"claude-oauth\")"
             );
         }
     }
     for (name, target) in &config.targets {
-        if !valid_target_name(name) || is_default_route_name(name) {
+        if !valid_target_name(name)
+            || is_default_route_name(name)
+            || canonical_target_name(name) == REJECT_TOOL_NAME
+        {
             bail!(
                 "integrated target {name:?} must be a non-reserved 1-64 character tool name containing only letters, digits, _, or -"
             );
+        }
+        if !canonical_names.insert(canonical_target_name(name)) {
+            bail!("integrated target {name:?} duplicates another target after normalization");
         }
         let Some(provider) = providers.get(&target.provider) else {
             bail!(
@@ -635,9 +660,9 @@ pub(crate) async fn maybe_intercept(
     if !config.enabled && !integrated && !config.reject_sensitive {
         audit.set_decision(
             "bypass",
-            "An explicit model bypassed integrated triage and standalone interception is disabled.",
+            "An explicit model bypassed integrated triage; intercept mode is inactive.",
         );
-        return InterceptionOutcome::Continue(audit);
+        return InterceptionOutcome::Continue(Box::new(audit));
     }
 
     if let Some(request_kind) = policy.bypass_kind() {
@@ -645,15 +670,15 @@ pub(crate) async fn maybe_intercept(
             request_id,
             protocol = protocol.as_str(),
             request_kind,
-            route = "external",
-            "local interceptor bypassed control request"
+            route = "normal_provider",
+            "triage bypassed control request"
         );
         proxy_stats().record_intercept_bypass();
         audit.set_decision(
             "bypass",
-            format!("Native control request kind {request_kind:?} requires external passthrough."),
+            format!("Native control request kind {request_kind:?} requires provider passthrough."),
         );
-        return InterceptionOutcome::Continue(audit);
+        return InterceptionOutcome::Continue(Box::new(audit));
     }
     proxy_stats().record_intercept_attempt();
 
@@ -686,9 +711,7 @@ pub(crate) async fn maybe_intercept(
             state,
             &target,
             local_chat_request,
-            protocol,
-            client_model,
-            client_streaming,
+            ClientResponseContext::new(protocol, client_model, client_streaming),
             Some(key),
             audit,
         )
@@ -711,7 +734,7 @@ pub(crate) async fn maybe_intercept(
                 request_id,
                 protocol = protocol.as_str(),
                 error = %message,
-                "local interceptor could not prepare request"
+                "triage could not prepare request"
             );
             return fallback_or_error(
                 config,
@@ -719,9 +742,7 @@ pub(crate) async fn maybe_intercept(
                 &request_id,
                 message,
                 audit,
-                protocol,
-                client_model,
-                client_streaming,
+                ClientResponseContext::new(protocol, client_model, client_streaming),
             );
         }
     };
@@ -730,6 +751,7 @@ pub(crate) async fn maybe_intercept(
         .providers
         .get(&config.provider)
         .expect("validated interceptor provider missing from runtime state");
+    let triage_class = route_class_for_base_url(&provider.config.base_url);
     let meta = UpstreamRequestMeta::new(
         &provider.name,
         incoming_headers,
@@ -749,7 +771,7 @@ pub(crate) async fn maybe_intercept(
     audit.audit.triage_model = Some(config.model.clone());
 
     if !config.reject_sensitive {
-        log_request_value(RouteClass::Local, &provider.name, &local_request);
+        log_request_value(triage_class, &provider.name, &local_request);
     }
     let started_at = std::time::Instant::now();
     let result = tokio::time::timeout(
@@ -763,7 +785,7 @@ pub(crate) async fn maybe_intercept(
         Ok(Err(error)) => {
             audit.audit.triage_elapsed_ms =
                 Some(started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
-            log_response_text(RouteClass::Local, &provider.name, format!("error: {error}"));
+            log_response_text(triage_class, &provider.name, format!("error: {error}"));
             crate::stats::error_log().record(&provider.name, "interceptor", error.to_string());
             error!(
                 request_id = %meta.request_id,
@@ -772,7 +794,7 @@ pub(crate) async fn maybe_intercept(
                 elapsed_ms = started_at.elapsed().as_millis(),
                 error = %error,
                 fallback = config.fallback_on_error,
-                "local interceptor request failed"
+                "triage provider request failed"
             );
             audit.set_error(error.to_string());
             if config.reject_sensitive {
@@ -782,23 +804,21 @@ pub(crate) async fn maybe_intercept(
                     &meta.request_id,
                     error.to_string(),
                     audit,
-                    protocol,
-                    client_model,
-                    client_streaming,
+                    ClientResponseContext::new(protocol, client_model, client_streaming),
                 );
             }
             return if config.fallback_on_error {
                 proxy_stats().record_intercept_fallback();
                 audit.set_decision(
                     "fallback",
-                    "The local triage request failed and fallback_on_error selected normal routing.",
+                    "The triage provider request failed and fallback_on_error selected normal routing.",
                 );
-                InterceptionOutcome::Continue(audit)
+                InterceptionOutcome::Continue(Box::new(audit))
             } else {
                 proxy_stats().record_intercept_error();
                 audit.set_decision(
                     "error",
-                    "The local triage request failed and fallback_on_error is disabled.",
+                    "The triage provider request failed and fallback_on_error is disabled.",
                 );
                 audit.record();
                 InterceptionOutcome::Respond(upstream_error_response(&error))
@@ -807,8 +827,8 @@ pub(crate) async fn maybe_intercept(
         Err(_) => {
             audit.audit.triage_elapsed_ms =
                 Some(started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
-            let message = format!("local interceptor timed out after {}ms", config.timeout_ms);
-            log_response_text(RouteClass::Local, &provider.name, message.as_str());
+            let message = format!("triage provider timed out after {}ms", config.timeout_ms);
+            log_response_text(triage_class, &provider.name, message.as_str());
             error!(
                 request_id = %meta.request_id,
                 protocol = protocol.as_str(),
@@ -823,9 +843,7 @@ pub(crate) async fn maybe_intercept(
                 &meta.request_id,
                 message,
                 audit,
-                protocol,
-                client_model,
-                client_streaming,
+                ClientResponseContext::new(protocol, client_model, client_streaming),
             );
         }
     };
@@ -838,11 +856,11 @@ pub(crate) async fn maybe_intercept(
     audit.set_triage(provider, &config.model, local_elapsed);
     proxy_stats().record_model_usage(&provider.name, &config.model, local_elapsed, local_usage);
     if !config.reject_sensitive {
-        log_response_value(RouteClass::Local, &provider.name, &completion);
+        log_response_value(triage_class, &provider.name, &completion);
     }
 
     if first_chat_choice_message(&completion).is_none() {
-        let message = "local interceptor returned no assistant message".to_string();
+        let message = "triage provider returned no assistant message".to_string();
         error!(
             request_id = %meta.request_id,
             protocol = protocol.as_str(),
@@ -856,17 +874,15 @@ pub(crate) async fn maybe_intercept(
             &meta.request_id,
             message,
             audit,
-            protocol,
-            client_model,
-            client_streaming,
+            ClientResponseContext::new(protocol, client_model, client_streaming),
         );
     }
 
     if completion_truncated(&completion) {
-        // A clipped answer must never reach the agent; the cap doubles as a
-        // "this was not a short local task" signal.
+        // A clipped answer must never reach the agent; the cap also signals
+        // that this was not a short deterministic task.
         let message = format!(
-            "local completion hit the interceptor max_tokens cap ({})",
+            "triage completion hit the interceptor max_tokens cap ({})",
             config.max_tokens
         );
         error!(
@@ -882,9 +898,7 @@ pub(crate) async fn maybe_intercept(
             &meta.request_id,
             message,
             audit,
-            protocol,
-            client_model,
-            client_streaming,
+            ClientResponseContext::new(protocol, client_model, client_streaming),
         );
     }
 
@@ -894,8 +908,10 @@ pub(crate) async fn maybe_intercept(
     } else {
         &no_targets
     };
-    let classification =
-        classify_completion_details(&completion, decision_targets, config.reject_sensitive);
+    let classification = enforce_router_only(
+        classify_completion_details(&completion, decision_targets, config.reject_sensitive),
+        integrated,
+    );
     let reason = classification.reason.clone().unwrap_or_else(|| {
         match classification.decision {
             CompletionDecision::Local =>
@@ -938,11 +954,11 @@ pub(crate) async fn maybe_intercept(
                 protocol = protocol.as_str(),
                 provider = %provider.name,
                 elapsed_ms = local_elapsed.as_millis(),
-                route = "external",
-                "local interceptor selected route"
+                route = "normal_provider",
+                "triage selected normal provider routing"
             );
             proxy_stats().record_intercept_pass();
-            InterceptionOutcome::Continue(audit)
+            InterceptionOutcome::Continue(Box::new(audit))
         }
         CompletionDecision::Redirect(target) => {
             let target_config = state
@@ -966,9 +982,7 @@ pub(crate) async fn maybe_intercept(
                 state,
                 &target,
                 redirect_request,
-                protocol,
-                client_model,
-                client_streaming,
+                ClientResponseContext::new(protocol, client_model, client_streaming),
                 conversation_key,
                 audit,
             )
@@ -976,7 +990,7 @@ pub(crate) async fn maybe_intercept(
         }
         CompletionDecision::InvalidControl => {
             audit.set_decision("invalid", reason);
-            let message = "local interceptor mixed routing control with other output".to_string();
+            let message = "triage provider mixed routing control with other output".to_string();
             error!(
                 request_id = %meta.request_id,
                 protocol = protocol.as_str(),
@@ -990,22 +1004,21 @@ pub(crate) async fn maybe_intercept(
                 &meta.request_id,
                 message,
                 audit,
-                protocol,
-                client_model,
-                client_streaming,
+                ClientResponseContext::new(protocol, client_model, client_streaming),
             )
         }
         CompletionDecision::Local => {
-            audit.set_decision("local", reason);
+            audit.set_decision("direct", reason);
             info!(
                 request_id = %meta.request_id,
                 protocol = protocol.as_str(),
                 provider = %provider.name,
                 elapsed_ms = local_elapsed.as_millis(),
-                route = "local",
-                "local interceptor selected route"
+                route = "direct",
+                "triage provider answered directly"
             );
             proxy_stats().record_intercept_local(
+                route_class_for_base_url(&provider.config.base_url),
                 &provider.name,
                 protocol.as_str(),
                 local_elapsed,
@@ -1027,9 +1040,7 @@ async fn execute_integrated_redirect(
     state: &AppState,
     target_name: &str,
     chat_request: Value,
-    protocol: InterceptorProtocol,
-    client_model: Option<String>,
-    client_streaming: bool,
+    client: ClientResponseContext,
     conversation_key: Option<u64>,
     mut audit: RoutingAuditDraft,
 ) -> InterceptionOutcome {
@@ -1048,16 +1059,16 @@ async fn execute_integrated_redirect(
         provider = target.provider,
         model = target.model,
         reasoning_effort = target.reasoning_effort.map(crate::ReasoningEffort::as_str),
-        protocol = protocol.as_str(),
+        protocol = client.protocol.as_str(),
         "sending integrated route"
     );
     let response = proxy_integrated_chat(
         provider,
         chat_request,
         target,
-        protocol,
-        client_model,
-        client_streaming,
+        client.protocol,
+        client.model,
+        client.streaming,
         state.config.as_ref(),
     )
     .await;
@@ -1105,9 +1116,7 @@ fn fallback_or_error(
     request_id: &str,
     message: String,
     mut audit: RoutingAuditDraft,
-    protocol: InterceptorProtocol,
-    client_model: Option<String>,
-    client_streaming: bool,
+    client: ClientResponseContext,
 ) -> InterceptionOutcome {
     crate::stats::error_log().record(&config.provider, "interceptor", message.as_str());
     audit.set_error(message.clone());
@@ -1116,14 +1125,14 @@ fn fallback_or_error(
         audit.redact_prompt();
         audit.set_decision(
             "reject",
-            "Sensitive-data screening failed; fail-closed policy prevented external routing.",
+            "Sensitive-data screening failed; fail-closed policy prevented provider routing.",
         );
         audit.record();
         return InterceptionOutcome::Respond(render_rejection(
-            protocol,
+            client.protocol,
             "sensitive information that could not be screened safely",
-            client_model,
-            client_streaming,
+            client.model,
+            client.streaming,
             request_id,
         ));
     }
@@ -1132,16 +1141,16 @@ fn fallback_or_error(
         if audit.audit.decision == "pending" {
             audit.set_decision(
                 "fallback",
-                "Local triage could not produce a valid decision and fallback_on_error selected normal routing.",
+                "The triage provider could not produce a valid decision and fallback_on_error selected normal routing.",
             );
         }
-        InterceptionOutcome::Continue(audit)
+        InterceptionOutcome::Continue(Box::new(audit))
     } else {
         proxy_stats().record_intercept_error();
         if audit.audit.decision == "pending" {
             audit.set_decision(
                 "error",
-                "Local triage could not produce a valid decision and fallback_on_error is disabled.",
+                "The triage provider could not produce a valid decision and fallback_on_error is disabled.",
             );
         }
         audit.record();
@@ -1180,7 +1189,7 @@ pub(super) fn build_local_request(
     let integrated = integrated_routing_requested(&proxy_config.integrated, client_model);
     rewrite_request_roles(&mut request, role_map);
     let Some(object) = request.as_object_mut() else {
-        return Err("local interceptor request is not a JSON object".to_string());
+        return Err("triage request is not a JSON object".to_string());
     };
 
     object.insert("model".to_string(), Value::String(config.model.clone()));
@@ -1203,19 +1212,21 @@ pub(super) fn build_local_request(
         .entry("tools".to_string())
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
-        .ok_or_else(|| "local interceptor tools field is not an array".to_string())?;
+        .ok_or_else(|| "triage request tools field is not an array".to_string())?;
     if let Some(name) = tools
         .iter()
         .filter_map(tool_name)
-        .find(|name| is_default_route_name(name) || *name == REJECT_TOOL_NAME)
+        .find(|name| is_default_route_name(name) || canonical_target_name(name) == REJECT_TOOL_NAME)
     {
         return Err(format!("request already defines a tool named {name}"));
     }
     if integrated {
         for name in proxy_config.integrated.targets.keys() {
+            let canonical_name = canonical_target_name(name);
             if tools
                 .iter()
-                .any(|tool| tool_name(tool) == Some(name.as_str()))
+                .filter_map(tool_name)
+                .any(|tool| canonical_target_name(tool) == canonical_name)
             {
                 return Err(format!("request already defines a tool named {name}"));
             }
@@ -1261,7 +1272,7 @@ pub(super) fn build_local_request(
             ));
         }
         dynamic_instructions.push_str(
-            "\nCall exactly one provider route, or ROUTE_DEFAULT when no route fits. Include a brief audit reason in the call.",
+            "\nCall exactly one provider route when its ownership likelihood exceeds 80%; otherwise call PASS. Include the estimated likelihood and a brief observable audit reason in the call.",
         );
     }
     if config.reject_sensitive {
@@ -1269,7 +1280,7 @@ pub(super) fn build_local_request(
         dynamic_instructions.push_str(SENSITIVE_REJECTION_INSTRUCTIONS);
         if !config.enabled && !integrated {
             dynamic_instructions.push_str(
-                "\nThis request is rejection-screening only. When no sensitive data is present, call PASS with a brief reason. Never answer locally.",
+                "\nThis request is rejection-screening only. Below the rejection threshold, call PASS with a brief reason. Never answer directly.",
             );
         }
     }
@@ -1277,7 +1288,7 @@ pub(super) fn build_local_request(
         .entry("messages".to_string())
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
-        .ok_or_else(|| "local interceptor messages field is not an array".to_string())?;
+        .ok_or_else(|| "triage request messages field is not an array".to_string())?;
     messages.push(json!({
         "role": "system",
         "content": dynamic_instructions
@@ -1292,7 +1303,7 @@ fn reject_tool() -> Value {
         "type": "function",
         "function": {
             "name": REJECT_TOOL_NAME,
-            "description": "Stop before any local answer or provider route because the original request contains sensitive data. Never include the sensitive value.",
+            "description": "Stop before any direct answer or provider route because the original request contains sensitive data. Never include the sensitive value.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1316,13 +1327,13 @@ fn reject_tool() -> Value {
 fn default_route_tool(integrated: bool) -> Value {
     let (name, description) = if integrated {
         (
-            ROUTE_DEFAULT_TOOL_NAME,
-            "Continue this complete original request through normal model alias and default-provider routing. Call this function alone only when no configured provider route fits.",
+            PASS_TOOL_NAME,
+            "Continue this complete original request through normal model-alias and default-provider routing. Call this function alone when no configured provider route exceeds the routing threshold.",
         )
     } else {
         (
             PASS_TOOL_NAME,
-            "Route this complete original request to the external model. Call this function alone when the task should not be handled by the local model.",
+            "Continue this complete original request through normal provider routing. Call this function alone when deterministic execution confidence is not greater than 80%.",
         )
     };
     json!({
@@ -1336,7 +1347,7 @@ fn default_route_tool(integrated: bool) -> Value {
                     "reason": {
                         "type": "string",
                         "maxLength": 240,
-                        "description": "Briefly name the observable policy condition or route hint that matched. Do not provide chain-of-thought."
+                        "description": "Briefly state the estimated likelihood and observable policy condition or route hint that matched. Do not provide chain-of-thought."
                     }
                 },
                 "required": ["reason"],
@@ -1367,7 +1378,7 @@ fn redirect_tool(name: &str, target: &IntegratedTarget) -> Value {
                     "reason": {
                         "type": "string",
                         "maxLength": 240,
-                        "description": "Briefly name the observable policy condition or route hint that matched. Do not provide chain-of-thought."
+                        "description": "Briefly state the estimated likelihood and observable route hint that matched. Do not provide chain-of-thought."
                     }
                 },
                 "required": ["reason"],
@@ -1390,7 +1401,14 @@ pub(super) fn is_pass_tool(tool: &Value) -> bool {
 }
 
 fn is_default_route_name(name: &str) -> bool {
-    name == PASS_TOOL_NAME || name == ROUTE_DEFAULT_TOOL_NAME
+    matches!(
+        canonical_target_name(name).as_str(),
+        PASS_TOOL_NAME | ROUTE_DEFAULT_TOOL_NAME
+    )
+}
+
+fn canonical_target_name(name: &str) -> String {
+    name.trim().replace('-', "_").to_ascii_uppercase()
 }
 
 #[cfg(test)]
@@ -1485,6 +1503,22 @@ fn classification(
     CompletionClassification { decision, reason }
 }
 
+fn enforce_router_only(
+    result: CompletionClassification,
+    integrated: bool,
+) -> CompletionClassification {
+    if integrated && result.decision == CompletionDecision::Local {
+        return classification(
+            CompletionDecision::InvalidControl,
+            Some(
+                "Integrated triage returned an answer instead of selecting a provider route or PASS."
+                    .to_string(),
+            ),
+        );
+    }
+    result
+}
+
 fn control_tool_call_classification(
     call: &Value,
     targets: &BTreeMap<String, IntegratedTarget>,
@@ -1559,14 +1593,16 @@ fn control_decision(
     if is_default_route_name(name) {
         return Some(CompletionDecision::DefaultRoute);
     }
-    let canonical = name.replace('-', "_").to_ascii_uppercase();
+    let canonical = canonical_target_name(name);
     targets
-        .contains_key(&canonical)
-        .then_some(CompletionDecision::Redirect(canonical))
+        .keys()
+        .find(|target| canonical_target_name(target) == canonical)
+        .cloned()
+        .map(CompletionDecision::Redirect)
 }
 
 /// True when any choice stopped for length: the completion is clipped and
-/// must not be served as a local answer.
+/// must not be served as a direct answer.
 pub(super) fn completion_truncated(completion: &Value) -> bool {
     completion
         .get("choices")
@@ -1580,8 +1616,8 @@ pub(super) fn completion_truncated(completion: &Value) -> bool {
 
 /// Which routing policy a route test or revision exercises. Intercept tests
 /// force integrated off; integrated tests force it on with the configured
-/// targets, so routes can be exercised even while the saved config keeps
-/// integrated mode disabled (launchers enable it per session).
+/// targets, so either policy can be evaluated without changing the live
+/// instance mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteTestMode {
     Intercept,
@@ -1642,9 +1678,9 @@ pub(crate) async fn test_route(
     }
     let config = proxy_config.interceptor.clone();
     let fallback_note = if config.reject_sensitive {
-        "live traffic would fail closed without contacting an external provider"
+        "live traffic would fail closed without contacting an execution provider"
     } else if config.fallback_on_error {
-        "live traffic would fall back to external routing on this failure"
+        "live traffic would fall back to normal provider routing on this failure"
     } else {
         "live traffic would return this error to the client (fallback_on_error = false)"
     };
@@ -1720,7 +1756,7 @@ pub(crate) async fn test_route(
             );
             return json!({
                 "decision": "error",
-                "detail": format!("local model timed out after {}ms", config.timeout_ms),
+                "detail": format!("triage provider timed out after {}ms", config.timeout_ms),
                 "note": fallback_note,
                 "elapsed_ms": elapsed_ms,
             });
@@ -1730,7 +1766,7 @@ pub(crate) async fn test_route(
     let Some(message) = first_chat_choice_message(&completion) else {
         return json!({
             "decision": "error",
-            "detail": "local model returned no assistant message",
+            "detail": "triage provider returned no assistant message",
             "note": fallback_note,
             "elapsed_ms": elapsed_ms,
         });
@@ -1739,7 +1775,7 @@ pub(crate) async fn test_route(
         return json!({
             "decision": "error",
             "detail": format!(
-                "local completion hit the max_tokens cap ({}); the answer would be clipped",
+                "triage completion hit the max_tokens cap ({}); the answer would be clipped",
                 config.max_tokens
             ),
             "note": fallback_note,
@@ -1778,32 +1814,33 @@ pub(crate) async fn test_route(
         RouteTestMode::Intercept => &BTreeMap::new(),
         RouteTestMode::Integrated => &proxy_config.integrated.targets,
     };
-    let classification = classify_completion_details(&completion, targets, config.reject_sensitive);
+    let classification = enforce_router_only(
+        classify_completion_details(&completion, targets, config.reject_sensitive),
+        mode == RouteTestMode::Integrated,
+    );
     let audit_reason = classification.reason.clone();
     let (decision, target, note) = match classification.decision {
         CompletionDecision::Local => (
-            "local",
+            "direct",
             None,
-            "the local model would answer this request itself".to_string(),
+            "the triage provider would answer this request itself".to_string(),
         ),
         CompletionDecision::Reject => (
             "reject",
             None,
-            "REJECT — returns a no-action response without contacting an external provider"
+            "REJECT — returns a no-action response without contacting an execution provider"
                 .to_string(),
         ),
         CompletionDecision::DefaultRoute => match mode {
             RouteTestMode::Intercept => (
                 "external",
                 None,
-                format!("{PASS_TOOL_NAME} — forwards untouched to normal external routing"),
+                format!("{PASS_TOOL_NAME} — forwards untouched to normal provider routing"),
             ),
             RouteTestMode::Integrated => (
                 "default_route",
                 None,
-                format!(
-                    "{ROUTE_DEFAULT_TOOL_NAME} — continues through model aliases to the default provider"
-                ),
+                format!("{PASS_TOOL_NAME} — continues through model aliases to the default provider"),
             ),
         },
         CompletionDecision::Redirect(target_name) => {
@@ -1827,7 +1864,7 @@ pub(crate) async fn test_route(
         CompletionDecision::InvalidControl => (
             "invalid",
             None,
-            "the local model mixed routing control with other output; live traffic follows fallback_on_error".to_string(),
+            "the triage provider mixed routing control with other output; live traffic follows fallback_on_error".to_string(),
         ),
     };
     let used_default_instructions = match mode {
@@ -1848,15 +1885,15 @@ pub(crate) async fn test_route(
     })
 }
 
-/// The meta-prompt for the admin tab's policy reviser. It confines the local
-/// model to one job: emitting a complete replacement routing policy.
-const REVISER_INSTRUCTIONS: &str = r#"You maintain the routing policy ("system prompt") of llmproxy's local-first interceptor. That policy tells a small local model when to answer an agent request itself and when to route it onward. Intercept mode uses PASS for fall-through. Integrated mode uses ROUTE_DEFAULT for normal routing and configured route functions for explicit provider/model routes.
+/// The meta-prompt for the admin tab's policy reviser. It confines the triage
+/// provider to one job: emitting a complete replacement routing policy.
+const REVISER_INSTRUCTIONS: &str = r#"You maintain the routing policy ("system prompt") of llmproxy's triage provider. Intercept mode may complete high-confidence deterministic requests and uses PASS for normal routing. Integrated mode is router-only: it selects configured provider/model routes and uses PASS when no route exceeds the routing threshold. Sensitive rejection, when enabled, takes precedence.
 
 The user supplies the current policy and a requested change. Reply with ONLY the complete revised policy text, ready to be used verbatim as the new system prompt. No preamble, no explanation, no code fences, no surrounding quotes.
 
 You only edit this routing policy. If the request is unrelated to editing the policy, or asks you to do anything else, return the current policy text unchanged."#;
 
-/// Ask the interceptor's local model to rewrite the routing instructions.
+/// Ask the triage provider to rewrite the routing instructions.
 /// Returns the revised text for the admin editor; nothing is persisted here.
 pub(crate) async fn revise_instructions(
     state: &AppState,
@@ -1910,7 +1947,7 @@ pub(crate) async fn revise_instructions(
         false,
     );
     // Rewrites produce far more tokens than a triage decision, so give the
-    // local model more room than the routing timeout.
+    // Give the triage provider more room than the routing timeout.
     let timeout_ms = config.timeout_ms.max(30_000);
     let started_at = std::time::Instant::now();
     let result = tokio::time::timeout(
@@ -1936,7 +1973,7 @@ pub(crate) async fn revise_instructions(
                 "routing policy revision timed out"
             );
             return json!({
-                "error": format!("local model timed out after {timeout_ms}ms"),
+                "error": format!("triage provider timed out after {timeout_ms}ms"),
                 "elapsed_ms": elapsed_ms,
             });
         }
@@ -1949,7 +1986,7 @@ pub(crate) async fn revise_instructions(
         .unwrap_or_default();
     if revised.trim().is_empty() {
         return json!({
-            "error": "local model returned no revision text",
+            "error": "triage provider returned no revision text",
             "elapsed_ms": elapsed_ms,
         });
     }

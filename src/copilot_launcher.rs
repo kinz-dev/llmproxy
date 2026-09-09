@@ -14,6 +14,7 @@ use crate::INTEGRATED_AUTO_MODEL;
 use crate::agent_launcher::{
     LauncherKind, LauncherMode, LauncherSession, configure_proxy_process, contains_arg,
     has_model_arg, home_dir, non_empty_env_value, prepend_args, require_loopback,
+    resolve_agent_executable,
 };
 
 const COPILOT_API_BASE_URL: &str = "https://api.githubcopilot.com";
@@ -79,7 +80,12 @@ impl CopilotLaunch {
             .clone()
             .or_else(|| env::var_os("LLMPROXY_COPILOT_BIN").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("copilot"));
-        let upstream_base_url = discover_copilot_upstream(cli.upstream.as_deref())?;
+        let copilot_bin = resolve_agent_executable(
+            "Copilot",
+            copilot_bin,
+            "--copilot-bin or LLMPROXY_COPILOT_BIN",
+        )?;
+        let upstream_base_url = discover_copilot_upstream(cli.default_provider_url.as_deref())?;
         let github_mcp_url = non_empty_env_value("GITHUB_MCP_URL_OVERRIDE")
             .unwrap_or_else(|| append_path(&upstream_base_url, "mcp"));
         let remote_sessions_url = non_empty_env_value("COPILOT_MC_BASE_URL")

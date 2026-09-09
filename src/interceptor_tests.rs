@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use super::{
     IntegratedConfig, IntegratedTarget, classify_completion_details,
-    classify_completion_with_targets,
+    classify_completion_with_targets, enforce_router_only,
 };
 use crate::Config;
 use crate::INTEGRATED_AUTO_MODEL;
@@ -257,6 +257,78 @@ fn integrated_redirect_must_be_the_only_local_output() {
 }
 
 #[test]
+fn integrated_mode_rejects_direct_answers_and_normalizes_target_names() {
+    let targets = BTreeMap::from([(
+        "provider-default".to_string(),
+        IntegratedTarget {
+            provider: "default".to_string(),
+            model: "routine-model".to_string(),
+            hint: "deterministic work".to_string(),
+            reasoning_effort: None,
+        },
+    )]);
+    let redirect = json!({
+        "choices": [{
+            "message": {
+                "content": Value::Null,
+                "tool_calls": [{
+                    "function": { "name": "PROVIDER_DEFAULT", "arguments": "{}" }
+                }]
+            }
+        }]
+    });
+    assert_eq!(
+        classify_completion_with_targets(&redirect, &targets),
+        CompletionDecision::Redirect("provider-default".to_string())
+    );
+
+    let direct = json!({ "choices": [{ "message": { "content": "answer" } }] });
+    let classified =
+        enforce_router_only(classify_completion_details(&direct, &targets, false), true);
+    assert_eq!(classified.decision, CompletionDecision::InvalidControl);
+}
+
+#[test]
+fn integrated_request_rejects_normalized_caller_tool_collisions() {
+    let proxy_config = Config {
+        integrated: IntegratedConfig {
+            enabled: true,
+            targets: BTreeMap::from([(
+                "provider-default".to_string(),
+                IntegratedTarget {
+                    provider: "default".to_string(),
+                    model: "routine-model".to_string(),
+                    hint: "deterministic work".to_string(),
+                    reasoning_effort: None,
+                },
+            )]),
+            ..IntegratedConfig::default()
+        },
+        ..Config::default()
+    };
+    let request = json!({
+        "messages": [{ "role": "user", "content": "work" }],
+        "tools": [{
+            "type": "function",
+            "function": { "name": "PROVIDER_DEFAULT", "parameters": {} }
+        }]
+    });
+    let error = build_local_request(
+        request,
+        &InterceptorConfig {
+            model: "triage".to_string(),
+            ..InterceptorConfig::default()
+        },
+        InterceptorProtocol::ChatCompletions,
+        Some(INTEGRATED_AUTO_MODEL),
+        &HashMap::new(),
+        &proxy_config,
+    )
+    .unwrap_err();
+    assert!(error.contains("provider-default"));
+}
+
+#[test]
 fn integrated_request_adds_target_tools_and_prompt_hints() {
     let proxy_config = Config {
         integrated: IntegratedConfig {
@@ -293,8 +365,8 @@ fn integrated_request_adds_target_tools_and_prompt_hints() {
         .iter()
         .filter_map(|tool| tool["function"]["name"].as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"ROUTE_DEFAULT"));
-    assert!(!tool_names.contains(&"PASS"));
+    assert!(tool_names.contains(&"PASS"));
+    assert!(!tool_names.contains(&"ROUTE_DEFAULT"));
     assert!(tool_names.contains(&"backend"));
     for tool in local["tools"].as_array().unwrap() {
         assert_eq!(
@@ -315,7 +387,8 @@ fn integrated_request_adds_target_tools_and_prompt_hints() {
         .join("\n");
     assert!(prompt.contains("Call backend when: complex coding."));
     assert!(prompt.contains("Destination: openai/gpt-test with max reasoning effort."));
-    assert!(prompt.contains("ROUTE_DEFAULT"));
+    assert!(prompt.contains("otherwise call PASS"));
+    assert!(prompt.contains("greater than 80%"));
 }
 
 #[test]
@@ -358,8 +431,12 @@ fn explicit_model_in_integrated_config_uses_pass_only_prompt() {
     assert!(tool_names.contains(&"PASS"));
     assert!(!tool_names.contains(&"ROUTE_DEFAULT"));
     assert!(!tool_names.contains(&"backend"));
-    assert!(local.to_string().contains("local fast path"));
-    assert!(!local.to_string().contains("routing tier"));
+    assert!(
+        local
+            .to_string()
+            .contains("triage and deterministic-execution provider")
+    );
+    assert!(!local.to_string().contains("provider-routing tier"));
 }
 
 #[test]
@@ -404,10 +481,10 @@ fn integrated_mode_swaps_in_the_routing_tier_prompt_unless_overridden() {
         model: "triage".to_string(),
         ..InterceptorConfig::default()
     });
-    assert!(stock.contains("routing tier"));
-    assert!(!stock.contains("local fast path"));
-    assert!(stock.contains("ROUTE_DEFAULT"));
-    assert!(!stock.contains("PASS"));
+    assert!(stock.contains("provider-routing tier"));
+    assert!(!stock.contains("triage and deterministic-execution provider"));
+    assert!(!stock.contains("ROUTE_DEFAULT"));
+    assert!(stock.contains("PASS"));
 
     // Intercept-mode overrides stay out of integrated mode; the integrated
     // policy has its own override field.
@@ -416,7 +493,7 @@ fn integrated_mode_swaps_in_the_routing_tier_prompt_unless_overridden() {
         instructions: "Custom intercept policy.".to_string(),
         ..InterceptorConfig::default()
     });
-    assert!(intercept_override.contains("routing tier"));
+    assert!(intercept_override.contains("provider-routing tier"));
     assert!(!intercept_override.contains("Custom intercept policy."));
 
     let mut config_with_override = proxy_config.clone();
@@ -441,7 +518,7 @@ fn integrated_mode_swaps_in_the_routing_tier_prompt_unless_overridden() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(overridden.contains("Custom integrated policy."));
-    assert!(!overridden.contains("routing tier"));
+    assert!(!overridden.contains("provider-routing tier"));
     // Route hints are still appended around a custom policy.
     assert!(overridden.contains("Call PROVIDER_OPENAI when: everything else (default route)."));
 
@@ -465,8 +542,8 @@ fn integrated_mode_swaps_in_the_routing_tier_prompt_unless_overridden() {
         .map(|message| text_from_value(&message["content"]))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(plain_prompt.contains("local fast path"));
-    assert!(!plain_prompt.contains("routing tier"));
+    assert!(plain_prompt.contains("triage and deterministic-execution provider"));
+    assert!(!plain_prompt.contains("provider-routing tier"));
 }
 
 #[test]
@@ -597,6 +674,28 @@ fn temperature_out_of_range_is_rejected() {
 }
 
 #[test]
+fn sensitive_rejection_requires_private_triage_provider() {
+    let providers = HashMap::from([(
+        "triage".to_string(),
+        crate::UpstreamConfig {
+            base_url: "https://triage.example/v1".to_string(),
+            ..crate::UpstreamConfig::default()
+        },
+    )]);
+    let config = InterceptorConfig {
+        enabled: true,
+        reject_sensitive: true,
+        provider: "triage".to_string(),
+        model: "screening-model".to_string(),
+        ..InterceptorConfig::default()
+    };
+    let error = crate::interceptor::validate_config(&config, &providers)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("would receive the prompt before REJECT"));
+}
+
+#[test]
 fn integrated_external_targets_require_proxy_credentials() {
     let mut provider = crate::UpstreamConfig {
         base_url: "https://provider.example/v1".to_string(),
@@ -667,6 +766,7 @@ fn integrated_target_names_are_generic_tool_names() {
     }
     for name in [
         "PASS".to_string(),
+        "reject".to_string(),
         "ROUTE_DEFAULT".to_string(),
         "bad name".to_string(),
         "x".repeat(65),

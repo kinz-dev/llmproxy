@@ -11,7 +11,8 @@ use tracing::info;
 use super::Cli;
 use crate::agent_launcher::{
     LauncherKind, LauncherMode, LauncherSession, configure_proxy_process, contains_arg, home_dir,
-    non_empty_env_value, prepend_args, require_loopback, with_integrated_auto_model,
+    non_empty_env_value, prepend_args, require_loopback, resolve_agent_executable,
+    with_integrated_auto_model,
 };
 
 const CODEX_PROXY_PROVIDER: &str = "llmproxy_intercept";
@@ -81,12 +82,14 @@ impl CodexLaunch {
             .clone()
             .or_else(|| env::var_os("LLMPROXY_CODEX_BIN").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("codex"));
+        let codex_bin =
+            resolve_agent_executable("Codex", codex_bin, "--codex-bin or LLMPROXY_CODEX_BIN")?;
         let codex_args = with_integrated_auto_model(&codex_launch_args(&cli.agent_args), mode);
         let upstream_base_url = if mode == LauncherMode::Intercept {
             let auth_route = detect_auth_route(&codex_bin, &codex_args).await?;
             let configured_base_url = configured_openai_base_url(&cli.agent_args)?;
             let upstream_base_url = cli
-                .upstream
+                .default_provider_url
                 .clone()
                 .or(configured_base_url)
                 .unwrap_or_else(|| auth_route.default_base_url().to_string())
@@ -185,7 +188,7 @@ async fn detect_auth_route(codex_bin: &Path, codex_args: &[OsString]) -> Result<
 fn classify_login_status(status: &str) -> Result<CodexAuthRoute> {
     let normalized = status.to_ascii_lowercase();
     if normalized.contains("amazon bedrock") {
-        bail!("Codex Amazon Bedrock login is not supported by --intercept --codex");
+        bail!("Codex Amazon Bedrock login is not supported by intercept-mode launchers");
     }
     if normalized.contains("api key") {
         return Ok(CodexAuthRoute::ApiKeyManaged);

@@ -1,6 +1,10 @@
 use std::env;
+#[cfg(any(windows, test))]
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::net::SocketAddr;
+#[cfg(any(windows, test))]
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -10,6 +14,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::process::{Child, Command};
+#[cfg(windows)]
+use tracing::info;
 
 use super::Cli;
 use crate::INTEGRATED_AUTO_MODEL;
@@ -38,6 +44,141 @@ pub(super) fn configure_proxy_process(command: &mut Command) {
         .env("NO_PROXY", no_proxy_value("NO_PROXY"))
         .env("no_proxy", no_proxy_value("no_proxy"))
         .kill_on_drop(true);
+}
+
+#[cfg(any(windows, test))]
+const WINDOWS_LAUNCH_EXTENSIONS: [&str; 4] = [".COM", ".EXE", ".BAT", ".CMD"];
+
+pub(super) fn resolve_agent_executable(
+    agent: &str,
+    configured: PathBuf,
+    configuration_hint: &str,
+) -> Result<PathBuf> {
+    if configured.as_os_str().is_empty() {
+        bail!("{agent} executable cannot be empty; set {configuration_hint}");
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (agent, configuration_hint);
+        Ok(configured)
+    }
+
+    #[cfg(windows)]
+    {
+        let search_dirs = windows_agent_search_dirs();
+        let extensions = windows_launch_extensions(env::var_os("PATHEXT").as_deref());
+        let resolved = resolve_windows_executable_with(
+            &configured,
+            &search_dirs,
+            &extensions,
+            Path::is_file,
+        )
+        .with_context(|| {
+            format!(
+                "{agent} executable {} was not found; install {agent}, add its .exe/.cmd shim to PATH, or set {configuration_hint}",
+                configured.display()
+            )
+        })?;
+        if resolved != configured {
+            info!(
+                agent,
+                configured = %configured.display(),
+                resolved = %resolved.display(),
+                "resolved Windows agent executable"
+            );
+        }
+        Ok(resolved)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_launch_extensions(path_ext: Option<&OsStr>) -> Vec<OsString> {
+    let mut extensions = Vec::new();
+    if let Some(path_ext) = path_ext {
+        for extension in path_ext.to_string_lossy().split(';') {
+            push_windows_launch_extension(&mut extensions, extension);
+        }
+    }
+    for extension in WINDOWS_LAUNCH_EXTENSIONS {
+        push_windows_launch_extension(&mut extensions, extension);
+    }
+    extensions
+}
+
+#[cfg(any(windows, test))]
+fn push_windows_launch_extension(extensions: &mut Vec<OsString>, extension: &str) {
+    let extension = extension.trim();
+    if extension.is_empty() {
+        return;
+    }
+    let normalized = if extension.starts_with('.') {
+        extension.to_ascii_uppercase()
+    } else {
+        format!(".{}", extension.to_ascii_uppercase())
+    };
+    if !WINDOWS_LAUNCH_EXTENSIONS.contains(&normalized.as_str())
+        || extensions
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(OsStr::new(&normalized)))
+    {
+        return;
+    }
+    extensions.push(OsString::from(normalized));
+}
+
+#[cfg(windows)]
+fn windows_agent_search_dirs() -> Vec<PathBuf> {
+    let mut directories = env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(path) = env::var_os("PATH") {
+        directories.extend(env::split_paths(&path).filter(|path| !path.as_os_str().is_empty()));
+    }
+    directories
+}
+
+#[cfg(any(windows, test))]
+fn resolve_windows_executable_with(
+    configured: &Path,
+    search_dirs: &[PathBuf],
+    extensions: &[OsString],
+    is_file: impl Fn(&Path) -> bool,
+) -> Result<PathBuf> {
+    let has_directory = configured
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    let bases = if has_directory {
+        vec![configured.to_path_buf()]
+    } else {
+        search_dirs
+            .iter()
+            .map(|directory| directory.join(configured))
+            .collect()
+    };
+
+    for base in bases {
+        if base.extension().is_some() {
+            if is_file(&base) {
+                return Ok(base);
+            }
+            continue;
+        }
+        for extension in extensions {
+            let mut candidate = base.as_os_str().to_os_string();
+            candidate.push(extension);
+            let candidate = PathBuf::from(candidate);
+            if is_file(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        if has_directory && is_file(&base) {
+            return Ok(base);
+        }
+    }
+    bail!("no supported Windows executable candidate exists")
 }
 
 pub(super) fn require_loopback(agent: &str, addr: SocketAddr) -> Result<()> {

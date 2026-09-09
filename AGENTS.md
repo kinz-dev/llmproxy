@@ -25,44 +25,49 @@
 
 ## Product Contract
 
-`llmproxy` is a local-first Rust proxy for OpenAI Chat Completions and
+`llmproxy` is a provider-routing Rust proxy for OpenAI Chat Completions and
 Responses, Anthropic Messages, and native agent launcher traffic.
 
 ```text
-agent request -> separate local interceptor request -> local response
-                                               \-> PASS -> original external request (intercept)
-                                               \-> Auto + ROUTE_DEFAULT -> normal configured routing
-                                               \-> Auto + configured route -> provider/model
+agent request -> separate triage-provider request -> deterministic response (intercept only)
+                                                  \-> REJECT -> safe no-action response
+                                                  \-> PASS -> normal configured routing
+                                                  \-> Auto + configured route -> provider/model
 ```
 
-- The triage model receives a separate dynamic request with compatible tools.
-  Model `Auto` enables integrated `ROUTE_DEFAULT` and configured route tools.
-  Other models bypass integrated triage; they receive `PASS` only when the
-  standalone interceptor is enabled. The local copy must never mutate the
-  external copy.
+- The triage provider receives a separate dynamic request with compatible tools.
+  Model `Auto` enables integrated `PASS` and configured route tools.
+  Other models bypass integrated triage. Intercept mode advertises `PASS`
+  independently of the requested model. The triage copy must never mutate the
+  original execution copy.
 - Routing controls are valid only as the sole tool call or exact text output.
-  Mixed output is invalid. Integrated mode accepts legacy `PASS` output but
-  does not advertise it. Tool calls may carry only a concise `reason` audit
+  Mixed output is invalid. Integrated mode advertises `PASS` and continues to
+  accept legacy `ROUTE_DEFAULT`. Tool calls may carry only a concise `reason` audit
   field; legacy empty arguments remain valid, and audit metadata is never
   rendered to the caller.
 - Optional `interceptor.reject_sensitive` adds a mandatory, dynamically
-  appended `REJECT` control before local/external routing. Its reason is a safe
-  category, never the detected value. Rejection renders a native successful
+  appended `REJECT` control before execution/provider routing. The built-in
+  policy selects it at 75% sensitive-data likelihood or higher. Its reason is
+  a safe category, never the detected value. The triage provider must be on a
+  loopback or private network because it sees the prompt before classification.
+  Rejection renders a native successful
   no-action response, disables sticky bypass, and fails closed when screening
   cannot complete. Screened request/triage bodies are omitted from TRACE, and
-  rejected audit prompts are redacted. Pure `--proxy` launcher sessions
-  disable it to remain prompt-free.
-- Caller authentication, account headers, and external credentials must never
-  reach the local provider.
-- Accepted local output is rendered in the caller's native protocol. Buffered
+  rejected audit prompts are redacted. Proxy mode ignores it and remains
+  prompt-free.
+- Caller authentication, account headers, and execution-provider credentials must never
+  reach the triage provider.
+- Accepted triage-provider output is rendered in the caller's native protocol.
+  The built-in intercept policy executes directly only above 80% deterministic
+  confidence. Integrated triage is router-only and direct output is invalid. Buffered
   speculation and routing controls must never appear in the conversation.
-- Timeout or local failure follows `interceptor.fallback_on_error`.
-  Sensitive rejection overrides that fallback and never continues externally
-  after a screening failure.
-- Integrated launcher routes, including explicit-model and `ROUTE_DEFAULT`
-  traffic, strip caller credentials; every external destination must have a
+- Timeout or triage-provider failure follows `interceptor.fallback_on_error`.
+  Sensitive rejection overrides that fallback and never continues to another
+  provider after a screening failure.
+- Integrated launcher routes, including explicit-model and `PASS`
+  traffic, strip caller credentials; every remote destination must have a
   proxy-owned credential.
-- Codex control requests bypass interceptor/integrated local execution because
+- Codex control requests bypass interceptor/integrated triage execution because
   they require native response items. Pure proxy sessions relay them directly
   to the default provider with only model remapping.
 
@@ -72,12 +77,11 @@ Without a launcher, preserve these rules:
 
 - Explicit model aliases win.
 - A recognized `provider/model` namespace selects that provider and strips only
-  the first prefix. It bypasses integrated triage; standalone interception may
-  still perform its independent `PASS` check.
+  the first prefix. It bypasses integrated triage; intercept mode still performs
+  its independent `PASS` check.
 - Otherwise the first upstream model is selected and cached.
 - In integrated sessions, a non-`Auto` model that is not an alias or namespace
-  is preserved on the default provider. It is locally checked only when the
-  standalone interceptor is also enabled.
+  is preserved on the default provider and bypasses triage.
 - Alias-covered requests skip model discovery.
 - Provider selection, role rewriting, and protocol adapters remain active.
 - A configured provider `reasoning_effort` is an enforced outbound policy:
@@ -85,7 +89,7 @@ Without a launcher, preserve these rules:
   and Anthropic Messages uses `output_config.effort`.
 - An integrated target's `reasoning_effort` overrides its provider default and
   is included in the dynamic routing prompt and admin route editor.
-- `--intercept` alone keeps normal external remapping after `PASS`.
+- Intercept mode keeps normal provider remapping after `PASS`.
 - Provider `kind` selects OpenAI-compatible, OpenAI, Anthropic, or Copilot
   upstream adaptation. OpenAI Chat Completions remains the canonical format.
 
@@ -110,29 +114,28 @@ Without a launcher, preserve these rules:
 
 ## Launchers
 
-- `--proxy --codex|--claude|--copilot` is a tokenized pure-adapter session. It
-  disables interceptor and integrated routing, clears aliases and non-default
-  providers, strips caller credentials, and remaps every generation request to
-  the configured default provider. It adds no system prompt or control tools.
-- `--intercept --codex` uses native OpenAI Responses passthrough and preserves
-  Codex models and request metadata only for its tokenized launcher session.
-- `--intercept --claude` uses native Anthropic Messages passthrough and
-  preserves Claude models, bodies, headers, and SSE only for its session.
-- `--intercept --copilot` supports native Copilot model discovery, Chat
-  Completions, Responses, and Anthropic-wire requests. GitHub MCP and remote
-  sessions stay external; provider-specific BYOK variables must not bypass the
-  launcher.
-- `--integrated` launchers use tokenized sessions over the protocol adapters
-  and default their wire model to `Auto` unless the user selected a model.
-  Copilot uses its documented BYOK Responses surface; GitHub MCP and remote
-  sessions remain external.
-- `--codex`, `--claude`, or `--copilot` without a mode defaults to integrated;
-  `--proxy`, `--intercept`, and `--integrated` remain explicit overrides.
+- `routing_mode` is exclusive per instance: `proxy`, `intercept`, or
+  `integrated`. `--codex`, `--claude`, and `--copilot` always inherit the live
+  instance mode. Change it with config, the admin, or `--restart --mode`; mode
+  flags cannot be combined with a launcher.
+- Proxy launchers are tokenized pure-adapter sessions. They clear aliases and
+  non-default providers, strip caller credentials, and remap every generation
+  request to the default provider. They add no prompt or control tools.
+- Intercept Codex and Claude launchers preserve their native Responses or
+  Messages wire, models, request metadata, headers, and SSE. Copilot intercept
+  supports native model discovery, Chat Completions, Responses, and
+  Anthropic-wire requests. GitHub MCP and remote sessions stay external.
+- Integrated launchers use tokenized sessions over the protocol adapters and
+  default their wire model to `Auto` unless the user selected a model. Copilot
+  uses its documented BYOK Responses surface; GitHub MCP and remote sessions
+  remain external.
 - Native interceptor sessions leave credential loading and refresh with the
   matching agent. Proxy and integrated sessions do not require agent login and
   never forward caller-generated credentials.
-- Launcher modes are mutually exclusive, loopback-only, and protected against
-  upstream loops.
+- On Windows, launcher discovery resolves supported `.exe`, `.com`, `.cmd`, and
+  `.bat` files from `PATH` before authentication probes or interactive spawn.
+- Launcher sessions are loopback-only, reject tokens from a different instance
+  mode, and are protected against upstream loops.
 - Interactive launchers resume only when their native session behavior permits;
   explicit prompt, session, management, help, and version arguments are kept.
 
@@ -153,8 +156,11 @@ Without a launcher, preserve these rules:
   observable policy reason, requested model, triage model/latency, finalized
   provider/model/class, and fallback error. The admin keeps a bounded 24-hour
   decision feed with prompt previews; it never stores credential headers.
-- Proxy, interceptor, and integrated launcher sessions can safely share one
-  daemon because routing mode is encoded in each loopback-only session token.
+- The admin can atomically change the instance routing mode and schedule a
+  managed restart. A restart stops the current bound listener and applies the
+  validated configured fixed listener address. Existing agent processes must be
+  relaunched after a mode change because session tokens record the mode that
+  created them.
 - The admin interface is unauthenticated and must remain loopback-only.
 - Runtime config updates must validate and build replacement providers before
   atomically swapping shared state; persist edits without discarding comments.
@@ -165,8 +171,8 @@ Without a launcher, preserve these rules:
   launcher sessions, and startup output.
 - `src/backend_adapters.rs`: provider-facing Anthropic and Copilot adapters and
   cross-provider history sanitization.
-- `src/interceptor.rs`: local request construction, routing controls, decision
-  audit drafts, failure policy, and local response rendering.
+- `src/interceptor.rs`: triage request construction, routing controls, decision
+  audit drafts, failure policy, and native response rendering.
 - `src/logging.rs`: bounded asynchronous trace file setup, timestamp naming,
   and retention cleanup.
 - `src/agent_launcher.rs`: shared launcher selection and lifecycle.

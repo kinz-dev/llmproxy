@@ -32,26 +32,50 @@ fn non_loopback_admin_listen_address_is_rejected() {
 }
 
 #[test]
-fn loopback_host_check_accepts_only_literal_loopback_ip_port() {
+fn loopback_host_check_accepts_literal_loopback_and_loopback_names() {
     assert!(loopback_host_matches("127.0.0.1:11180", 11180));
     assert!(loopback_host_matches("[::1]:11180", 11180));
     // Wrong port.
     assert!(!loopback_host_matches("127.0.0.1:9999", 11180));
-    // DNS rebinding: attacker hostname (even one resolving to loopback) fails
-    // because we require a literal IP, not a name.
+    // A name is admitted only by resolution, never by spelling: localhost is in
+    // every resolver's loopback set, so it must now pass.
+    assert!(loopback_host_matches("localhost:11180", 11180));
+    assert!(loopback_host_matches("ip6-localhost:11180", 11180));
+    // DNS rebinding: an attacker-chosen name does not resolve to loopback on
+    // the victim's machine, so it fails on resolution rather than on being a
+    // name. Absent names fail the same way, which is the fail-closed direction.
     assert!(!loopback_host_matches("attacker.com:11180", 11180));
-    assert!(!loopback_host_matches("localhost:11180", 11180));
+    assert!(!loopback_host_matches("rebind.example:11180", 11180));
     // Non-loopback literal.
     assert!(!loopback_host_matches("10.0.0.5:11180", 11180));
     // Missing port / malformed.
     assert!(!loopback_host_matches("127.0.0.1", 11180));
     assert!(!loopback_host_matches("127.0.0.1:notaport", 11180));
+    // Not a name at all: the character filter must reject before the resolver.
+    assert!(!loopback_host_matches("local host:11180", 11180));
+    assert!(!loopback_host_matches(":11180", 11180));
 }
 
 #[test]
-fn same_origin_check_allows_only_own_loopback_origin() {
+fn loopback_name_check_fails_closed_on_unresolvable_and_mixed_names() {
+    // Unresolvable resolves to nothing, which must not be read as "allowed".
+    assert!(!host_is_loopback_by_name("llmproxy-does-not-exist.invalid"));
+    // A name resolving to any non-loopback address is rejected outright, even
+    // if it also yields a loopback record.
+    assert!(!host_is_loopback_by_name("example.com"));
+    // Empty and non-name input never reach the resolver.
+    assert!(!host_is_loopback_by_name(""));
+    assert!(!host_is_loopback_by_name("bad/name"));
+    assert!(!host_is_loopback_by_name("a;b"));
+    // The loopback names do resolve.
+    assert!(host_is_loopback_by_name("localhost"));
+}
+
+#[test]
+fn same_origin_check_allows_own_loopback_origin_and_loopback_names() {
     assert!(is_same_loopback_origin("http://127.0.0.1:11180", 11180));
     assert!(is_same_loopback_origin("http://[::1]:11180", 11180));
+    assert!(is_same_loopback_origin("http://localhost:11180", 11180));
     assert!(!is_same_loopback_origin("http://attacker.com:11180", 11180));
     assert!(!is_same_loopback_origin("https://127.0.0.1:11180", 11180));
     assert!(!is_same_loopback_origin("http://127.0.0.1:2222", 11180));

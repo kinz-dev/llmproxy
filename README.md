@@ -32,6 +32,15 @@ Config discovery is `--config`, `LLMPROXY_CONFIG`, `./config.toml`, then
 locations. The admin can change routing mode, inspect decisions, and restart
 the managed proxy.
 
+The admin stays loopback-only, but reaches it by name as well as by number:
+`http://localhost:PORT` works alongside the literal `127.0.0.1`/`[::1]` form.
+Host names are admitted by resolution rather than spelling, so a hostname an
+attacker controls still cannot present itself as same-origin, and a machine
+name published at `127.0.1.1` is allowed. Remote access means an SSH tunnel or
+a reverse proxy that rewrites `Host` to the loopback address; binding the admin
+to a routable address remains unsupported because the interface is
+unauthenticated and serves the raw config.
+
 Aliases route ordinary or embedding models. Provider and integrated-target
 `reasoning_effort` enforce outbound reasoning policy. Optional private-network
 sensitive screening rejects likely credentials or personal data before

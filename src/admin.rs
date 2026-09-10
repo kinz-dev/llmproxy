@@ -167,9 +167,18 @@ fn router(state: AdminState) -> Router {
         .route_layer(middleware::from_fn_with_state(state, require_local_origin))
 }
 
-/// True when `host` is a literal loopback `ip:port` matching this listener.
-/// Literals only: a hostname (even `localhost`) fails, which is what stops
-/// DNS-rebinding from presenting the admin's own origin to itself.
+/// True when the `Host` header names this listener: the port must equal the
+/// bound port and the host must resolve to a loopback address.
+///
+/// Literal IPs pass as before. A *name* now also passes when it really does
+/// resolve to loopback, which is what allows `http://localhost:PORT` while
+/// keeping DNS rebinding closed. The distinction still has teeth: this API is
+/// unauthenticated and serves the raw config (plaintext provider keys), so a
+/// short-TTL domain pointed at 127.0.0.1 makes a browser treat the attacker's
+/// page as same-origin and the Origin check stops helping. Whether the name
+/// resolves to loopback is then the only thing that says whose name it was,
+/// and an attacker-chosen name does not resolve to loopback on the victim's
+/// machine.
 fn loopback_host_matches(host: &str, bound_port: u16) -> bool {
     let Some((host_part, port_part)) = host.rsplit_once(':') else {
         return false;
@@ -177,14 +186,52 @@ fn loopback_host_matches(host: &str, bound_port: u16) -> bool {
     let Ok(port) = port_part.parse::<u16>() else {
         return false;
     };
+    if port != bound_port {
+        return false;
+    }
     let host_ip = host_part
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host_part);
-    let Ok(ip) = host_ip.parse::<std::net::IpAddr>() else {
+    if let Ok(ip) = host_ip.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    host_is_loopback_by_name(host_ip)
+}
+
+/// Resolve a bare host name and require every address it yields to be loopback.
+///
+/// All-or-nothing deliberately: a name resolving to both a loopback and a
+/// routable address must fail, so a rebinding zone with one good and one bad
+/// record cannot be admitted on the strength of the good one. A name that does
+/// not resolve to loopback could not have been served by this socket in the
+/// first place (the listener is loopback-bound), so failing closed here costs
+/// nothing legitimate.
+///
+/// Resolution is synchronous, which is acceptable because loopback names come
+/// from `/etc/hosts` under the usual `files dns` order (~0.1-0.5 ms warm here)
+/// and the admin is polled by one local browser. A deployment whose
+/// `nsswitch.order` puts DNS first would pay a lookup per admin request and
+/// should memoize rather than move this onto a blocking pool.
+fn host_is_loopback_by_name(host: &str) -> bool {
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return false;
+    }
+    let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host.to_owned(), 0u16)) else {
         return false;
     };
-    ip.is_loopback() && port == bound_port
+    let mut saw_any = false;
+    for addr in addrs {
+        if !addr.ip().is_loopback() {
+            return false;
+        }
+        saw_any = true;
+    }
+    saw_any
 }
 
 fn is_same_loopback_origin(origin: &str, bound_port: u16) -> bool {

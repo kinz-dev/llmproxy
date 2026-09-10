@@ -8,6 +8,14 @@ max_logging_retention_days = 7
 # 127.0.0.1 with a random port, printed at startup. The UI is served from the
 # ui/ directory next to the binary: debug builds re-read files per request,
 # release builds read them once at startup and cache until restart.
+# Requests are accepted when the Host header port matches the bound port and
+# the host resolves to a loopback address, so http://localhost:PORT works as
+# well as the literal IP. Names are admitted by resolution, never by spelling:
+# an attacker-chosen hostname still fails, which is what keeps DNS rebinding
+# closed on this unauthenticated interface. A machine name published at
+# 127.0.1.1 (the Debian-style /etc/hosts entry) counts as loopback and is
+# allowed. Reaching the admin from a non-loopback address is not supported;
+# use an SSH tunnel or a reverse proxy that rewrites Host to the loopback name.
 [admin]
 enable = false
 # listen_address = "127.0.0.1:11180"

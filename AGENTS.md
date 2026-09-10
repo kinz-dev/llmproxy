@@ -202,6 +202,13 @@ Without a launcher, preserve these rules:
   relaunched after a mode change because session tokens record the mode that
   created them.
 - The admin interface is unauthenticated and must remain loopback-only.
+- Admin requests are admitted by Host/Origin resolution, not by literal spelling:
+  the Host port must equal the bound port and the host must resolve entirely to
+  loopback, so `localhost` and a `127.0.1.1` machine name work while an
+  attacker-chosen hostname still cannot. A name yielding any routable address
+  is rejected outright, and a non-resolving name fails closed. Never replace
+  this with a hostname allowlist or a removed check: the Host check is the one
+  that still holds under DNS rebinding, after which Origin is same-origin.
 - Runtime config updates must validate and build replacement providers before
   atomically swapping shared state; persist edits without discarding comments.
 

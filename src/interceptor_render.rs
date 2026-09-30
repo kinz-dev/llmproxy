@@ -12,7 +12,7 @@ use crate::{
     chat_usage_to_responses_usage, sse_event, text_from_value, unix_timestamp,
 };
 
-pub(super) fn render_local_completion(
+pub(crate) fn render_local_completion(
     protocol: InterceptorProtocol,
     mut completion: Value,
     client_model: Option<String>,
@@ -54,7 +54,7 @@ pub(super) fn render_local_completion(
     }
 }
 
-pub(super) fn render_rejection(
+pub(crate) fn render_rejection(
     protocol: InterceptorProtocol,
     reason: &str,
     client_model: Option<String>,

@@ -156,6 +156,25 @@
                 <span class="latency-figures mono" id="lat-ext-figures">no samples</span>
               </div>
             </div>
+
+            <h4 class="sub-label mono">latency budget <span class="sub-note">p50, to first byte</span></h4>
+            <div class="budget-band is-empty" id="budget-band" role="img"
+                 aria-label="Share of time to first byte spent inside llmproxy versus waiting on the provider">
+              <div class="budget-seg is-proxy" id="budget-pre" style="width:0%"></div>
+              <div class="budget-seg is-upstream" id="budget-upstream" style="width:0%"></div>
+              <div class="budget-seg is-proxy" id="budget-relay" style="width:0%"></div>
+            </div>
+            <p class="split-caption mono budget-caption" id="budget-caption">no samples yet</p>
+            <div class="latency-rows">
+              <div class="latency-row budget-row">
+                <span class="latency-name mono is-proxy">proxy</span>
+                <span class="latency-figures mono" id="lat-overhead-figures">no samples</span>
+              </div>
+              <div class="latency-row budget-row">
+                <span class="latency-name mono is-external">upstream</span>
+                <span class="latency-figures mono" id="lat-upstream-figures">no samples</span>
+              </div>
+            </div>
           </div>
         </div>
 

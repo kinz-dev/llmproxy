@@ -75,6 +75,15 @@ function fmtMs(ms) {
   return ms + " ms";
 }
 
+// The proxy's own cost lives in microseconds; the model's lives in seconds.
+// One formatter has to read naturally across both.
+function fmtUs(us) {
+  if (us === null || us === undefined) return "—";
+  if (us < 1000) return us + " \u00B5s";
+  if (us < 10_000) return (us / 1000).toFixed(2) + " ms";
+  return fmtMs(Math.round(us / 1000));
+}
+
 function fmtUptime(secs) {
   if (secs < 90) return `${secs}s up`;
   const m = Math.floor(secs / 60);
@@ -289,8 +298,33 @@ function renderStats(stats) {
   $("#stat-local").textContent = fmtCount(served.local);
   $("#stat-local-sub").textContent = intercept.local ? `${fmtCount(intercept.local)} by interceptor` : " ";
   $("#stat-external").textContent = fmtCount(served.external);
+  // Latency gives the remote tile the same sub-line weight the private tile has.
+  const extLatency = (stats.latency || {}).external || {};
+  $("#stat-external-sub").textContent = extLatency.samples
+    ? `p50 ${fmtMs(extLatency.p50_ms)} · p99 ${fmtMs(extLatency.p99_ms)}`
+    : " ";
   $("#stat-tokens").textContent = "≈ " + fmtCount(tokens.total);
-  $("#stat-tokens-sub").textContent = `prompt ${fmtCount(tokens.prompt)} · completion ${fmtCount(tokens.completion)}`;
+  const estimated = Number(tokens.estimated || 0);
+  const sources = tokens.estimate_sources || {};
+  const cal = Number(sources.calibrated || 0);
+  const def = Number(sources.default || 0);
+  const totalEstimates = cal + def;
+  // Exactness is what matters to an operator reading this tile: state how much
+  // of the avoided total was backed by real provider counts, then how the rest
+  // was guessed. A tile with no estimates yet says so rather than showing
+  // "0 calibrated / 0 default", and an all-estimated total hides the exactness
+  // line because "entirely estimated" is the same fact as "0% exact".
+  const tokensSub = $("#stat-tokens-sub");
+  tokensSub.textContent =
+    `prompt ${fmtCount(tokens.prompt)} · completion ${fmtCount(tokens.completion)}` +
+    (estimated
+      ? ` · ${fmtCount(estimated)} estimated`
+      : " · exact");
+  const tile = $("#stat-tokens").closest(".stat");
+  tile.title = totalEstimates
+    ? `${Math.round((100 * (totalEstimates - def)) / totalEstimates)}% of token estimates used a learned ratio; ` +
+      `the rest fell back to the cold-start default.`
+    : "Token estimates appear here once requests without provider usage are served.";
   renderCost(stats.cost);
   renderResilience(stats.resilience);
   renderRoutingMatrix(served.matrix || {});
@@ -329,6 +363,55 @@ function renderStats(stats) {
   const maxP99 = Math.max(stats.latency.local.p99_ms || 0, stats.latency.external.p99_ms || 0, 1);
   setLatencyRow("#lat-local-bar", "#lat-local-figures", stats.latency.local, maxP99);
   setLatencyRow("#lat-ext-bar", "#lat-ext-figures", stats.latency.external, maxP99);
+  renderLatencyBudget(stats.latency.phases);
+}
+
+// A single round-trip number cannot tell a slow model from a slow proxy. The
+// budget separates them: the green segments are time spent inside llmproxy,
+// the amber one is time spent waiting on the provider. Each figure is that
+// phase's own median, measured per request rather than inferred by
+// subtracting one percentile from another.
+function renderLatencyBudget(phases) {
+  const band = $("#budget-band");
+  const caption = $("#budget-caption");
+  const at = (name) => (phases || {})[name] || {};
+  const overhead = at("overhead");
+  const upstream = at("upstream");
+  const ttfb = at("client_ttfb");
+
+  const figures = (entry) =>
+    entry.samples ? `${fmtUs(entry.p50_us)} \u2192 ${fmtUs(entry.p99_us)}` : "no samples";
+  $("#lat-overhead-figures").textContent = figures(overhead);
+  $("#lat-upstream-figures").textContent = figures(upstream);
+
+  const pre = Number(at("pre_dispatch").p50_us || 0);
+  const wait = Number(upstream.p50_us || 0);
+  const relay = Number(at("relay").p50_us || 0);
+  const total = pre + wait + relay;
+  const segments = ["#budget-pre", "#budget-upstream", "#budget-relay"];
+  if (!ttfb.samples || !total) {
+    band.classList.add("is-empty");
+    for (const id of segments) {
+      $(id).hidden = true;
+      $(id).style.width = "0%";
+    }
+    caption.textContent = "no samples yet";
+    return;
+  }
+  band.classList.remove("is-empty");
+  const setSegment = (id, micros) => {
+    const el = $(id);
+    el.hidden = micros <= 0;
+    el.style.width = ((micros / total) * 100).toFixed(2) + "%";
+  };
+  setSegment("#budget-pre", pre);
+  setSegment("#budget-upstream", wait);
+  setSegment("#budget-relay", relay);
+  const share = ((pre + relay) / total) * 100;
+  caption.textContent =
+    `proxy ${fmtUs(pre + relay)} \u00B7 upstream ${fmtUs(wait)} \u00B7 ` +
+    `first byte ${fmtUs(ttfb.p50_us)} \u00B7 ` +
+    `${share < 1 ? share.toFixed(2) : share.toFixed(1)}% spent in llmproxy`;
 }
 
 // Cost and resilience only earn a tile once they have something to say: an

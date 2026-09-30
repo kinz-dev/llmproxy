@@ -2,39 +2,80 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use crate::token_estimate::TokenSource;
+
 use super::*;
+
+fn estimate(tokens: u64, source: TokenSource) -> (u64, TokenSource) {
+    (tokens, source)
+}
+
+fn estimate_for(text: &str) -> TokenEstimate {
+    proxy_stats().estimate_tokens(&json!(text))
+}
 
 #[test]
 fn latency_percentiles_use_nearest_rank() {
-    let window = LatencyWindow::default();
-    assert_eq!(window.percentiles(), (None, None, 0));
+    let window = LatencyRing::<LATENCY_WINDOW_CAP>::default();
+    assert_eq!(window.summary(), Default::default());
     for ms in 1..=100u64 {
         window.record(Duration::from_millis(ms));
     }
-    let (p50, p99, samples) = window.percentiles();
-    assert_eq!(p50, Some(50));
-    assert_eq!(p99, Some(99));
-    assert_eq!(samples, 100);
+    let summary = window.summary();
+    assert_eq!(summary.p50_us, Some(50_000));
+    assert_eq!(summary.p99_us, Some(99_000));
+    assert_eq!(summary.samples, 100);
+    // The millisecond fields the dashboard has always read still hold.
+    let json = summary.to_json();
+    assert_eq!(json["p50_ms"], json!(50));
+    assert_eq!(json["p99_ms"], json!(99));
 }
 
 #[test]
 fn latency_window_is_bounded() {
-    let window = LatencyWindow::default();
+    let window = LatencyRing::<LATENCY_WINDOW_CAP>::default();
     for _ in 0..(LATENCY_WINDOW_CAP + 10) {
         window.record(Duration::from_millis(7));
     }
-    let (_, _, samples) = window.percentiles();
-    assert_eq!(samples, LATENCY_WINDOW_CAP);
+    let summary = window.summary();
+    assert_eq!(summary.samples, LATENCY_WINDOW_CAP);
+    // The window is bounded; the lifetime count it reports is not.
+    assert_eq!(summary.total, LATENCY_WINDOW_CAP as u64 + 10);
 }
 
 #[test]
 fn provider_call_window_is_bounded_but_count_is_not() {
-    let mut calls = ProviderCalls::default();
+    let calls = ProviderCalls::default();
     for _ in 0..(PROVIDER_LATENCY_CAP + 10) {
         calls.record(Duration::from_millis(5));
     }
-    assert_eq!(calls.count as usize, PROVIDER_LATENCY_CAP + 10);
-    assert_eq!(calls.latency.percentiles().2, PROVIDER_LATENCY_CAP);
+    assert_eq!(
+        calls.count.load(Ordering::Relaxed) as usize,
+        PROVIDER_LATENCY_CAP + 10
+    );
+    assert_eq!(calls.latency.summary().samples, PROVIDER_LATENCY_CAP);
+}
+
+#[test]
+fn a_route_row_is_interned_once_and_reused() {
+    // The request path must not allocate a fresh key per request: the second
+    // sighting of a route has to resolve to the very same row.
+    let registry = MetricRegistry::<2, AtomicU64>::default();
+    let first = registry.row(["chat_completions", "local"]);
+    let second = registry.row(["chat_completions", "local"]);
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(registry.snapshot().len(), 1);
+    registry.row(["responses", "local"]);
+    assert_eq!(registry.snapshot().len(), 2);
+}
+
+#[test]
+fn money_accumulates_through_a_shared_reference() {
+    let total = AtomicF64::default();
+    assert_eq!(total.get(), 0.0);
+    total.add(0.25);
+    total.add(0.5);
+    assert!((total.get() - 0.75).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -87,24 +128,36 @@ fn usage_extraction_reads_openai_and_anthropic_shapes() {
     assert_eq!(usage_tokens(&json!({ "other": 1 })), None);
 }
 
+fn sniffer_read(key: &str, body: &[u8], input: u64, output: u64) {
+    let input_estimate = estimate_for("hello there");
+    let mut sniffer = UsageSniffer::new(false);
+    sniffer.feed(body);
+    assert_eq!(
+        sniffer.finish(&input_estimate, true),
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            estimated: false,
+            input_source: TokenSource::Exact,
+            output_source: TokenSource::Exact,
+        },
+        "{key}"
+    );
+}
+
 #[test]
 fn sniffer_reads_usage_from_buffered_json() {
-    let mut sniffer = UsageSniffer::new(false);
-    sniffer.feed(
+    sniffer_read(
+        "buffered",
         br#"{"id":"x","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":100,"completion_tokens":25}}"#,
-    );
-    assert_eq!(
-        sniffer.finish(1, true),
-        TokenUsage {
-            input_tokens: 100,
-            output_tokens: 25,
-            estimated: false,
-        }
+        100,
+        25,
     );
 }
 
 #[test]
 fn sniffer_skips_null_usage_in_stream_chunks() {
+    let input_estimate = estimate_for("hello there");
     let mut sniffer = UsageSniffer::new(true);
     sniffer.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n");
     sniffer.feed(
@@ -112,71 +165,84 @@ fn sniffer_skips_null_usage_in_stream_chunks() {
     );
     sniffer.feed(b"data: [DONE]\n\n");
     assert_eq!(
-        sniffer.finish(1, true),
+        sniffer.finish(&input_estimate, true),
         TokenUsage {
             input_tokens: 7,
             output_tokens: 3,
             estimated: false,
+            input_source: TokenSource::Exact,
+            output_source: TokenSource::Exact,
         }
     );
 }
 
 #[test]
 fn sniffer_estimates_when_usage_is_missing() {
+    let input_estimate = estimate_for("hello there");
+    let input_tokens = input_estimate.tokens;
     let mut sniffer = UsageSniffer::new(false);
     sniffer.feed(&[b'x'; 400]);
-    assert_eq!(
-        sniffer.finish(33, true),
-        TokenUsage {
-            input_tokens: 33,
-            output_tokens: 100,
-            estimated: true,
-        }
-    );
+    // The 400 'x' bytes decode to 400 ASCII characters. With no prior
+    // calibration the prose default ratio (0.25 tokens/char) yields 100.
+    let usage = sniffer.finish(&input_estimate, true);
+    assert_eq!(usage.input_tokens, input_tokens);
+    assert_eq!(usage.output_tokens, 100);
+    assert!(usage.estimated);
+    assert_eq!(usage.input_source, input_estimate.source);
+    assert_eq!(usage.output_source, TokenSource::Default);
 }
 
 #[test]
 fn sniffer_does_not_invent_embedding_output_tokens() {
+    let input_estimate = estimate_for("hello there");
     let mut sniffer = UsageSniffer::new(false);
     sniffer.feed(br#"{"usage":{"prompt_tokens":12,"total_tokens":12},"data":[[1,2,3]]}"#);
     assert_eq!(
-        sniffer.finish(1, false),
+        sniffer.finish(&input_estimate, false),
         TokenUsage {
             input_tokens: 12,
             output_tokens: 0,
             estimated: true,
+            input_source: TokenSource::Exact,
+            output_source: TokenSource::Exact,
         }
     );
 }
 
 #[test]
 fn sniffer_survives_usage_split_across_tail_boundary() {
+    let input_estimate = estimate_for("hello there");
     let mut sniffer = UsageSniffer::new(true);
     // Fill beyond the tail cap, then append the usage chunk; the tail must
     // still contain the complete usage object.
     sniffer.feed(&vec![b'p'; SNIFFER_TAIL_CAP + 512]);
     sniffer.feed(b"data: {\"usage\":{\"input_tokens\":11,\"output_tokens\":22}}\n\n");
     assert_eq!(
-        sniffer.finish(1, true),
+        sniffer.finish(&input_estimate, true),
         TokenUsage {
             input_tokens: 11,
             output_tokens: 22,
             estimated: false,
+            input_source: TokenSource::Exact,
+            output_source: TokenSource::Exact,
         }
     );
 }
 
 #[test]
 fn sniffer_combines_anthropic_stream_usage_events() {
+    let input_estimate = estimate_for("hello there");
     let mut sniffer = UsageSniffer::new(true);
     sniffer.feed(b"data: {\"usage\":{\"input_tokens\":17}}\n\n");
     sniffer.feed(b"data: {\"usage\":{\"output_tokens\":8}}\n\n");
     assert_eq!(
-        sniffer.finish(1, true),
+        sniffer.finish(&input_estimate, true),
         TokenUsage {
             input_tokens: 17,
             output_tokens: 8,
             estimated: false,
+            input_source: TokenSource::Exact,
+            output_source: TokenSource::Exact,
         }
     );
 }
@@ -201,8 +267,8 @@ fn stats_counters_and_snapshot_shape() {
     stats.record_intercept_reject();
     let local_usage = TokenUsage::from_response(
         Some(&json!({ "prompt_tokens": 10, "completion_tokens": 5 })),
-        1,
-        1,
+        estimate(1, TokenSource::Default),
+        estimate(1, TokenSource::Default),
     );
     stats.record_model_usage(
         "local",
@@ -235,12 +301,14 @@ fn stats_counters_and_snapshot_shape() {
             input_tokens: 20,
             output_tokens: 30,
             estimated: false,
+            input_source: TokenSource::Exact,
+            output_source: TokenSource::Exact,
         },
         RequestPricing::default(),
     );
     stats.record_routing_destination("responses", "openai", "gpt-test", false);
     stats.record_routing_destination("responses", "openai", "gpt-test", true);
-    stats.record_tokens_saved(0, 50, true);
+    stats.record_tokens_saved(0, 50, TokenSource::Exact, TokenSource::Default);
 
     let snapshot = stats.snapshot_json();
     assert_eq!(snapshot["requests"]["total"], 1);

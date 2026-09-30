@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     env,
     ffi::OsString,
@@ -47,9 +48,12 @@ mod claude_launcher;
 mod codex_launcher;
 mod copilot_launcher;
 mod interceptor;
+mod latency;
 mod logging;
 mod oauth;
+mod privacy;
 mod stats;
+mod token_estimate;
 
 use agent_launcher::{
     AgentLaunch, LauncherKind, LauncherMode, LauncherSession, probe_existing_llmproxy,
@@ -63,12 +67,13 @@ use interceptor::{
     IntegratedConfig, InterceptionOutcome, InterceptionPolicy, InterceptorConfig,
     InterceptorProtocol, maybe_intercept,
 };
+use privacy::PrivacyConfig;
 use stats::{
     ModelPrice, RemapKind, RequestPricing, ResponseTracking, RouteClass, log_request_value,
     proxy_stats, route_class_for_base_url, track_response,
 };
 
-#[cfg(unix)]
+#[cfg(all(unix, not(test)))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -251,6 +256,8 @@ struct Config {
     /// Deterministic routes evaluated before any triage request, in order.
     routing_rules: Vec<RoutingRule>,
     pricing: PricingConfig,
+    /// Opt-in confidentiality boundary for public model dispatch.
+    privacy: PrivacyConfig,
     /// The one routing behavior for this instance. Legacy configs without this
     /// key migrate from the per-section `enabled` flags in `parse_config`.
     routing_mode: RoutingMode,
@@ -279,6 +286,7 @@ impl Default for Config {
             admin: AdminConfig::default(),
             routing_rules: Vec::new(),
             pricing: PricingConfig::default(),
+            privacy: PrivacyConfig::default(),
             routing_mode: RoutingMode::Proxy,
             model_routing: ModelRoutingMode::Remap,
             anthropic_mode: AnthropicMode::ChatCompletions,
@@ -775,7 +783,13 @@ impl SharedState {
 struct ProviderState {
     name: String,
     config: Arc<UpstreamConfig>,
+    /// Outbound headers resolved once, so the request path only clones.
+    headers: Arc<ProviderHeaders>,
     client: Client,
+    /// The policy the running instance built this provider under, attached so
+    /// the transport gate can verify the final payload without reaching for
+    /// mutable global state.
+    privacy_state: Option<AppState>,
     model_cache: Arc<ModelCache>,
     model_refresh: Arc<AsyncMutex<()>>,
     breaker: Arc<CircuitBreaker>,
@@ -937,6 +951,7 @@ enum UpstreamErrorKind {
     Body,
     Decode,
     Status,
+    Privacy,
     Unknown,
 }
 
@@ -949,17 +964,27 @@ impl UpstreamErrorKind {
             Self::Body => "body",
             Self::Decode => "decode",
             Self::Status => "status",
+            Self::Privacy => "privacy",
             Self::Unknown => "unknown",
         }
     }
 }
 
 #[derive(Debug, Clone)]
+/// Identity and disposition of one upstream call.
+///
+/// Every field is a cheap handle rather than an owned copy, because this
+/// value is created per request and cloned again per streaming relay. The
+/// provider name and request id are refcounted, and the path is almost always
+/// a literal, so a clone bumps refcounts instead of copying strings.
 struct UpstreamRequestMeta {
-    provider: String,
-    request_id: String,
+    provider: Arc<str>,
+    request_id: Arc<str>,
+    /// The request id pre-encoded as a header value, so attaching it to an
+    /// outbound request is a refcount bump rather than a fresh validation.
+    request_id_header: HeaderValue,
     method: Method,
-    path: String,
+    path: Cow<'static, str>,
     response_kind: UpstreamResponseKind,
     idempotent: bool,
     log_bodies: bool,
@@ -970,15 +995,17 @@ impl UpstreamRequestMeta {
         provider: &str,
         incoming_headers: &HeaderMap,
         method: Method,
-        path: &str,
+        path: impl Into<Cow<'static, str>>,
         response_kind: UpstreamResponseKind,
         idempotent: bool,
     ) -> Self {
+        let (request_id, request_id_header) = request_identity(incoming_headers);
         Self {
-            provider: provider.to_string(),
-            request_id: request_id_from_headers(incoming_headers),
+            provider: Arc::from(provider),
+            request_id,
+            request_id_header,
             method,
-            path: path.to_string(),
+            path: path.into(),
             response_kind,
             idempotent,
             log_bodies: true,
@@ -993,10 +1020,10 @@ impl UpstreamRequestMeta {
 
 #[derive(Debug, Clone)]
 struct UpstreamFailure {
-    provider: String,
-    request_id: String,
+    provider: Arc<str>,
+    request_id: Arc<str>,
     method: Method,
-    path: String,
+    path: Cow<'static, str>,
     response_kind: UpstreamResponseKind,
     kind: UpstreamErrorKind,
     message: String,
@@ -1032,6 +1059,21 @@ impl UpstreamFailure {
 
     /// A borrowed-OAuth token could not be resolved (missing file, refresh
     /// failure). Treated as a request-setup error, never retried.
+    /// The confidentiality boundary refused the destination. This is a policy
+    /// refusal, not an availability failure, so it is never failed over.
+    pub(crate) fn privacy(meta: &UpstreamRequestMeta, error: impl Into<String>) -> Self {
+        Self {
+            provider: meta.provider.clone(),
+            request_id: meta.request_id.clone(),
+            method: meta.method.clone(),
+            path: meta.path.clone(),
+            response_kind: meta.response_kind,
+            kind: UpstreamErrorKind::Privacy,
+            message: error.into(),
+            upstream_status: None,
+        }
+    }
+
     fn oauth(meta: &UpstreamRequestMeta, error: impl Into<String>) -> Self {
         Self {
             provider: meta.provider.clone(),
@@ -1091,14 +1133,14 @@ impl UpstreamFailure {
     /// it to another provider cannot duplicate generation that already ran.
     /// Body and decode failures are deliberately excluded: those mean the
     /// upstream did generate, and a second call would bill for it twice.
-    fn is_failover_safe(&self) -> bool {
+    pub(crate) fn is_failover_safe(&self) -> bool {
         matches!(
             self.kind,
             UpstreamErrorKind::Connect | UpstreamErrorKind::Timeout | UpstreamErrorKind::Request
         ) || self.upstream_status.is_some_and(is_failover_status)
     }
 
-    fn is_retryable(&self) -> bool {
+    pub(crate) fn is_retryable(&self) -> bool {
         matches!(
             self.kind,
             UpstreamErrorKind::Connect
@@ -1213,6 +1255,50 @@ impl ModelCache {
             "first seen model"
         );
     }
+}
+
+pub(crate) fn request_context(headers: &HeaderMap) -> (String, Option<String>) {
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(generate_request_id);
+    let conversation = headers
+        .get("x-session-id")
+        .or_else(|| headers.get("session-id"))
+        .or_else(|| headers.get("x-codex-thread-id"))
+        .or_else(|| headers.get("thread-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    (request_id, conversation)
+}
+
+/// The request id in both the forms the pipeline needs: a string for logs and
+/// a header value for the outbound request.
+///
+/// The tracing middleware has already stamped `x-request-id` on every served
+/// request, so the common path clones the existing header value (a refcount
+/// bump on its backing bytes) and allocates only the string form. A request
+/// that arrives without one — an internal or test call — generates it.
+fn request_identity(headers: &HeaderMap) -> (Arc<str>, HeaderValue) {
+    if let Some(value) = headers.get("x-request-id")
+        && let Ok(text) = value.to_str()
+        && !text.trim().is_empty()
+    {
+        let trimmed = text.trim();
+        if trimmed.len() == text.len() {
+            return (Arc::from(trimmed), value.clone());
+        }
+        if let Ok(header) = HeaderValue::from_str(trimmed) {
+            return (Arc::from(trimmed), header);
+        }
+    }
+    let generated = generate_request_id();
+    let header = HeaderValue::from_str(&generated)
+        .unwrap_or_else(|_| HeaderValue::from_static("llmproxy-request"));
+    (Arc::from(generated), header)
 }
 
 fn request_id_from_headers(headers: &HeaderMap) -> String {
@@ -1346,13 +1432,7 @@ async fn main() -> Result<()> {
     }
 
     if cli.foreground {
-        run_server(
-            config,
-            config_path,
-            None,
-            logging_guard.file_name().map(ToOwned::to_owned),
-        )
-        .await?;
+        run_server(config, config_path, None, logging_guard.file_name()).await?;
         return Ok(());
     }
 
@@ -1383,13 +1463,13 @@ async fn run_server(
     for (name, upstream) in effective_provider_configs(&config)? {
         providers.insert(name.clone(), build_provider_state(name, upstream)?);
     }
-    let state = AppState {
+    let state = attach_privacy_boundary(AppState {
         config: config.clone(),
         providers: Arc::new(providers),
         launcher_kind: None,
         launcher_mode: None,
         forward_caller_credentials: config.routing_mode != RoutingMode::Integrated,
-    };
+    });
     let shared = SharedState::new(state.clone());
 
     if config.model_routing == ModelRoutingMode::Remap {
@@ -1534,28 +1614,35 @@ async fn route_not_found(request: Request) -> Response {
 
 async fn trace_http_request(mut request: Request, next: Next) -> Response {
     let method = request.method().clone();
-    let path = request.uri().path().to_string();
-    let request_id = request_id_from_headers(request.headers());
-    if let Ok(value) = HeaderValue::from_str(&request_id) {
-        request
-            .headers_mut()
-            .insert(HeaderName::from_static("x-request-id"), value);
-    }
+    // `Uri` holds its parts in refcounted bytes, so keeping it for the log
+    // lines below is a refcount bump rather than a copy of the path on every
+    // request, served or not.
+    let uri = request.uri().clone();
+    // Stamped onto the request here so the rest of the pipeline can reuse the
+    // encoded header value instead of re-encoding the id per upstream call.
+    let (request_id, request_id_header) = request_identity(request.headers());
+    request.headers_mut().insert(
+        HeaderName::from_static("x-request-id"),
+        request_id_header.clone(),
+    );
+    let path = uri.path();
     let started = Instant::now();
-    trace!(request_id, method = %method, path, "client request started");
-    let mut response = next.run(request).await;
-    if !response.headers().contains_key("x-request-id")
-        && let Ok(value) = HeaderValue::from_str(&request_id)
-    {
+    trace!(request_id = %request_id, method = %method, path, "client request started");
+    // Every served request passes through here, so this is the one place a
+    // per-request timing context can be installed exactly once. Phases
+    // recorded deeper in the pipeline attach to it without any intermediate
+    // signature having to carry them.
+    let mut response = latency::with_request_timing(next.run(request)).await;
+    if !response.headers().contains_key("x-request-id") {
         response
             .headers_mut()
-            .insert(HeaderName::from_static("x-request-id"), value);
+            .insert(HeaderName::from_static("x-request-id"), request_id_header);
     }
     let status = response.status();
     if status.is_success() {
         trace!(
             method = %method,
-            request_id,
+            request_id = %request_id,
             path,
             status = status.as_u16(),
             elapsed_ms = started.elapsed().as_millis(),
@@ -1564,7 +1651,7 @@ async fn trace_http_request(mut request: Request, next: Next) -> Response {
     } else {
         error!(
             method = %method,
-            request_id,
+            request_id = %request_id,
             path,
             status = status.as_u16(),
             elapsed_ms = started.elapsed().as_millis(),
@@ -1578,6 +1665,7 @@ async fn trace_http_request(mut request: Request, next: Next) -> Response {
     let (parts, body) = response.into_parts();
     let mut body_stream = body.into_data_stream();
     let error_body = async_stream::stream! {
+        let path = uri.path();
         let mut chunk_index = 0_u64;
         while let Some(chunk) = body_stream.next().await {
             match &chunk {
@@ -1585,7 +1673,7 @@ async fn trace_http_request(mut request: Request, next: Next) -> Response {
                     chunk_index = chunk_index.saturating_add(1);
                     error!(
                         method = %method,
-                        request_id,
+                        request_id = %request_id,
                         path,
                         status = status.as_u16(),
                         chunk_index,
@@ -1595,7 +1683,7 @@ async fn trace_http_request(mut request: Request, next: Next) -> Response {
                 }
                 Err(body_error) => error!(
                     method = %method,
-                    request_id,
+                    request_id = %request_id,
                     path,
                     status = status.as_u16(),
                     error = %body_error,
@@ -1606,6 +1694,33 @@ async fn trace_http_request(mut request: Request, next: Next) -> Response {
         }
     };
     Response::from_parts(parts, Body::from_stream(error_body))
+}
+
+/// Attaches the policy snapshot to every provider so the transport gate can
+/// verify an outbound payload against the same policy that routed it. This is
+/// the only way a provider acquires a boundary, and it happens where the
+/// validated config is already in hand.
+pub(crate) fn attach_privacy_boundary(state: AppState) -> AppState {
+    if !state.config.privacy.enabled() {
+        return state;
+    }
+    let providers = state
+        .providers
+        .iter()
+        .map(|(name, provider)| {
+            (
+                name.clone(),
+                ProviderState {
+                    privacy_state: Some(state.clone()),
+                    ..provider.clone()
+                },
+            )
+        })
+        .collect();
+    AppState {
+        providers: Arc::new(providers),
+        ..state
+    }
 }
 
 fn build_provider_state(name: String, upstream: UpstreamConfig) -> Result<ProviderState> {
@@ -1625,8 +1740,10 @@ fn build_provider_state(name: String, upstream: UpstreamConfig) -> Result<Provid
     ));
     Ok(ProviderState {
         name,
+        headers: Arc::new(ProviderHeaders::new(&upstream)),
         config: Arc::new(upstream),
         client,
+        privacy_state: None,
         model_cache: Arc::new(ModelCache::default()),
         model_refresh: Arc::new(AsyncMutex::new(())),
         breaker,
@@ -2273,6 +2390,7 @@ const CONFIG_KEYS: &[&str] = &[
     "admin",
     "routing_rules",
     "pricing",
+    "privacy",
 ];
 const PROVIDER_KEYS: &[&str] = &[
     "kind",
@@ -2323,6 +2441,25 @@ const ROUTING_RULE_KEYS: &[&str] = &[
     "contains_any",
     "requested_model",
     "route",
+];
+const PRIVACY_KEYS: &[&str] = &[
+    "mode",
+    "private-providers",
+    "private-networks",
+    "on-sensitive",
+    "private-target",
+    "screening-provider",
+    "screening-model",
+    "screening-timeout-ms",
+    "detector-sensitivity",
+    "sensitive-source-labels",
+    "detectors",
+];
+const PRIVACY_DETECTOR_KEYS: &[&str] = &[
+    "category",
+    "patterns",
+    "regexes",
+    "applies-to-credential-fields",
 ];
 const PRICING_KEYS: &[&str] = &["baseline_model", "models"];
 const MODEL_PRICE_KEYS: &[&str] = &["input_per_mtok", "output_per_mtok"];
@@ -2398,6 +2535,21 @@ fn warn_on_unknown_config_keys(document: &toml::Table, source: &str, found: &mut
                     ROUTING_RULE_KEYS,
                     found,
                 );
+            }
+        }
+    }
+    if let Some(privacy) = table(document, "privacy") {
+        check(privacy, "privacy", PRIVACY_KEYS, found);
+        if let Some(detectors) = table(privacy, "detectors") {
+            for (name, item) in detectors {
+                if let Some(detector) = item.as_table() {
+                    check(
+                        detector,
+                        &format!("privacy.detectors.{name}"),
+                        PRIVACY_DETECTOR_KEYS,
+                        found,
+                    );
+                }
             }
         }
     }
@@ -2500,6 +2652,93 @@ fn request_state(shared: &SharedState, launcher_token: Option<&str>) -> Response
         .map_err(|error| Box::new(launcher_error_response(error.to_string())))
 }
 
+/// Refuses a generation request whose content is not eligible for the
+/// destination routing chose. The caller receives its own protocol's successful
+/// no-action response; there is no silent fallback to another provider.
+fn privacy_denial(
+    state: &AppState,
+    headers: &HeaderMap,
+    protocol: InterceptorProtocol,
+    body: &Value,
+    enforcement: &privacy::Enforcement,
+) -> Response {
+    privacy::denial(state, headers, protocol, body, enforcement).response
+}
+
+/// The non-native refusal shape for opaque and control endpoints, which have
+/// no assistant turn to render.
+fn privacy_error(
+    state: &AppState,
+    headers: &HeaderMap,
+    context: &str,
+    body: &Value,
+    enforcement: &privacy::Enforcement,
+) -> Response {
+    let (request_id, conversation) = request_context(headers);
+    privacy::record_disposition(
+        state,
+        &request_id,
+        context,
+        body.get("model")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        None,
+        enforcement,
+    );
+    if let Some(conversation) = conversation {
+        privacy::bind_conversation_for_denial(&conversation, &enforcement.decision);
+    }
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": {
+                "message": format!(
+                    "llmproxy kept this request away from public models: {}",
+                    enforcement.reason
+                ),
+                "type": "privacy_policy_error",
+                "classification": enforcement.classification.as_str(),
+                "categories": enforcement.categories,
+                "request_id": request_id
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Screens a native launcher generation request against its fixed upstream and
+/// renders the refusal in the caller's protocol when it is not clear.
+async fn privacy_screen_native(
+    state: &AppState,
+    headers: &HeaderMap,
+    protocol: InterceptorProtocol,
+    body: &Value,
+) -> Option<Response> {
+    if state.launcher_mode != Some(LauncherMode::Intercept) {
+        return None;
+    }
+    let enforcement =
+        privacy::screen_native_session(state, state.default_provider(), protocol.as_str(), body)
+            .await?;
+    if enforcement.permitted {
+        return None;
+    }
+    Some(privacy_denial(state, headers, protocol, body, &enforcement))
+}
+
+/// Remembers a sensitive conversation after its request has passed screening,
+/// so compaction that removes the triggering text cannot lift the restriction.
+fn bind_screened_conversation(
+    state: &AppState,
+    headers: &HeaderMap,
+    hop: Option<&privacy::HopPrivacy>,
+) {
+    let (_, conversation) = request_context(headers);
+    if let (Some(conversation), Some(hop)) = (conversation, hop) {
+        privacy::mark_conversation_privately_dispatched(state, &conversation, hop.decision());
+    }
+}
+
 fn trace_client_request(
     frontend: &str,
     launcher_token: Option<&str>,
@@ -2561,7 +2800,7 @@ async fn launcher_copilot_models(
         launcher_token.as_str(),
         &headers,
         Method::GET,
-        "models",
+        Cow::Borrowed("models"),
     )
     .await
 }
@@ -2576,7 +2815,7 @@ async fn launcher_copilot_model_by_id(
         launcher_token.as_str(),
         &headers,
         Method::GET,
-        &format!("models/{model}"),
+        format!("models/{model}").into(),
     )
     .await
 }
@@ -2591,7 +2830,7 @@ async fn launcher_copilot_model_policy(
         launcher_token.as_str(),
         &headers,
         Method::POST,
-        &format!("models/{model}/policy"),
+        format!("models/{model}/policy").into(),
     )
     .await
 }
@@ -2601,7 +2840,7 @@ async fn copilot_relay_endpoint_impl(
     launcher_token: &str,
     headers: &HeaderMap,
     method: Method,
-    upstream_path: &str,
+    upstream_path: Cow<'static, str>,
 ) -> Response {
     let state = match request_state(shared, Some(launcher_token)) {
         Ok(state) => state,
@@ -2609,6 +2848,14 @@ async fn copilot_relay_endpoint_impl(
     };
     if state.launcher_kind != Some(LauncherKind::Copilot) {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    // An opaque GET/POST relay carries no body to inspect. A configured
+    // privacy boundary blocks it rather than trusting that model-policy and
+    // session relays never carry customer context.
+    if let Some(enforcement) = privacy::screen_opaque_body(&state, "relay", &Value::Null).await
+        && !enforcement.permitted
+    {
+        return privacy_error(&state, headers, &upstream_path, &Value::Null, &enforcement);
     }
     proxy_relay(
         state.default_provider(),
@@ -2630,6 +2877,27 @@ async fn models_impl(
         Ok(state) => state,
         Err(response) => return *response,
     };
+    // Discovery itself carries no customer context, but the caller
+    // authentication forwarded to a caller-authenticated upstream does, so a
+    // public discovery hop requires a verified-clear caller identity.
+    if state.config.privacy.enabled()
+        && route_class_for_base_url(&state.default_provider().config.base_url)
+            == stats::RouteClass::External
+        && headers.keys().count() > 0
+    {
+        let caller_identity = headers
+            .iter()
+            .map(|(name, value)| format!("{name}:{}", value.to_str().unwrap_or("<binary>")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = json!({ "caller-identity": caller_identity });
+        if let Some(enforcement) =
+            privacy::screen_opaque_body(&state, "chat_completions", &body).await
+            && !enforcement.permitted
+        {
+            return privacy_error(&state, &headers, "models", &Value::Null, &enforcement);
+        }
+    }
     if state.config.model_routing == ModelRoutingMode::Passthrough {
         let provider = state.default_provider();
         let provider_headers = provider_request_headers(&state, &headers, provider);
@@ -2765,7 +3033,7 @@ async fn model_by_id_impl(
     if state.config.model_routing == ModelRoutingMode::Passthrough {
         let provider = state.default_provider();
         let provider_headers = provider_request_headers(&state, &headers, provider);
-        return match proxy_get(provider, &provider_headers, &format!("models/{model}")).await {
+        return match proxy_get(provider, &provider_headers, format!("models/{model}")).await {
             Ok(model) => Json(model).into_response(),
             Err(error_response) => error_response,
         };
@@ -2850,6 +3118,11 @@ async fn completions_impl(
     trace_client_request("completions", launcher_token, &body, false);
     proxy_stats().record_request();
     let started = Instant::now();
+    if let Some(enforcement) = privacy::screen_opaque_body(&state, "completions", &body).await
+        && !enforcement.permitted
+    {
+        return privacy_error(&state, &headers, "completions", &body, &enforcement);
+    }
     let provider = match rewrite_proxy_request_value(&state, &headers, &mut body).await {
         Ok(provider) => provider,
         Err(error_response) => return *error_response,
@@ -2857,7 +3130,7 @@ async fn completions_impl(
     let provider_headers = provider_request_headers(&state, &headers, &provider);
     let class = route_class_for_base_url(&provider.config.base_url);
     let model = request_model(&body).to_string();
-    let estimated_input_tokens = estimate_tokens(&body) as u64;
+    let input_estimate = estimate_tokens(&body);
     log_request_value(class, &provider.name, &body);
     let model_started = Instant::now();
     let response = proxy_json(&provider, &provider_headers, "completions", &body).await;
@@ -2869,7 +3142,7 @@ async fn completions_impl(
             "completions",
             started,
             model_started,
-            estimated_input_tokens,
+            input_estimate,
         )
         .with_pricing(request_pricing(&state.config, &provider.name, &model)),
         response,
@@ -2906,6 +3179,11 @@ async fn embeddings_impl(
     trace_client_request("embeddings", launcher_token, &body, false);
     proxy_stats().record_request();
     let started = Instant::now();
+    if let Some(enforcement) = privacy::screen_opaque_body(&state, "embeddings", &body).await
+        && !enforcement.permitted
+    {
+        return privacy_error(&state, &headers, "embeddings", &body, &enforcement);
+    }
     let provider = match rewrite_proxy_request_value(&state, &headers, &mut body).await {
         Ok(provider) => provider,
         Err(error_response) => return *error_response,
@@ -2913,7 +3191,7 @@ async fn embeddings_impl(
     let provider_headers = provider_request_headers(&state, &headers, &provider);
     let class = route_class_for_base_url(&provider.config.base_url);
     let model = request_model(&body).to_string();
-    let estimated_input_tokens = estimate_tokens(&body) as u64;
+    let input_estimate = estimate_tokens(&body);
     log_request_value(class, &provider.name, &body);
     let model_started = Instant::now();
     let response = proxy_json(&provider, &provider_headers, "embeddings", &body).await;
@@ -2925,7 +3203,7 @@ async fn embeddings_impl(
             "embeddings",
             started,
             model_started,
-            estimated_input_tokens,
+            input_estimate,
         )
         .without_output_estimation()
         .with_pricing(request_pricing(&state.config, &provider.name, &model)),
@@ -2968,6 +3246,17 @@ async fn chat_completions_impl(
     );
     proxy_stats().record_request();
     let started = Instant::now();
+    if let Some(enforcement) = privacy::screen_opaque_body(&state, "chat_completions", &body).await
+        && !enforcement.permitted
+    {
+        return privacy_denial(
+            &state,
+            &headers,
+            InterceptorProtocol::ChatCompletions,
+            &body,
+            &enforcement,
+        );
+    }
     let routing_audit = if state.triage_enabled() {
         match maybe_intercept(
             &state,
@@ -3005,11 +3294,27 @@ async fn chat_completions_impl(
     }
     let class = route_class_for_base_url(&provider.config.base_url);
     let model = request_model(&body).to_string();
+    if state.launcher_mode == Some(LauncherMode::Intercept)
+        && let Some(response) = privacy_screen_native(
+            &state,
+            &headers,
+            InterceptorProtocol::ChatCompletions,
+            &body,
+        )
+        .await
+    {
+        if let Some(audit) = routing_audit {
+            audit.record_route_error("the confidentiality boundary blocked the native session");
+        }
+        return response;
+    }
     if let Some(audit) = routing_audit {
         audit.record_destination(&provider, &model);
     }
-    let estimated_input_tokens = estimate_tokens(&body) as u64;
+    let screened_hop = privacy::screen_hop(&state, &body).await;
+    let input_estimate = estimate_tokens(&body);
     log_request_value(class, &provider.name, &body);
+    bind_screened_conversation(&state, &headers, screened_hop.as_ref());
     let model_started = Instant::now();
     let (response, served) = if state.launcher_kind == Some(LauncherKind::Copilot)
         && state.config.model_routing == ModelRoutingMode::Passthrough
@@ -3019,7 +3324,16 @@ async fn chat_completions_impl(
             ServedBy::routed(&provider, &model),
         )
     } else {
-        proxy_chat_failover(&state, &provider, &headers, &body, ChatWire::Chat, None).await
+        proxy_chat_failover(
+            &state,
+            &provider,
+            &headers,
+            &body,
+            ChatWire::Chat,
+            None,
+            screened_hop,
+        )
+        .await
     };
     track_response(
         ResponseTracking::new(
@@ -3029,7 +3343,7 @@ async fn chat_completions_impl(
             "chat_completions",
             started,
             model_started,
-            estimated_input_tokens,
+            input_estimate,
         )
         .with_pricing(request_pricing(
             &state.config,
@@ -3080,6 +3394,17 @@ async fn responses_impl(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
+    if let Some(enforcement) = privacy::screen_opaque_body(&state, "responses", &body).await
+        && !enforcement.permitted
+    {
+        return privacy_denial(
+            &state,
+            &headers,
+            InterceptorProtocol::Responses,
+            &body,
+            &enforcement,
+        );
+    }
     let routing_audit = if state.triage_enabled() {
         let policy = InterceptionPolicy::for_responses(&headers, &body);
         let local_chat_request = responses_to_chat_request(&body);
@@ -3122,11 +3447,21 @@ async fn responses_impl(
     let provider_headers = provider_request_headers(&state, &headers, &provider);
     let class = route_class_for_base_url(&provider.config.base_url);
     let model = request_model(&rewritten).to_string();
+    if let Some(response) =
+        privacy_screen_native(&state, &headers, InterceptorProtocol::Responses, &rewritten).await
+    {
+        if let Some(audit) = routing_audit {
+            audit.record_route_error("the confidentiality boundary blocked the native session");
+        }
+        return response;
+    }
     if let Some(audit) = routing_audit {
         audit.record_destination(&provider, &model);
     }
-    let estimated_input_tokens = estimate_tokens(&rewritten) as u64;
+    let input_estimate = estimate_tokens(&rewritten);
     log_request_value(class, &provider.name, &rewritten);
+    let screened_hop = privacy::screen_hop(&state, &rewritten).await;
+    bind_screened_conversation(&state, &headers, screened_hop.as_ref());
 
     let model_started = Instant::now();
     let (response, served) = if passthrough {
@@ -3147,6 +3482,7 @@ async fn responses_impl(
             &chat_request,
             ChatWire::Responses,
             client_model,
+            screened_hop,
         )
         .await
     };
@@ -3158,7 +3494,7 @@ async fn responses_impl(
             "responses",
             started,
             model_started,
-            estimated_input_tokens,
+            input_estimate,
         )
         .with_pricing(request_pricing(
             &state.config,
@@ -3209,6 +3545,18 @@ async fn anthropic_messages_impl(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
+    if let Some(enforcement) =
+        privacy::screen_opaque_body(&state, "anthropic_messages", &body).await
+        && !enforcement.permitted
+    {
+        return privacy_denial(
+            &state,
+            &headers,
+            InterceptorProtocol::AnthropicMessages,
+            &body,
+            &enforcement,
+        );
+    }
     let routing_audit = if state.triage_enabled() {
         let local_chat_request = anthropic_message_to_chat_request(&body);
         match maybe_intercept(
@@ -3253,11 +3601,26 @@ async fn anthropic_messages_impl(
     let provider_headers = provider_request_headers(&state, &headers, &provider);
     let class = route_class_for_base_url(&provider.config.base_url);
     let model = request_model(&rewritten).to_string();
+    if let Some(response) = privacy_screen_native(
+        &state,
+        &headers,
+        InterceptorProtocol::AnthropicMessages,
+        &rewritten,
+    )
+    .await
+    {
+        if let Some(audit) = routing_audit {
+            audit.record_route_error("the confidentiality boundary blocked the native session");
+        }
+        return response;
+    }
     if let Some(audit) = routing_audit {
         audit.record_destination(&provider, &model);
     }
-    let estimated_input_tokens = estimate_tokens(&rewritten) as u64;
+    let input_estimate = estimate_tokens(&rewritten);
     log_request_value(class, &provider.name, &rewritten);
+    let screened_hop = privacy::screen_hop(&state, &rewritten).await;
+    bind_screened_conversation(&state, &headers, screened_hop.as_ref());
     if passthrough {
         let upstream_path = if provider.config.kind == ProviderKind::Copilot {
             "v1/messages"
@@ -3274,7 +3637,7 @@ async fn anthropic_messages_impl(
                 "anthropic_messages",
                 started,
                 model_started,
-                estimated_input_tokens,
+                input_estimate,
             )
             .with_pricing(request_pricing(&state.config, &provider.name, &model)),
             response,
@@ -3294,6 +3657,7 @@ async fn anthropic_messages_impl(
         &chat_request,
         ChatWire::Anthropic,
         client_model,
+        screened_hop,
     )
     .await;
     track_response(
@@ -3304,7 +3668,7 @@ async fn anthropic_messages_impl(
             "anthropic_messages",
             started,
             model_started,
-            estimated_input_tokens,
+            input_estimate,
         )
         .with_pricing(request_pricing(
             &state.config,
@@ -3327,8 +3691,9 @@ async fn launcher_anthropic_count_tokens(
 }
 
 async fn anthropic_count_tokens_impl(body: Value) -> Response {
+    let estimate = estimate_tokens(&body);
     Json(json!({
-        "input_tokens": estimate_tokens(&body)
+        "input_tokens": estimate.tokens
     }))
     .into_response()
 }
@@ -3409,7 +3774,7 @@ async fn codex_json_endpoint_impl(
     shared: &SharedState,
     launcher_token: Option<&str>,
     headers: &HeaderMap,
-    upstream_path: &str,
+    upstream_path: &'static str,
     body: &Value,
 ) -> Response {
     let state = match request_state(shared, launcher_token) {
@@ -3420,6 +3785,13 @@ async fn codex_json_endpoint_impl(
         && state.launcher_mode != Some(LauncherMode::Proxy)
     {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    // Control endpoints bypass triage, but a control request still carries the
+    // conversation, so it cannot bypass the confidentiality boundary.
+    if let Some(enforcement) = privacy::screen_opaque_body(&state, "codex_responses", body).await
+        && !enforcement.permitted
+    {
+        return privacy_error(&state, headers, upstream_path, body, &enforcement);
     }
     if state.launcher_mode == Some(LauncherMode::Proxy) {
         let mut rewritten = body.clone();
@@ -3488,12 +3860,11 @@ async fn fetch_upstream_models(
             ));
         }
 
-        let page_path = anthropic_models_page_path(&cursor);
         let page_meta = UpstreamRequestMeta::new(
             &provider.name,
             incoming_headers,
             Method::GET,
-            &page_path,
+            anthropic_models_page_path(&cursor),
             UpstreamResponseKind::Json,
             true,
         );
@@ -3777,12 +4148,30 @@ fn extract_model_ids(value: &Value) -> Vec<String> {
     ids
 }
 
-async fn send_upstream_once(
+pub(crate) async fn send_upstream_once(
     provider: &ProviderState,
     incoming_headers: &HeaderMap,
     meta: &UpstreamRequestMeta,
     body: Option<&Value>,
 ) -> std::result::Result<reqwest::Response, UpstreamFailure> {
+    // The last gate before a connection exists. It sees the final
+    // provider-formatted payload, so anything an adapter injected after
+    // request screening either passes its own fresh classification or keeps
+    // the destination closed. It also runs before credentials are attached,
+    // so a refused public destination never triggers an OAuth refresh.
+    if let Some(gate) = privacy::dispatch_gate(provider, body).await
+        && !gate.permitted
+    {
+        warn!(
+            provider = %meta.provider,
+            request_id = %meta.request_id,
+            upstream_path = %meta.path,
+            classification = gate.classification.as_str(),
+            "confidentiality boundary refused an outbound dispatch"
+        );
+        proxy_stats().record_privacy_block();
+        return Err(UpstreamFailure::privacy(meta, gate.reason));
+    }
     debug!(
         provider = %meta.provider,
         request_id = %meta.request_id,
@@ -3806,7 +4195,8 @@ async fn send_upstream_once(
         );
     }
 
-    let mut header_map = upstream_headers(&provider.config, incoming_headers, &meta.request_id);
+    let mut header_map =
+        upstream_headers(&provider.headers, incoming_headers, &meta.request_id_header);
     if let Some(oauth_provider) = provider.config.auth.oauth_provider() {
         match oauth::access_token(oauth_provider).await {
             Ok(token) => apply_oauth_headers(&mut header_map, &token, &meta.request_id),
@@ -3825,11 +4215,16 @@ async fn send_upstream_once(
         request = request.timeout(Duration::from_secs(provider.config.timeout_secs));
     }
 
+    // Everything from here to the response headers is the provider's time,
+    // not this proxy's. Attributing it explicitly is what lets the overhead
+    // figure mean "latency this process added" rather than "round trip".
+    let dispatched = Instant::now();
     let send = request.send();
     let response = if meta.response_kind == UpstreamResponseKind::Stream {
         match tokio::time::timeout(Duration::from_secs(provider.config.timeout_secs), send).await {
             Ok(response) => response,
             Err(_) => {
+                latency::add_upstream_wait(dispatched.elapsed());
                 return Err(UpstreamFailure::timeout(
                     meta,
                     format!(
@@ -3842,6 +4237,11 @@ async fn send_upstream_once(
     } else {
         send.await
     };
+    // Accumulated rather than published here: one request can make several
+    // upstream calls (model discovery, a failover hop, the generation itself),
+    // and the published figure has to be the wait that request actually paid.
+    // It is recorded once, per request, at the response boundary.
+    latency::add_upstream_wait(dispatched.elapsed());
 
     response.map_err(|error| UpstreamFailure::from_reqwest(meta, error))
 }
@@ -3932,8 +4332,11 @@ async fn upstream_json_once(
         return Err(UpstreamFailure::status_with_body(meta, status, &bytes));
     }
 
-    let bytes = response
-        .bytes()
+    // A buffered call has nothing to render until the whole body is in hand,
+    // so the body read is upstream's time too. A streaming call is different:
+    // there the wait genuinely ends at the headers, which is where it is
+    // already recorded.
+    let bytes = latency::timed_upstream(response.bytes())
         .await
         .map_err(|error| UpstreamFailure::from_reqwest(meta, error))?;
     if meta.log_bodies {
@@ -4036,7 +4439,7 @@ fn log_upstream_status(meta: &UpstreamRequestMeta, status: StatusCode, phase: &s
 async fn proxy_get(
     provider: &ProviderState,
     incoming_headers: &HeaderMap,
-    upstream_path: &str,
+    upstream_path: impl Into<Cow<'static, str>>,
 ) -> std::result::Result<Value, Response> {
     let meta = UpstreamRequestMeta::new(
         &provider.name,
@@ -4051,9 +4454,16 @@ async fn proxy_get(
         .map_err(|error| upstream_error_response(&error))
 }
 
-struct PreparedChatRequest {
+/// A request formatted for one provider's wire.
+///
+/// `body` is a `Cow` because the common case does not need a copy at all: an
+/// OpenAI-compatible provider with no reasoning-effort policy sends the
+/// request exactly as routed. A deep clone of the request tree costs one
+/// allocation per JSON node and scales with the prompt, so the copy is taken
+/// only when an adapter genuinely has to rewrite something.
+struct PreparedChatRequest<'a> {
     path: &'static str,
-    body: Value,
+    body: Cow<'a, Value>,
     anthropic_wire: bool,
 }
 
@@ -4107,13 +4517,15 @@ fn apply_provider_reasoning_effort(
     }
 }
 
-fn prepare_provider_chat_request(
+fn prepare_provider_chat_request<'a>(
     provider: &ProviderState,
-    chat_request: &Value,
-) -> PreparedChatRequest {
-    let mut chat_request = chat_request.clone();
+    chat_request: &'a Value,
+) -> PreparedChatRequest<'a> {
+    let mut chat_request = Cow::Borrowed(chat_request);
     if provider.config.kind == ProviderKind::Copilot {
-        sanitize_copilot_chat_request(&mut chat_request);
+        // `to_mut` is what takes the copy, so it is reached only on the wires
+        // that actually rewrite the body.
+        sanitize_copilot_chat_request(chat_request.to_mut());
     }
     let anthropic_wire = provider.config.kind == ProviderKind::Anthropic
         || (provider.config.kind == ProviderKind::Copilot
@@ -4130,15 +4542,17 @@ fn prepare_provider_chat_request(
             } else {
                 "messages"
             },
-            body,
+            body: Cow::Owned(body),
             anthropic_wire: true,
         }
     } else {
-        apply_provider_reasoning_effort(
-            provider,
-            ReasoningWire::ChatCompletions,
-            &mut chat_request,
-        );
+        if provider.config.reasoning_effort.is_some() {
+            apply_provider_reasoning_effort(
+                provider,
+                ReasoningWire::ChatCompletions,
+                chat_request.to_mut(),
+            );
+        }
         PreparedChatRequest {
             path: "chat/completions",
             body: chat_request,
@@ -4352,20 +4766,24 @@ async fn proxy_chat(
     }
 }
 
-/// One destination in a request's failover chain.
-struct FailoverHop<'a> {
-    provider: &'a ProviderState,
+/// One destination in a request's failover chain. Hops are owned because the
+/// privacy layer can append a permitted sensitivity reroute that no configured
+/// provider list contains.
+#[derive(Clone)]
+struct FailoverHop {
+    provider: ProviderState,
     /// Model to use on this hop; `None` keeps the request's own model.
-    model: Option<&'a str>,
+    model: Option<String>,
 }
 
 /// Which provider and model actually served a request. Failover means the
 /// routed destination and the serving destination can differ, and statistics
 /// must record what happened rather than what was intended.
 pub(crate) struct ServedBy {
-    provider: String,
-    model: String,
-    class: RouteClass,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    #[allow(dead_code)]
+    pub(crate) class: RouteClass,
 }
 
 impl ServedBy {
@@ -4383,22 +4801,25 @@ impl ServedBy {
 /// The routed provider first, then its configured fallbacks. Fallbacks are
 /// deliberately not followed recursively: one level keeps the worst-case
 /// latency of a request bounded and makes a misconfigured cycle impossible.
-fn failover_chain<'a>(state: &'a AppState, routed: &'a ProviderState) -> Vec<FailoverHop<'a>> {
+fn failover_chain(state: &AppState, routed: &ProviderState) -> Vec<FailoverHop> {
     let mut hops = vec![FailoverHop {
-        provider: routed,
+        provider: routed.clone(),
         model: None,
     }];
     let mut seen = HashSet::from([routed.name.as_str()]);
     for entry in &routed.config.fallback {
         let (name, model) = match entry.split_once('/') {
-            Some((name, model)) => (name, Some(model)),
+            Some((name, model)) => (name, Some(model.to_string())),
             None => (entry.as_str(), None),
         };
         if !seen.insert(name) {
             continue;
         }
         if let Some(provider) = state.providers.get(name) {
-            hops.push(FailoverHop { provider, model });
+            hops.push(FailoverHop {
+                provider: provider.clone(),
+                model,
+            });
         }
     }
     hops
@@ -4408,7 +4829,7 @@ fn failover_chain<'a>(state: &'a AppState, routed: &'a ProviderState) -> Vec<Fai
 /// three client protocols share one upstream pipeline, so they can share one
 /// failover driver too.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ChatWire {
+pub(crate) enum ChatWire {
     Chat,
     Responses,
     Anthropic,
@@ -4487,22 +4908,67 @@ async fn attempt_chat(
     Ok(wire.render_stream(response, meta, client_model).await)
 }
 
-/// Run a chat request through its failover chain. Returns the response and the
-/// destination that produced it.
-async fn proxy_chat_failover(
+/// Run a chat request through its failover chain. The optional hop privacy
+/// state is what makes the confidentiality boundary hold across hops: the
+/// gate runs again for each candidate destination with the exact hop body, so
+/// an unscreened or sensitive request can never be failovered onto a public
+/// provider, and a public fallback entry is simply not eligible for it.
+pub(crate) async fn proxy_chat_failover(
     state: &AppState,
     routed: &ProviderState,
     incoming_headers: &HeaderMap,
     chat_request: &Value,
     wire: ChatWire,
     client_model: Option<String>,
+    mut hop_privacy: Option<privacy::HopPrivacy>,
 ) -> (Response, ServedBy) {
-    let hops = failover_chain(state, routed);
+    let mut hops = failover_chain(state, routed);
+    let mut private_reroute = Vec::new();
+    if let Some(hop) = hop_privacy.as_ref()
+        && !hop.is_clear()
+        && let Some((provider, model)) =
+            privacy::private_reroute_target(&state.config.privacy, state)
+        && let Some(provider) = state.providers.get(&provider)
+    {
+        private_reroute.push(FailoverHop {
+            provider: provider.clone(),
+            model: Some(model),
+        });
+    }
+    // A sensitive or unclassifiable request is served by the approved private
+    // chain only: public fallback entries are ineligible, and the profile's
+    // declared private target is appended as the permitted privacy action.
+    if hop_privacy
+        .as_ref()
+        .is_some_and(|hop: &privacy::HopPrivacy| !hop.is_clear())
+    {
+        hops.retain(|hop| privacy::approved_private_provider(&state.config.privacy, &hop.provider));
+        hops.extend(private_reroute);
+    }
     let last_index = hops.len().saturating_sub(1);
     let mut exhausted: Option<UpstreamFailure> = None;
 
     for (index, hop) in hops.iter().enumerate() {
-        let provider = hop.provider;
+        let provider = &hop.provider;
+        if let Some(state_gate) = hop_privacy.as_mut() {
+            let enforcement = privacy::check_hop(state, state_gate, provider, chat_request).await;
+            if !enforcement.permitted {
+                privacy::record_disposition(
+                    state,
+                    &request_id_from_headers(incoming_headers),
+                    "chat_failover",
+                    Some(request_model(chat_request).to_string()),
+                    None,
+                    &enforcement,
+                );
+                warn!(
+                    provider = %provider.name,
+                    classification = enforcement.classification.as_str(),
+                    "privacy boundary skipped an ineligible failover destination"
+                );
+                continue;
+            }
+        }
         if !provider.breaker.allow() {
             proxy_stats().record_breaker_skip();
             warn!(
@@ -4513,18 +4979,26 @@ async fn proxy_chat_failover(
             continue;
         }
 
-        let mut request = chat_request.clone();
-        if index > 0 {
+        // The routed hop sends the request exactly as it was rewritten, so it
+        // is borrowed. Copying the request tree here cost one allocation per
+        // JSON node on every single request, scaling with the prompt, to
+        // produce a value that was then sent unchanged. Only a fallback hop,
+        // which must be re-normalized for a different provider, pays for it.
+        let request = if index > 0 {
+            let mut request = chat_request.clone();
             // A different provider must not receive another provider's signed
             // reasoning artifacts, and may not recognize the original model.
             sanitize_cross_provider_chat_request(&mut request);
-            if let Some(model) = hop.model
+            if let Some(model) = &hop.model
                 && let Some(object) = request.as_object_mut()
             {
-                object.insert("model".to_string(), Value::String(model.to_string()));
+                object.insert("model".to_string(), Value::String(model.clone()));
             }
             normalize_chat_completion_request(&mut request, &state.config);
-        }
+            Cow::Owned(request)
+        } else {
+            Cow::Borrowed(chat_request)
+        };
         let served = ServedBy {
             provider: provider.name.clone(),
             model: request_model(&request).to_string(),
@@ -4544,7 +5018,8 @@ async fn proxy_chat_failover(
         {
             Ok(response) => {
                 provider.breaker.record_success();
-                if index > 0 {
+                if index > 0 && !privacy::approved_private_provider(&state.config.privacy, provider)
+                {
                     proxy_stats().record_failover();
                     info!(
                         routed_provider = %routed.name,
@@ -4589,7 +5064,7 @@ async fn proxy_chat_failover(
 async fn proxy_json(
     provider: &ProviderState,
     incoming_headers: &HeaderMap,
-    upstream_path: &str,
+    upstream_path: impl Into<Cow<'static, str>>,
     body: &Value,
 ) -> Response {
     let response_kind = if request_is_streaming(body) {
@@ -4618,7 +5093,7 @@ async fn proxy_relay(
     provider: &ProviderState,
     incoming_headers: &HeaderMap,
     method: Method,
-    upstream_path: &str,
+    upstream_path: impl Into<Cow<'static, str>>,
     body: Option<&Value>,
     idempotent: bool,
 ) -> Response {
@@ -4751,7 +5226,7 @@ pub(crate) async fn proxy_integrated_chat(
     let headers = HeaderMap::new();
     let class = route_class_for_base_url(&provider.config.base_url);
     let started = Instant::now();
-    let estimated_input_tokens = estimate_tokens(&chat_request) as u64;
+    let input_estimate = estimate_tokens(&chat_request);
     log_request_value(class, &provider.name, &chat_request);
     let model_started = Instant::now();
     let response = match protocol {
@@ -4779,7 +5254,7 @@ pub(crate) async fn proxy_integrated_chat(
             protocol.as_str(),
             started,
             model_started,
-            estimated_input_tokens,
+            input_estimate,
         )
         .with_pricing(request_pricing(config, &provider.name, target_model)),
         response,
@@ -4893,8 +5368,10 @@ impl AppState {
             LAUNCHER_EXTERNAL_PROVIDER.to_string(),
             ProviderState {
                 name: LAUNCHER_EXTERNAL_PROVIDER.to_string(),
+                headers: Arc::new(ProviderHeaders::new(&external_config)),
                 config: Arc::new(external_config),
                 client: template_provider.client.clone(),
+                privacy_state: template_provider.privacy_state.clone(),
                 model_cache: Arc::new(ModelCache::default()),
                 model_refresh: Arc::new(AsyncMutex::new(())),
                 breaker: Arc::new(CircuitBreaker::new(0, Duration::from_secs(0))),
@@ -4929,84 +5406,147 @@ impl ProviderState {
     }
 }
 
-fn upstream_headers(
-    config: &UpstreamConfig,
-    incoming_headers: &HeaderMap,
-    request_id: &str,
-) -> HeaderMap {
-    let mut headers = HeaderMap::new();
+/// A provider's outbound headers, resolved once when the provider is built.
+///
+/// None of this depends on the request: the API key, the configured headers,
+/// and the wire defaults are fixed by configuration. Recomputing them per
+/// request meant formatting `Bearer {key}` into a fresh `String`, re-parsing
+/// every configured header name from bytes, and re-validating every value —
+/// on every single proxied call. Resolving them once turns the request path
+/// into a `HeaderMap` clone, whose values are refcounted `Bytes` rather than
+/// copied.
+struct ProviderHeaders {
+    /// The complete static set for a provider that carries its own
+    /// credentials, in the precedence the request path used to rebuild.
+    credentialed: HeaderMap,
+    /// Configured headers alone. On the passthrough path these are applied
+    /// after the caller's, because a configured header overrides the caller.
+    configured: HeaderMap,
+    /// Wire defaults alone. Applied last and only where absent, because the
+    /// caller's own value wins over a default.
+    defaults: HeaderMap,
+    /// Whether the provider supplies its own credentials. This is what decides
+    /// between the two paths, and it is also what stops caller credentials
+    /// from ever reaching a proxy-owned destination.
+    uses_proxy_credentials: bool,
+}
 
-    // Borrowed-OAuth providers own their credentials; the bearer token is
-    // attached later (asynchronously) in send_upstream_once. Here we only make
-    // sure caller credentials are not forwarded and set the static beta header.
-    let oauth_mode = config.auth != ProviderAuth::None;
-    let uses_proxy_credentials = config.api_key.is_some() || oauth_mode;
-    if let Some(api_key) = &config.api_key {
-        if let Ok(value) = HeaderValue::from_str(api_key) {
+impl ProviderHeaders {
+    fn new(config: &UpstreamConfig) -> Self {
+        // Borrowed-OAuth providers own their credentials; the bearer token is
+        // attached later (asynchronously) in send_upstream_once. Here we only
+        // make sure caller credentials are not forwarded and set the static
+        // beta header.
+        let oauth_mode = config.auth != ProviderAuth::None;
+        let uses_proxy_credentials = config.api_key.is_some() || oauth_mode;
+
+        let mut configured = HeaderMap::new();
+        for (name, value) in &config.headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                configured.insert(name, value);
+            }
+        }
+
+        let mut defaults = HeaderMap::new();
+        if matches!(config.kind, ProviderKind::Anthropic | ProviderKind::Copilot) {
+            defaults.insert(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_static("2023-06-01"),
+            );
+        }
+        if config.kind == ProviderKind::Copilot {
+            for (name, value) in [
+                ("copilot-integration-id", "vscode-chat"),
+                ("editor-version", "vscode/1.107.1"),
+                ("editor-plugin-version", "copilot-chat/0.26.7"),
+                ("openai-intent", "conversation-panel"),
+                ("x-github-api-version", "2022-11-28"),
+            ] {
+                defaults.insert(
+                    HeaderName::from_static(name),
+                    HeaderValue::from_static(value),
+                );
+            }
+        }
+
+        let mut credentialed = HeaderMap::new();
+        if let Some(api_key) = &config.api_key
+            && let Ok(value) = HeaderValue::from_str(api_key)
+        {
             match config.kind {
                 ProviderKind::Anthropic => {
-                    headers.insert(HeaderName::from_static("x-api-key"), value);
+                    credentialed.insert(HeaderName::from_static("x-api-key"), value);
                 }
                 _ => {
                     if let Ok(value) = HeaderValue::from_str(&format!("Bearer {api_key}")) {
-                        headers.insert(AUTHORIZATION, value);
+                        credentialed.insert(AUTHORIZATION, value);
                     }
                 }
             }
         }
-    } else if !oauth_mode && let Some(value) = incoming_headers.get(AUTHORIZATION) {
-        headers.insert(AUTHORIZATION, value.clone());
-    }
+        if config.auth == ProviderAuth::ClaudeOauth {
+            // Anthropic accepts subscription OAuth only when the request
+            // presents as Claude Code: the oauth beta flag plus the Claude
+            // Code beta.
+            credentialed.insert(
+                HeaderName::from_static("anthropic-beta"),
+                HeaderValue::from_static("oauth-2025-04-20,claude-code-20250219"),
+            );
+        }
+        for (name, value) in &configured {
+            credentialed.insert(name.clone(), value.clone());
+        }
+        for (name, value) in &defaults {
+            credentialed
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
 
-    if !uses_proxy_credentials {
+        Self {
+            credentialed,
+            configured,
+            defaults,
+            uses_proxy_credentials,
+        }
+    }
+}
+
+fn upstream_headers(
+    provider: &ProviderHeaders,
+    incoming_headers: &HeaderMap,
+    request_id: &HeaderValue,
+) -> HeaderMap {
+    let mut headers = if provider.uses_proxy_credentials {
+        // Nothing from the caller is forwarded, so the resolved set is already
+        // complete and correct; cloning it copies no header bytes.
+        provider.credentialed.clone()
+    } else {
+        // Passthrough: the caller's own credentials and metadata travel, then
+        // configured headers override them, then wire defaults fill the gaps.
+        let mut headers = HeaderMap::with_capacity(
+            incoming_headers.len() + provider.configured.len() + provider.defaults.len(),
+        );
+        if let Some(value) = incoming_headers.get(AUTHORIZATION) {
+            headers.insert(AUTHORIZATION, value.clone());
+        }
         for (name, value) in incoming_headers {
             if name != AUTHORIZATION && should_forward_incoming_header(name) {
                 headers.insert(name.clone(), value.clone());
             }
         }
-    }
-
-    if config.auth == ProviderAuth::ClaudeOauth {
-        // Anthropic accepts subscription OAuth only when the request presents
-        // as Claude Code: the oauth beta flag plus the Claude Code beta.
-        headers.insert(
-            HeaderName::from_static("anthropic-beta"),
-            HeaderValue::from_static("oauth-2025-04-20,claude-code-20250219"),
-        );
-    }
-
-    for (name, value) in &config.headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            headers.insert(name, value);
+        for (name, value) in &provider.configured {
+            headers.insert(name.clone(), value.clone());
         }
-    }
-
-    if matches!(config.kind, ProviderKind::Anthropic | ProviderKind::Copilot) {
+        for (name, value) in &provider.defaults {
+            headers.entry(name.clone()).or_insert_with(|| value.clone());
+        }
         headers
-            .entry(HeaderName::from_static("anthropic-version"))
-            .or_insert(HeaderValue::from_static("2023-06-01"));
-    }
-    if config.kind == ProviderKind::Copilot {
-        for (name, value) in [
-            ("copilot-integration-id", "vscode-chat"),
-            ("editor-version", "vscode/1.107.1"),
-            ("editor-plugin-version", "copilot-chat/0.26.7"),
-            ("openai-intent", "conversation-panel"),
-            ("x-github-api-version", "2022-11-28"),
-        ] {
-            headers
-                .entry(HeaderName::from_static(name))
-                .or_insert(HeaderValue::from_static(value));
-        }
-    }
+    };
 
-    if let Ok(value) = HeaderValue::from_str(request_id) {
-        headers.insert(HeaderName::from_static("x-request-id"), value);
-    }
-
+    headers.insert(HeaderName::from_static("x-request-id"), request_id.clone());
     headers
 }
 
@@ -5084,71 +5624,76 @@ async fn relay_response(meta: &UpstreamRequestMeta, response: reqwest::Response)
     if !status.is_success() {
         log_upstream_status(meta, status, "relay_headers");
     }
-    let response_headers = response.headers().clone();
-    let content_type = response_headers.get(CONTENT_TYPE).cloned();
-    let is_sse = content_type
-        .as_ref()
+    let is_sse = response
+        .headers()
+        .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(is_event_stream_content_type);
+    // Filter once, rather than copying the whole upstream map and then
+    // discarding most of it: only the forwarded subset is ever used, and the
+    // map built here is moved into the response instead of copied again.
+    let mut forwarded = HeaderMap::with_capacity(response.headers().len());
+    for (name, value) in response.headers() {
+        if should_forward_response_header(name) {
+            forwarded.insert(name.clone(), value.clone());
+        }
+    }
+    if !forwarded.contains_key("x-request-id") {
+        forwarded.insert(
+            HeaderName::from_static("x-request-id"),
+            meta.request_id_header.clone(),
+        );
+    }
     let stream_meta = meta.clone();
     let mut chunk_index = 0_u64;
-    let stream = response.bytes_stream().map(move |chunk| match chunk {
-        Ok(chunk) => {
-            chunk_index = chunk_index.saturating_add(1);
-            trace!(
-                provider = %stream_meta.provider,
-                request_id = %stream_meta.request_id,
-                method = %stream_meta.method,
-                upstream_path = %stream_meta.path,
-                upstream_status = status.as_u16(),
-                chunk_index,
-                body_bytes = chunk.len(),
-                body = %String::from_utf8_lossy(&chunk),
-                "relayed upstream response body"
-            );
-            if !status.is_success() {
-                error!(
+    let stream =
+        latency::timed_body_stream(response.bytes_stream()).map(move |chunk| match chunk {
+            Ok(chunk) => {
+                chunk_index = chunk_index.saturating_add(1);
+                trace!(
                     provider = %stream_meta.provider,
                     request_id = %stream_meta.request_id,
                     method = %stream_meta.method,
                     upstream_path = %stream_meta.path,
                     upstream_status = status.as_u16(),
                     chunk_index,
+                    body_bytes = chunk.len(),
                     body = %String::from_utf8_lossy(&chunk),
-                    "relayed upstream error response body"
+                    "relayed upstream response body"
                 );
+                if !status.is_success() {
+                    error!(
+                        provider = %stream_meta.provider,
+                        request_id = %stream_meta.request_id,
+                        method = %stream_meta.method,
+                        upstream_path = %stream_meta.path,
+                        upstream_status = status.as_u16(),
+                        chunk_index,
+                        body = %String::from_utf8_lossy(&chunk),
+                        "relayed upstream error response body"
+                    );
+                }
+                Ok(chunk)
             }
-            Ok(chunk)
-        }
-        Err(error) => {
-            let message = error.to_string();
-            let failure = UpstreamFailure::from_reqwest(&stream_meta, error);
-            log_upstream_failure(&failure, "relay_stream");
-            if is_sse {
-                Ok(generic_stream_error_event(&failure))
-            } else {
-                Err(std::io::Error::other(message))
+            Err(error) => {
+                let message = error.to_string();
+                let failure = UpstreamFailure::from_reqwest(&stream_meta, error);
+                log_upstream_failure(&failure, "relay_stream");
+                if is_sse {
+                    Ok(generic_stream_error_event(&failure))
+                } else {
+                    Err(std::io::Error::other(message))
+                }
             }
-        }
-    });
+        });
 
-    let mut response = Response::builder()
-        .status(status)
+    let mut builder = Response::builder().status(status);
+    if let Some(headers) = builder.headers_mut() {
+        *headers = forwarded;
+    }
+    builder
         .body(Body::from_stream(stream))
-        .unwrap_or_else(|error| internal_error_response(error.to_string()));
-    for (name, value) in &response_headers {
-        if should_forward_response_header(name) {
-            response.headers_mut().insert(name.clone(), value.clone());
-        }
-    }
-    if !response.headers().contains_key("x-request-id")
-        && let Ok(value) = HeaderValue::from_str(&meta.request_id)
-    {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static("x-request-id"), value);
-    }
-    response
+        .unwrap_or_else(|error| internal_error_response(error.to_string()))
 }
 
 fn should_forward_response_header(name: &HeaderName) -> bool {
@@ -5196,9 +5741,9 @@ fn upstream_error_response(error: &UpstreamFailure) -> Response {
                 "type": "upstream_error",
                 "kind": error.kind.as_str(),
                 "upstream_status": error.upstream_status.map(|status| status.as_u16()),
-                "request_id": error.request_id,
-                "proxy_provider": error.provider,
-                "upstream_path": error.path
+                "request_id": error.request_id.as_ref(),
+                "proxy_provider": error.provider.as_ref(),
+                "upstream_path": error.path.as_ref()
             }
         })),
     )
@@ -6014,9 +6559,8 @@ fn anthropic_usage(usage: Option<&Value>) -> Value {
     })
 }
 
-fn estimate_tokens(value: &Value) -> usize {
-    let text = text_from_value(value);
-    (text.chars().count() / 4).max(1)
+fn estimate_tokens(value: &Value) -> stats::TokenEstimate {
+    proxy_stats().estimate_tokens(value)
 }
 
 fn responses_to_chat_request(response_request: &Value) -> Value {
@@ -6535,7 +7079,7 @@ fn anthropic_response_as_chat(
     client_model: Option<String>,
     meta: Option<UpstreamRequestMeta>,
 ) -> reqwest::Response {
-    let mut upstream_stream = response.bytes_stream();
+    let mut upstream_stream = latency::timed_body_stream(response.bytes_stream());
     let response_request_id = meta.as_ref().map(|meta| meta.request_id.clone());
     let stream_meta = meta.clone();
     let mut translator = AnthropicStreamTranslator::new(client_model, unix_timestamp());
@@ -6599,7 +7143,7 @@ fn anthropic_response_as_chat(
         .header(CONTENT_TYPE, "text/event-stream")
         .header(CACHE_CONTROL, "no-cache");
     if let Some(request_id) = &response_request_id {
-        builder = builder.header("x-request-id", request_id.as_str());
+        builder = builder.header("x-request-id", request_id.as_ref());
     }
     reqwest::Response::from(
         builder
@@ -6625,7 +7169,7 @@ fn stream_chat_as_responses(
     let item_id = format!("msg_{response_id}");
     let created_at = unix_timestamp();
     let model = client_model.unwrap_or_else(|| "unknown".to_string());
-    let mut upstream_stream = response.bytes_stream();
+    let mut upstream_stream = latency::timed_body_stream(response.bytes_stream());
     let response_request_id = meta.as_ref().map(|meta| meta.request_id.clone());
     let stream_meta = meta.clone();
 
@@ -6914,7 +7458,7 @@ fn stream_chat_as_responses(
         .header(CONTENT_TYPE, "text/event-stream")
         .header(CACHE_CONTROL, "no-cache");
     if let Some(request_id) = &response_request_id {
-        builder = builder.header("x-request-id", request_id.as_str());
+        builder = builder.header("x-request-id", request_id.as_ref());
     }
     builder
         .body(Body::from_stream(stream))
@@ -6928,7 +7472,7 @@ fn stream_chat_as_anthropic(
 ) -> Response {
     let message_id = format!("msg_{}", unix_timestamp());
     let model = client_model.unwrap_or_else(|| "unknown".to_string());
-    let mut upstream_stream = response.bytes_stream();
+    let mut upstream_stream = latency::timed_body_stream(response.bytes_stream());
     let response_request_id = meta.as_ref().map(|meta| meta.request_id.clone());
     let stream_meta = meta.clone();
 
@@ -7188,7 +7732,7 @@ fn stream_chat_as_anthropic(
         .header(CONTENT_TYPE, "text/event-stream")
         .header(CACHE_CONTROL, "no-cache");
     if let Some(request_id) = &response_request_id {
-        builder = builder.header("x-request-id", request_id.as_str());
+        builder = builder.header("x-request-id", request_id.as_ref());
     }
     builder
         .body(Body::from_stream(stream))
@@ -7559,7 +8103,7 @@ fn responses_stream_failed_event(
                     "type": "upstream_error",
                     "code": failure.kind.as_str(),
                     "message": upstream_stream_error_message(failure),
-                    "request_id": failure.request_id
+                    "request_id": failure.request_id.as_ref()
                 }
             }
         }),
@@ -7716,6 +8260,14 @@ fn validate_config(config: &Config) -> Result<()> {
             "pricing.baseline_model {baseline:?} has no entry in [pricing.models]; a baseline with no rate cannot answer what traffic would have cost"
         );
     }
+    let integrated_lookup = |name: &str| {
+        config
+            .integrated
+            .targets
+            .get(name)
+            .map(|target| (target.provider.clone(), target.model.clone()))
+    };
+    privacy::validate_config(&config.privacy, &providers, &integrated_lookup)?;
     let mut routing_interceptor = config.interceptor.clone();
     routing_interceptor.enabled = config.routing_mode != RoutingMode::Proxy;
     routing_interceptor.reject_sensitive &= config.routing_mode != RoutingMode::Proxy;

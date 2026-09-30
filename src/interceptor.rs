@@ -19,11 +19,13 @@ use crate::UpstreamRequestMeta;
 use crate::UpstreamResponseKind;
 use crate::first_chat_choice_message;
 use crate::normalize_chat_completion_request;
+use crate::privacy;
 use crate::request_id_from_headers;
 use crate::rewrite_request_roles;
 use crate::stats::{
     RouteClass, RoutingDecisionAudit, TokenUsage, log_request_value, log_response_text,
     log_response_value, proxy_stats, route_class_for_base_url, routing_decision_log,
+    usage_token_fields,
 };
 use crate::text_from_value;
 use crate::upstream_error_response;
@@ -151,7 +153,7 @@ pub(crate) fn match_routing_rule(
     chat_request: &Value,
     client_model: Option<&str>,
 ) -> Option<(String, RuleOutcome)> {
-    let estimated_tokens = crate::estimate_tokens(chat_request) as u64;
+    let estimated_tokens = crate::estimate_tokens(chat_request).tokens;
     let has_tools = chat_request
         .get("tools")
         .and_then(Value::as_array)
@@ -671,6 +673,10 @@ fn sticky_routes() -> &'static StickyRoutes {
     ROUTES.get_or_init(StickyRoutes::default)
 }
 
+pub(crate) fn key_or(key: Option<u64>) -> u64 {
+    key.unwrap_or(0)
+}
+
 fn conversation_key(headers: &HeaderMap, chat_request: &Value) -> u64 {
     let mut hasher = DefaultHasher::new();
     for name in [
@@ -885,7 +891,7 @@ pub(crate) async fn maybe_intercept(
         meta
     };
     let local_headers = HeaderMap::new();
-    let estimated_input_tokens = crate::estimate_tokens(&local_request) as u64;
+    let input_estimate = crate::estimate_tokens(&local_request);
     audit.audit.triage_provider = Some(provider.name.clone());
     audit.audit.triage_model = Some(config.model.clone());
 
@@ -967,10 +973,25 @@ pub(crate) async fn maybe_intercept(
         }
     };
     let local_elapsed = started_at.elapsed();
+    let output_estimate = crate::estimate_tokens(&completion);
+    let (reported_input, reported_output) = completion
+        .get("usage")
+        .map(usage_token_fields)
+        .unwrap_or((None, None));
     let local_usage = TokenUsage::from_response(
         completion.get("usage"),
-        estimated_input_tokens,
-        crate::estimate_tokens(&completion) as u64,
+        (input_estimate.tokens, input_estimate.source),
+        (output_estimate.tokens, output_estimate.source),
+    );
+    // A triage call that returned a real usage object trains the estimator just
+    // like proxied traffic does: the screened request and the completion are the
+    // actual texts behind the reported counts.
+    proxy_stats().calibrate_from_usage(
+        reported_input,
+        reported_output,
+        &input_estimate,
+        Some(&crate::text_from_value(&local_request)),
+        &crate::text_from_value(&completion),
     );
     audit.set_triage(provider, &config.model, local_elapsed);
     // Triage is a real billable call, not overhead that disappears from the
@@ -1192,7 +1213,27 @@ async fn execute_integrated_redirect(
 /// Send a request to one concrete destination. Integrated targets come from
 /// config; routing rules can also synthesize a `provider/model` destination
 /// that was never declared as a target.
-async fn execute_target_redirect(
+fn execute_target_redirect<'a>(
+    state: &'a AppState,
+    target_name: &'a str,
+    target: &'a IntegratedTarget,
+    chat_request: Value,
+    client: ClientResponseContext,
+    conversation_key: Option<u64>,
+    audit: RoutingAuditDraft,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = InterceptionOutcome> + Send + 'a>> {
+    Box::pin(execute_target_redirect_impl(
+        state,
+        target_name,
+        target,
+        chat_request,
+        client,
+        conversation_key,
+        audit,
+    ))
+}
+
+async fn execute_target_redirect_impl(
     state: &AppState,
     target_name: &str,
     target: &IntegratedTarget,
@@ -1205,6 +1246,66 @@ async fn execute_target_redirect(
         .providers
         .get(&target.provider)
         .expect("validated integrated provider missing");
+    // The destination of an integrated redirect is an explicit decision, so it
+    // is also where the confidentiality boundary is allowed to apply its
+    // declared private replacement. Sensitive or unclassifiable content never
+    // reaches a public target, and a rule cannot route around that.
+    if state.config.privacy.enabled() {
+        let mut hop = privacy::RequestPrivacy::from_body(&chat_request).into_hop();
+        let enforcement = privacy::check_hop(state, &mut hop, provider, &chat_request).await;
+        if !enforcement.permitted {
+            let disposition = privacy::private_redirect_disposition(state, provider, &chat_request);
+            match disposition {
+                privacy::RedirectDisposition::Block(reason) => {
+                    let request_id = audit.audit.request_id.clone();
+                    audit.set_decision("privacy_block", reason.clone());
+                    audit.redact_prompt();
+                    proxy_stats().record_privacy_block();
+                    privacy::record_hop_denial(
+                        state,
+                        &request_id,
+                        client.protocol.as_str(),
+                        &chat_request,
+                        &enforcement,
+                    );
+                    if let Some(sticky) = privacy::sticky_from(&enforcement) {
+                        privacy::remember_conversation(key_or(conversation_key), &sticky);
+                    }
+                    audit.record();
+                    return InterceptionOutcome::Respond(render_rejection(
+                        client.protocol,
+                        &reason,
+                        client.model,
+                        client.streaming,
+                        &request_id,
+                    ));
+                }
+                privacy::RedirectDisposition::Reroute(target_override) => {
+                    info!(
+                        target = target_name,
+                        provider = target_override.provider,
+                        model = target_override.model,
+                        "privacy boundary replaced a public integrated route with the approved private target"
+                    );
+                    return execute_target_redirect(
+                        state,
+                        target_name,
+                        &target_override,
+                        chat_request,
+                        client,
+                        conversation_key,
+                        audit,
+                    )
+                    .await;
+                }
+                privacy::RedirectDisposition::Proceed => {}
+            }
+        } else if !enforcement.decision.is_clear()
+            && let Some(key) = conversation_key
+        {
+            privacy::remember_conversation(key, &enforcement.decision);
+        }
+    }
     info!(
         target = target_name,
         provider = target.provider,
@@ -1213,12 +1314,15 @@ async fn execute_target_redirect(
         protocol = client.protocol.as_str(),
         "sending integrated route"
     );
+    // An integrated destination is an audited routing decision, so it never
+    // fails over for availability: the request goes to exactly the destination
+    // the decision named, gated by the confidentiality boundary above.
     let response = proxy_integrated_chat(
         provider,
         chat_request,
         target,
         client.protocol,
-        client.model,
+        client.model.clone(),
         client.streaming,
         state.config.as_ref(),
     )
@@ -2180,7 +2284,7 @@ fn bounded_detail(text: &str) -> String {
 }
 
 #[path = "interceptor_render.rs"]
-mod render;
+pub(crate) mod render;
 use render::{render_local_completion, render_rejection};
 
 #[cfg(test)]

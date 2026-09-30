@@ -566,8 +566,10 @@ fn test_state_with_config(config: Config) -> AppState {
                 name.clone(),
                 ProviderState {
                     name,
+                    headers: Arc::new(ProviderHeaders::new(&upstream)),
                     config: Arc::new(upstream),
                     client: Client::new(),
+                    privacy_state: None,
                     model_cache: Arc::new(ModelCache::default()),
                     model_refresh: Arc::new(AsyncMutex::new(())),
                     breaker: Arc::new(CircuitBreaker::new(
@@ -3593,13 +3595,11 @@ fn copilot_claude_models_use_native_messages_wire() {
         ..UpstreamConfig::default()
     };
     let provider = build_provider_state("copilot".to_string(), upstream).unwrap();
-    let prepared = prepare_provider_chat_request(
-        &provider,
-        &json!({
-            "model": "claude-sonnet-test",
-            "messages": [{ "role": "user", "content": "hello" }]
-        }),
-    );
+    let request = json!({
+        "model": "claude-sonnet-test",
+        "messages": [{ "role": "user", "content": "hello" }]
+    });
+    let prepared = prepare_provider_chat_request(&provider, &request);
     assert_eq!(prepared.path, "v1/messages");
     assert!(prepared.anthropic_wire);
     assert_eq!(prepared.body["messages"][0]["content"][0]["text"], "hello");
@@ -3641,13 +3641,11 @@ fn provider_reasoning_effort_maps_to_anthropic_messages_wire() {
     )
     .unwrap();
 
-    let prepared = prepare_provider_chat_request(
-        &provider,
-        &json!({
-            "model": "claude-test",
-            "messages": [{ "role": "user", "content": "hello" }]
-        }),
-    );
+    let request = json!({
+        "model": "claude-test",
+        "messages": [{ "role": "user", "content": "hello" }]
+    });
+    let prepared = prepare_provider_chat_request(&provider, &request);
 
     assert_eq!(prepared.path, "messages");
     assert_eq!(prepared.body["output_config"]["effort"], "max");
@@ -4133,11 +4131,13 @@ async fn model_discovery_times_out_a_hung_provider_without_stalling_others() {
 fn model_discovery_timeout_caps_the_generation_timeout() {
     let make = |timeout_secs| ProviderState {
         name: "p".to_string(),
+        headers: Arc::new(ProviderHeaders::new(&UpstreamConfig::default())),
         config: Arc::new(UpstreamConfig {
             timeout_secs,
             ..UpstreamConfig::default()
         }),
         client: Client::new(),
+        privacy_state: None,
         model_cache: Arc::new(ModelCache::default()),
         model_refresh: Arc::new(AsyncMutex::new(())),
         breaker: Arc::new(CircuitBreaker::new(0, Duration::from_secs(0))),
@@ -5103,6 +5103,87 @@ fn mock_upstream_response(body: &str) -> reqwest::Response {
     reqwest::Response::from(http_response)
 }
 
+/// Shared fixture builders for sibling test modules (notably
+/// `src/privacy_tests.rs`) that need to stand up real loopback upstreams and
+/// build an [`AppState`] whose providers carry a live client.
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    /// Builds an [`AppState`] from a validated [`Config`] the same way startup
+    /// does, but without binding a listener. Providers keep a real HTTP client
+    /// so their base URL can point at a loopback mock upstream.
+    pub(crate) fn state_with_config(config: Config) -> AppState {
+        let forward_caller_credentials = config.routing_mode != RoutingMode::Integrated;
+        let providers = effective_provider_configs(&config)
+            .expect("fixture config must produce valid providers")
+            .into_iter()
+            .map(|(name, upstream)| {
+                let state = build_provider_state(name.clone(), upstream)
+                    .expect("fixture provider must build");
+                (name, state)
+            })
+            .collect();
+        AppState {
+            config: Arc::new(config),
+            providers: Arc::new(providers),
+            launcher_kind: None,
+            launcher_mode: None,
+            forward_caller_credentials,
+        }
+    }
+
+    async fn bind_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/v1"), server)
+    }
+
+    /// A loopback upstream that answers every POST with `response`, returning
+    /// its `/v1` base URL and the detached server task.
+    pub(crate) async fn mock_upstream(response: Value) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().fallback(move || {
+            let response = response.clone();
+            async move { Json(response) }
+        });
+        bind_server(app).await
+    }
+
+    /// A loopback upstream that counts every request it serves and returns
+    /// `chatcmpl-counted`. Tests assert the counter to prove a destination was
+    /// never contacted.
+    pub(crate) async fn counting_upstream() -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().fallback(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Json(json!({
+                    "id": "chatcmpl-counted",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "counted",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": "ok" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                }))
+            }
+        });
+        let (base_url, _server) = bind_server(app).await;
+        (base_url, hits)
+    }
+}
+
 fn mock_upstream_error_response(message: &'static str) -> reqwest::Response {
     let stream = futures_util::stream::once(async move {
         Err::<Bytes, std::io::Error>(std::io::Error::other(message))
@@ -5160,6 +5241,9 @@ async fn collect_sse_events(response: Response) -> Vec<(String, Value)> {
 
 use interceptor::{RuleOutcome, match_routing_rule};
 use stats::TokenUsage;
+
+#[path = "alloc_stress_tests.rs"]
+mod alloc_stress_tests;
 
 #[test]
 fn circuit_breaker_opens_after_threshold_and_admits_one_probe() {
@@ -5275,7 +5359,7 @@ fn failover_chain_follows_one_level_and_ignores_cycles() {
     let chain = failover_chain(&state, routed);
     let names = chain
         .iter()
-        .map(|hop| (hop.provider.name.as_str(), hop.model))
+        .map(|hop| (hop.provider.name.as_str(), hop.model.as_deref()))
         .collect::<Vec<_>>();
     assert_eq!(
         names,
@@ -5522,6 +5606,8 @@ fn pricing_prefers_the_namespaced_rate_and_computes_cost() {
         input_tokens: 1_000_000,
         output_tokens: 500_000,
         estimated: false,
+        input_source: crate::token_estimate::TokenSource::Exact,
+        output_source: crate::token_estimate::TokenSource::Exact,
     };
     // 1.0 for a million input tokens plus half of 2.0 for the output.
     assert!((pricing.actual.cost_usd(usage) - 2.0).abs() < 1e-9);
@@ -5721,4 +5807,246 @@ async fn an_open_breaker_skips_the_provider_entirely() {
 
     dead.1.abort();
     healthy.1.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Latency attribution
+// ---------------------------------------------------------------------------
+
+/// A loopback upstream that stalls `delay` before answering, so a test can
+/// tell time spent waiting on a provider from time spent in the proxy.
+async fn slow_upstream(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+    let app = Router::new().fallback(move || async move {
+        tokio::time::sleep(delay).await;
+        Json(json!({
+            "id": "chatcmpl-slow",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "ok" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5 }
+        }))
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/v1"), server)
+}
+
+fn provider_for(base_url: String) -> ProviderState {
+    build_provider_state(
+        "slow".to_string(),
+        UpstreamConfig {
+            base_url,
+            api_key: Some("sk-test".to_string()),
+            ..UpstreamConfig::default()
+        },
+    )
+    .expect("provider builds")
+}
+
+#[tokio::test]
+async fn a_slow_provider_is_billed_to_the_provider_not_to_the_proxy() {
+    // The whole point of splitting the phases: a request that takes 200ms
+    // because the model is slow must not read as 200ms of proxy overhead.
+    let delay = Duration::from_millis(200);
+    let (base_url, _server) = slow_upstream(delay).await;
+    let provider = provider_for(base_url);
+    let body = json!({
+        "model": "gpt-test",
+        "messages": [{ "role": "user", "content": "hello" }]
+    });
+
+    let waited = latency::with_request_timing(async {
+        let response = proxy_chat(&provider, &HeaderMap::new(), &body).await;
+        assert!(response.status().is_success());
+        latency::upstream_wait()
+    })
+    .await;
+
+    assert!(
+        waited >= delay,
+        "the provider stalled for {delay:?} but only {waited:?} was attributed to it"
+    );
+}
+
+#[tokio::test]
+async fn upstream_waits_outside_a_request_context_are_simply_unattributed() {
+    // Background model discovery and direct pipeline calls have no request
+    // scope. They must not panic, and must not bill another request either.
+    let (base_url, _server) = slow_upstream(Duration::from_millis(5)).await;
+    let provider = provider_for(base_url);
+    let body = json!({
+        "model": "gpt-test",
+        "messages": [{ "role": "user", "content": "hello" }]
+    });
+    let response = proxy_chat(&provider, &HeaderMap::new(), &body).await;
+    assert!(response.status().is_success());
+    assert_eq!(latency::upstream_wait(), Duration::ZERO);
+}
+
+#[tokio::test]
+async fn a_served_request_records_every_latency_phase() {
+    // End to end through the real router, which is the only place the timing
+    // context is installed. Lifetime counters are asserted as having advanced
+    // rather than compared to a value: `proxy_stats` is process-wide and other
+    // tests in this binary are recording into it concurrently.
+    // Serves discovery and generation both, so the request reaches the
+    // upstream the way a real one does rather than failing during routing.
+    let upstream_app = Router::new()
+        .route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                Json(json!({ "data": [{ "id": "gpt-test", "object": "model" }] }))
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                Json(json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gpt-test",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": "ok" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15 }
+                }))
+            }),
+        );
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let _upstream_server = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream_app).await.unwrap();
+    });
+    let upstream = format!("http://{upstream_addr}/v1");
+    let config = Config {
+        default_provider: "test".to_string(),
+        providers: HashMap::from([(
+            "test".to_string(),
+            UpstreamConfig {
+                base_url: upstream,
+                api_key: Some("sk-test".to_string()),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let phases = || {
+        let snapshot = proxy_stats().snapshot_json();
+        let phases = snapshot["latency"]["phases"].clone();
+        [
+            "pre_dispatch",
+            "upstream",
+            "client_ttfb",
+            "relay",
+            "overhead",
+            "total",
+        ]
+        .map(|name| phases[name]["total"].as_u64().expect("phase total"))
+    };
+
+    let before = phases();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = build_app(SharedState::new(test_support::state_with_config(config)));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-test",
+            "messages": [{ "role": "user", "content": "hello" }]
+        }))
+        .send()
+        .await
+        .expect("proxied request");
+    assert!(response.status().is_success());
+    // The body has to be drained: the completion phases are recorded as the
+    // tracked response stream finishes, not when its headers are sent.
+    let _ = response.bytes().await.expect("response body");
+
+    let after = phases();
+    for (index, name) in [
+        "pre_dispatch",
+        "upstream",
+        "client_ttfb",
+        "relay",
+        "overhead",
+        "total",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(
+            after[index] > before[index],
+            "{name} recorded no sample for a served request"
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_slow_first_token_is_billed_to_the_provider_not_to_the_proxy() {
+    // The regression this guards: a streamed response's headers arrive
+    // immediately and its first token much later. That gap is the model
+    // thinking, and it used to fall out of the phase subtraction as proxy
+    // overhead — turning a figure that should read in microseconds into one
+    // that tracked the provider's time to first token.
+    let stall = Duration::from_millis(150);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move || async move {
+            let body = Body::from_stream(futures_util::stream::once(async move {
+                tokio::time::sleep(stall).await;
+                Ok::<_, std::io::Error>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+                ))
+            }));
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(body)
+                .unwrap()
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let provider = provider_for(format!("http://{addr}/v1"));
+    let body = json!({
+        "model": "gpt-test",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "hello" }]
+    });
+
+    let waited = latency::with_request_timing(async {
+        let response = proxy_chat(&provider, &HeaderMap::new(), &body).await;
+        assert!(response.status().is_success());
+        // The wait only happens while the body streams, which is after the
+        // handler has produced the response.
+        let text = collect_response_text(response).await;
+        assert!(text.contains("hi"), "relayed body was {text:?}");
+        latency::upstream_wait()
+    })
+    .await;
+
+    assert!(
+        waited >= stall,
+        "the provider stalled {stall:?} before its first token but only {waited:?} \
+         was attributed to it; the rest would read as proxy overhead"
+    );
 }

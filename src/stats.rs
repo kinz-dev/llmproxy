@@ -3,10 +3,10 @@
 //! One global [`ProxyStats`] instance collects counters, latency sample
 //! windows, and approximate token savings. Everything resets on restart.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -16,6 +16,8 @@ use serde_json::{Value, json};
 use tracing::{error, info, trace};
 
 use crate::is_event_stream_content_type;
+use crate::latency::{LATENCY_WINDOW_CAP, LatencyMetrics, LatencyRing, PROVIDER_LATENCY_CAP};
+use crate::token_estimate::{self, TokenEstimator, TokenSource};
 
 /// Derived provider network scope used for privacy checks and aggregate
 /// telemetry. This is not a provider type or a routing preference.
@@ -41,81 +43,122 @@ pub(crate) enum RemapKind {
     Auto,
 }
 
-const LATENCY_WINDOW_CAP: usize = 2048;
-const PROVIDER_LATENCY_CAP: usize = 512;
-
-fn nearest_rank_percentiles(mut sorted: Vec<u32>) -> (Option<u32>, Option<u32>, usize) {
-    if sorted.is_empty() {
-        return (None, None, 0);
-    }
-    sorted.sort_unstable();
-    let rank = |q: f64| {
-        let index = ((q * sorted.len() as f64).ceil() as usize).max(1) - 1;
-        sorted[index.min(sorted.len() - 1)]
-    };
-    (Some(rank(0.50)), Some(rank(0.99)), sorted.len())
+/// A read-mostly registry of per-route metric rows.
+///
+/// Route cardinality is bounded by configuration (frontends x providers x
+/// models), so a short linear scan under a read lock beats a hash map here: it
+/// compares borrowed `&str` segments directly instead of building an owned key
+/// to hash, and that is what keeps the request path allocation-free once a row
+/// exists. Only the first sighting of a route takes the write lock and interns
+/// its segments; every request after that is a shared read plus atomic
+/// updates, so recording statistics never serializes requests against each
+/// other the way the previous `Mutex<HashMap<(String, String), _>>` did.
+struct MetricRegistry<const N: usize, V> {
+    rows: RwLock<Vec<MetricRow<N, V>>>,
 }
 
-#[derive(Default)]
-struct LatencySamples<const CAP: usize> {
-    values: VecDeque<u32>,
+struct MetricRow<const N: usize, V> {
+    key: [Arc<str>; N],
+    value: Arc<V>,
 }
 
-impl<const CAP: usize> LatencySamples<CAP> {
-    fn record(&mut self, elapsed: Duration) {
-        let ms = elapsed.as_millis().min(u128::from(u32::MAX)) as u32;
-        if self.values.len() >= CAP {
-            self.values.pop_front();
+impl<const N: usize, V> Default for MetricRegistry<N, V> {
+    fn default() -> Self {
+        Self {
+            rows: RwLock::new(Vec::new()),
         }
-        self.values.push_back(ms);
-    }
-
-    fn percentiles(&self) -> (Option<u32>, Option<u32>, usize) {
-        nearest_rank_percentiles(self.values.iter().copied().collect())
-    }
-
-    fn clear(&mut self) {
-        self.values.clear();
     }
 }
 
-#[derive(Default)]
-struct LatencyWindow {
-    samples: Mutex<LatencySamples<LATENCY_WINDOW_CAP>>,
+fn key_matches<const N: usize>(key: &[Arc<str>; N], parts: [&str; N]) -> bool {
+    key.iter().zip(parts).all(|(owned, part)| &**owned == part)
 }
 
-impl LatencyWindow {
-    fn record(&self, elapsed: Duration) {
-        self.samples
-            .lock()
-            .expect("latency window poisoned")
-            .record(elapsed);
+impl<const N: usize, V: Default> MetricRegistry<N, V> {
+    /// The row for `parts`, interning it on first sight. The returned handle is
+    /// an `Arc` clone (a refcount bump), never a fresh allocation.
+    fn row(&self, parts: [&str; N]) -> Arc<V> {
+        if let Some(row) = self
+            .rows
+            .read()
+            .expect("metric registry poisoned")
+            .iter()
+            .find(|row| key_matches(&row.key, parts))
+        {
+            return Arc::clone(&row.value);
+        }
+        let mut rows = self.rows.write().expect("metric registry poisoned");
+        // Another writer may have interned the same route while this one
+        // waited for the write lock.
+        if let Some(row) = rows.iter().find(|row| key_matches(&row.key, parts)) {
+            return Arc::clone(&row.value);
+        }
+        let value = Arc::new(V::default());
+        rows.push(MetricRow {
+            key: parts.map(Arc::from),
+            value: Arc::clone(&value),
+        });
+        value
     }
 
-    fn percentiles(&self) -> (Option<u32>, Option<u32>, usize) {
-        self.samples
-            .lock()
-            .expect("latency window poisoned")
-            .percentiles()
+    /// Every row, for the admin snapshot.
+    fn snapshot(&self) -> Vec<([Arc<str>; N], Arc<V>)> {
+        self.rows
+            .read()
+            .expect("metric registry poisoned")
+            .iter()
+            .map(|row| (row.key.clone(), Arc::clone(&row.value)))
+            .collect()
     }
 
     fn clear(&self) {
-        self.samples
-            .lock()
-            .expect("latency window poisoned")
-            .clear();
+        self.rows.write().expect("metric registry poisoned").clear();
+    }
+}
+
+/// A `u64` accumulator that saturates instead of wrapping, addressable through
+/// a shared reference. The registry hands out `&V`, so the counters inside a
+/// row have to be updatable without a lock while keeping the saturating
+/// semantics the ledger has always had.
+fn saturating_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
+}
+
+/// An `f64` accumulator addressable through a shared reference. Money is the
+/// only quantity here that is not an integer, and it still has to be summed
+/// without taking a lock, so the bits live in an atomic and accumulate under a
+/// compare-and-swap.
+#[derive(Default)]
+struct AtomicF64(AtomicU64);
+
+impl AtomicF64 {
+    fn add(&self, value: f64) {
+        if value == 0.0 {
+            return;
+        }
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                Some((f64::from_bits(bits) + value).to_bits())
+            });
+    }
+
+    fn get(&self) -> f64 {
+        f64::from_bits(self.0.load(Ordering::Relaxed))
     }
 }
 
 #[derive(Default)]
 struct ProviderCalls {
-    count: u64,
-    latency: LatencySamples<PROVIDER_LATENCY_CAP>,
+    count: AtomicU64,
+    latency: LatencyRing<PROVIDER_LATENCY_CAP>,
 }
 
 impl ProviderCalls {
-    fn record(&mut self, elapsed: Duration) {
-        self.count += 1;
+    fn record(&self, elapsed: Duration) {
+        self.count.fetch_add(1, Ordering::Relaxed);
         self.latency.record(elapsed);
     }
 }
@@ -125,32 +168,53 @@ pub(crate) struct TokenUsage {
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) estimated: bool,
+    pub(crate) input_source: TokenSource,
+    pub(crate) output_source: TokenSource,
+}
+
+/// The result of a calibrated token estimate for one payload: the token count,
+/// the class that produced it, the decoded character count, and the provenance
+/// (`Calibrated` once enough real counts have trained the ratio, `Default` on
+/// cold start). Threading this to [`ProxyStats::calibrate_from_usage`] closes
+/// the loop: a later real count for the same class sharpens the next estimate.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TokenEstimate {
+    pub(crate) tokens: u64,
+    pub(crate) source: TokenSource,
+    pub(crate) chars: u64,
+    pub(crate) kind: token_estimate::ContentKind,
 }
 
 impl TokenUsage {
+    /// Builds a usage record from a provider's `usage` object where present and
+    /// the caller-supplied estimates where not. The estimates are produced by
+    /// [`ProxyStats::estimate_tokens`], so each carries the source that made it
+    /// (learned ratio or cold-start default) and is only upgraded to `Exact`
+    /// when the provider actually reported that side.
     pub(crate) fn from_response(
         usage: Option<&Value>,
-        estimated_input_tokens: u64,
-        estimated_output_tokens: u64,
+        estimated_input: (u64, TokenSource),
+        estimated_output: (u64, TokenSource),
     ) -> Self {
         let (input, output) = usage.map(usage_token_fields).unwrap_or_default();
-        Self::from_fields(
-            input,
-            output,
-            estimated_input_tokens,
-            estimated_output_tokens,
-        )
+        Self::from_fields(input, output, estimated_input, estimated_output)
     }
 
     fn from_fields(
         input: Option<u64>,
         output: Option<u64>,
-        estimated_input_tokens: u64,
-        estimated_output_tokens: u64,
+        estimated_input: (u64, TokenSource),
+        estimated_output: (u64, TokenSource),
     ) -> Self {
         Self {
-            input_tokens: input.unwrap_or(estimated_input_tokens),
-            output_tokens: output.unwrap_or(estimated_output_tokens),
+            input_tokens: input.unwrap_or(estimated_input.0),
+            output_tokens: output.unwrap_or(estimated_output.0),
+            input_source: input
+                .map(|_| TokenSource::Exact)
+                .unwrap_or(estimated_input.1),
+            output_source: output
+                .map(|_| TokenSource::Exact)
+                .unwrap_or(estimated_output.1),
             estimated: input.is_none() || output.is_none(),
         }
     }
@@ -158,17 +222,17 @@ impl TokenUsage {
 
 #[derive(Default)]
 struct ModelUsage {
-    requests: u64,
-    input_tokens: u64,
-    output_tokens: u64,
-    total_time_ms: u64,
-    estimated_requests: u64,
-    cost_usd: f64,
+    requests: AtomicU64,
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+    total_time_ms: AtomicU64,
+    estimated_requests: AtomicU64,
+    cost_usd: AtomicF64,
     /// What this traffic would have cost at the configured baseline price.
     /// Local providers are the reason the proxy exists, so the counterfactual
     /// is worth as much as the bill itself.
-    baseline_usd: f64,
-    priced_requests: u64,
+    baseline_usd: AtomicF64,
+    priced_requests: AtomicU64,
 }
 
 /// USD per one million tokens, as published by providers. Rates are per model
@@ -202,30 +266,38 @@ pub(crate) struct RequestPricing {
 
 #[derive(Default)]
 struct RoutingDestination {
-    requests: u64,
-    errors: u64,
+    requests: AtomicU64,
+    errors: AtomicU64,
 }
 
 impl ModelUsage {
-    fn record(&mut self, elapsed: Duration, usage: TokenUsage, pricing: RequestPricing) {
-        self.requests = self.requests.saturating_add(1);
+    fn record(&self, elapsed: Duration, usage: TokenUsage, pricing: RequestPricing) {
+        saturating_add(&self.requests, 1);
         // A model with no configured price contributes nothing rather than
         // silently counting as free, so a partial price table stays honest.
         if !pricing.actual.is_zero() || !pricing.baseline.is_zero() {
-            self.cost_usd += pricing.actual.cost_usd(usage);
-            self.baseline_usd += pricing.baseline.cost_usd(usage);
-            self.priced_requests = self.priced_requests.saturating_add(1);
+            self.cost_usd.add(pricing.actual.cost_usd(usage));
+            self.baseline_usd.add(pricing.baseline.cost_usd(usage));
+            saturating_add(&self.priced_requests, 1);
         }
-        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
-        self.total_time_ms = self
-            .total_time_ms
-            .saturating_add(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
+        saturating_add(&self.input_tokens, usage.input_tokens);
+        saturating_add(&self.output_tokens, usage.output_tokens);
+        saturating_add(
+            &self.total_time_ms,
+            elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+        );
         if usage.estimated {
-            self.estimated_requests = self.estimated_requests.saturating_add(1);
+            saturating_add(&self.estimated_requests, 1);
         }
     }
 }
+
+/// Where the last N token estimates came from, so the UI can state whether the
+/// number reflects a learned ratio or the cold-start fallback rather than a
+/// single opaque `approximate` flag. Only the two estimate sources are counted
+/// (an exact provider count is never routed through here).
+const TOKEN_SOURCE_CALIBRATED: usize = 0;
+const TOKEN_SOURCE_DEFAULT: usize = 1;
 
 #[derive(Default)]
 pub(crate) struct ProxyStats {
@@ -239,6 +311,9 @@ pub(crate) struct ProxyStats {
     intercept_local: AtomicU64,
     intercept_reject: AtomicU64,
     intercept_pass: AtomicU64,
+    privacy_screens: AtomicU64,
+    privacy_screen_errors: AtomicU64,
+    privacy_blocks: AtomicU64,
     failovers: AtomicU64,
     breaker_skips: AtomicU64,
     rule_matches: AtomicU64,
@@ -250,13 +325,18 @@ pub(crate) struct ProxyStats {
     tokens_saved_prompt: AtomicU64,
     tokens_saved_completion: AtomicU64,
     tokens_saved_estimated: AtomicU64,
-    latency_local: LatencyWindow,
-    latency_external: LatencyWindow,
-    redirects_by_target: Mutex<HashMap<String, u64>>,
-    served_by_provider: Mutex<HashMap<String, ProviderCalls>>,
-    model_usage: Mutex<HashMap<(String, String), ModelUsage>>,
-    routing_matrix: Mutex<HashMap<(String, String), u64>>,
-    routing_destinations: Mutex<HashMap<(String, String, String), RoutingDestination>>,
+    estimate_calls: [AtomicU64; 3],
+    pub(crate) token_estimator: TokenEstimator,
+    latency_local: LatencyRing<LATENCY_WINDOW_CAP>,
+    latency_external: LatencyRing<LATENCY_WINDOW_CAP>,
+    /// Phase-attributed latency: what the proxy spent versus what it waited on.
+    pub(crate) latency: LatencyMetrics,
+    redirects_by_target: MetricRegistry<1, AtomicU64>,
+    upstream_ttfb_by_provider: MetricRegistry<1, LatencyRing<PROVIDER_LATENCY_CAP>>,
+    served_by_provider: MetricRegistry<1, ProviderCalls>,
+    model_usage: MetricRegistry<2, ModelUsage>,
+    routing_matrix: MetricRegistry<2, AtomicU64>,
+    routing_destinations: MetricRegistry<3, RoutingDestination>,
 }
 
 pub(crate) fn proxy_stats() -> &'static ProxyStats {
@@ -302,7 +382,12 @@ impl ProxyStats {
     ) {
         self.intercept_local.fetch_add(1, Ordering::Relaxed);
         self.record_served(class, provider, frontend, elapsed);
-        self.record_tokens_saved(usage.input_tokens, usage.output_tokens, usage.estimated);
+        self.record_tokens_saved(
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.input_source,
+            usage.output_source,
+        );
     }
 
     pub(crate) fn record_intercept_pass(&self) {
@@ -315,11 +400,9 @@ impl ProxyStats {
 
     pub(crate) fn record_intercept_redirect(&self, target: &str) {
         self.intercept_redirect.fetch_add(1, Ordering::Relaxed);
-        let mut redirects = self
-            .redirects_by_target
-            .lock()
-            .expect("redirect stats poisoned");
-        *redirects.entry(target.to_string()).or_default() += 1;
+        self.redirects_by_target
+            .row([target])
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_intercept_fallback(&self) {
@@ -328,6 +411,21 @@ impl ProxyStats {
 
     pub(crate) fn record_intercept_error(&self) {
         self.intercept_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Time one request spent waiting on providers, summed across every
+    /// upstream call it made and attributed to the provider that served it.
+    ///
+    /// This is the provider's latency, kept apart from the proxy's own so a
+    /// slow upstream is never mistaken for a regression in this codebase. It
+    /// is deliberately per request rather than per call, so that it subtracts
+    /// cleanly from the same request's time to first byte: a request that also
+    /// paid for model discovery really did wait for both.
+    pub(crate) fn record_upstream_wait(&self, provider: &str, elapsed: Duration) {
+        self.latency.record_upstream(elapsed);
+        self.upstream_ttfb_by_provider
+            .row([provider])
+            .record(elapsed);
     }
 
     fn record_served(&self, class: RouteClass, provider: &str, frontend: &str, elapsed: Duration) {
@@ -341,18 +439,10 @@ impl ProxyStats {
                 self.latency_external.record(elapsed);
             }
         }
-        self.served_by_provider
-            .lock()
-            .expect("provider stats poisoned")
-            .entry(provider.to_string())
-            .or_default()
-            .record(elapsed);
-        *self
-            .routing_matrix
-            .lock()
-            .expect("routing matrix stats poisoned")
-            .entry((frontend.to_string(), provider.to_string()))
-            .or_default() += 1;
+        self.served_by_provider.row([provider]).record(elapsed);
+        self.routing_matrix
+            .row([frontend, provider])
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_model_usage(
@@ -364,11 +454,97 @@ impl ProxyStats {
         pricing: RequestPricing,
     ) {
         self.model_usage
-            .lock()
-            .expect("model usage stats poisoned")
-            .entry((provider.to_string(), model.to_string()))
-            .or_default()
+            .row([provider, model])
             .record(elapsed, usage, pricing);
+    }
+
+    /// Estimates `value`'s token count using the calibrated ratio for its
+    /// content class.
+    ///
+    /// The hot-path shape is deliberate: classification scans only a bounded
+    /// window of the value's serialized form (a fixed stack buffer plus an
+    /// overflow probe), so neither the scan nor the overflow char count
+    /// allocates or scales per-chunk beyond the body itself. The steady-state
+    /// calibrated estimate therefore allocates nothing on this path.
+    pub(crate) fn estimate_tokens(&self, value: &Value) -> TokenEstimate {
+        let window = token_estimate::classify_window(value);
+        let (tokens, source) = self
+            .token_estimator
+            .estimate(window.total_chars.max(1), window.kind);
+        self.record_estimate_source(source);
+        TokenEstimate {
+            tokens,
+            source,
+            chars: window.total_chars,
+            kind: window.kind,
+        }
+    }
+
+    /// Streaming-side output estimate: characters from the decoded body, with a
+    /// byte-based fallback for SSE envelopes whose structural overhead is
+    /// meaningless to classify.
+    pub(crate) fn estimate_output(
+        &self,
+        decoded_chars: u64,
+        total_bytes: u64,
+        is_sse: bool,
+    ) -> (u64, TokenSource) {
+        if is_sse {
+            // SSE framing (event/data/blank-line overhead, JSON envelope
+            // around each delta) is not content the client sees; a byte
+            // divisor is the fair proxy for the tokens actually generated.
+            let tokens = total_bytes.max(1) / 6;
+            self.record_estimate_source(TokenSource::Default);
+            return (tokens.max(1), TokenSource::Default);
+        }
+        let (tokens, source) = self
+            .token_estimator
+            .estimate(decoded_chars, token_estimate::ContentKind::Prose);
+        self.record_estimate_source(source);
+        (tokens, source)
+    }
+
+    fn record_estimate_source(&self, source: TokenSource) {
+        let index = match source {
+            TokenSource::Calibrated => TOKEN_SOURCE_CALIBRATED,
+            // A cold-start default and an unclassifiable estimate both count as
+            // the fallback bucket: neither reflects a learned ratio.
+            TokenSource::Default | TokenSource::Exact => TOKEN_SOURCE_DEFAULT,
+        };
+        self.estimate_calls[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Folds a real provider-reported count into the running estimator so
+    /// future estimates for the same content class reflect how this deployment
+    /// actually tokenizes. Only exact provider counts become samples; local
+    /// estimates are never treated as ground truth. `None` means the provider
+    /// omitted that side, so nothing is observed for it. An explicit input text
+    /// overrides the classification used at estimate time (for callers whose
+    /// screened payload differs from the raw request).
+    pub(crate) fn calibrate_from_usage(
+        &self,
+        exact_input: Option<u64>,
+        exact_output: Option<u64>,
+        input_estimate: &TokenEstimate,
+        input_text: Option<&str>,
+        response_text: &str,
+    ) {
+        if let Some(tokens) = exact_input
+            && input_estimate.chars > 0
+        {
+            let kind = input_text
+                .map(token_estimate::classify)
+                .unwrap_or(input_estimate.kind);
+            self.token_estimator
+                .observe_exact(input_estimate.chars, tokens, kind);
+        }
+        if let Some(tokens) = exact_output
+            && !response_text.is_empty()
+        {
+            let chars = response_text.chars().count() as u64;
+            let kind = token_estimate::classify(response_text);
+            self.token_estimator.observe_exact(chars, tokens, kind);
+        }
     }
 
     fn record_routing_destination(
@@ -378,39 +554,41 @@ impl ProxyStats {
         model: &str,
         failed: bool,
     ) {
-        let mut destinations = self
-            .routing_destinations
-            .lock()
-            .expect("routing destination stats poisoned");
-        let destination = destinations
-            .entry((
-                frontend.to_string(),
-                provider.to_string(),
-                model.to_string(),
-            ))
-            .or_default();
-        destination.requests = destination.requests.saturating_add(1);
+        let destination = self.routing_destinations.row([frontend, provider, model]);
+        saturating_add(&destination.requests, 1);
         if failed {
-            destination.errors = destination.errors.saturating_add(1);
+            saturating_add(&destination.errors, 1);
         }
     }
 
     fn record_routing_error(&self, frontend: &str, provider: &str, model: &str) {
-        let mut destinations = self
-            .routing_destinations
-            .lock()
-            .expect("routing destination stats poisoned");
-        let destination = destinations
-            .entry((
-                frontend.to_string(),
-                provider.to_string(),
-                model.to_string(),
-            ))
-            .or_default();
-        destination.errors = destination.errors.saturating_add(1);
+        saturating_add(
+            &self
+                .routing_destinations
+                .row([frontend, provider, model])
+                .errors,
+            1,
+        );
     }
 
     /// A request routed by a deterministic rule, skipping the triage call.
+    /// One confidentiality classification call against the private screener.
+    pub(crate) fn record_privacy_screen(&self) {
+        self.privacy_screens.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Screening could not complete, so the request stayed private-only. This
+    /// is counted separately from a classifier that genuinely answered unknown
+    /// because an infrastructure failure must not look like a policy result.
+    pub(crate) fn record_privacy_screen_error(&self) {
+        self.privacy_screen_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A destination was refused because the content was not eligible for it.
+    pub(crate) fn record_privacy_block(&self) {
+        self.privacy_blocks.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_rule_match(&self) {
         self.rule_matches.fetch_add(1, Ordering::Relaxed);
     }
@@ -425,14 +603,30 @@ impl ProxyStats {
         self.breaker_skips.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_tokens_saved(&self, prompt: u64, completion: u64, estimated: bool) {
+    fn record_tokens_saved(
+        &self,
+        prompt: u64,
+        completion: u64,
+        prompt_source: TokenSource,
+        completion_source: TokenSource,
+    ) {
         self.tokens_saved_prompt
             .fetch_add(prompt, Ordering::Relaxed);
         self.tokens_saved_completion
             .fetch_add(completion, Ordering::Relaxed);
-        if estimated {
+        // Only estimated sides count toward "avoided tokens we guessed at"; a
+        // side backed by a real provider count is not an estimate, so it is not
+        // double-reported in the estimated bucket.
+        let mut estimated = 0_u64;
+        if prompt_source.is_estimate() {
+            estimated = estimated.saturating_add(prompt);
+        }
+        if completion_source.is_estimate() {
+            estimated = estimated.saturating_add(completion);
+        }
+        if estimated > 0 {
             self.tokens_saved_estimated
-                .fetch_add(prompt + completion, Ordering::Relaxed);
+                .fetch_add(estimated, Ordering::Relaxed);
         }
     }
 
@@ -450,6 +644,9 @@ impl ProxyStats {
             &self.intercept_redirect,
             &self.intercept_fallback,
             &self.intercept_errors,
+            &self.privacy_screens,
+            &self.privacy_screen_errors,
+            &self.privacy_blocks,
             &self.served_local,
             &self.served_external,
             &self.tokens_saved_prompt,
@@ -458,83 +655,69 @@ impl ProxyStats {
         ] {
             counter.store(0, Ordering::Relaxed);
         }
+        for counter in &self.estimate_calls {
+            counter.store(0, Ordering::Relaxed);
+        }
+        self.token_estimator.reset();
         for window in [&self.latency_local, &self.latency_external] {
             window.clear();
         }
-        self.redirects_by_target
-            .lock()
-            .expect("redirect stats poisoned")
-            .clear();
-        self.served_by_provider
-            .lock()
-            .expect("provider stats poisoned")
-            .clear();
-        self.model_usage
-            .lock()
-            .expect("model usage stats poisoned")
-            .clear();
-        self.routing_matrix
-            .lock()
-            .expect("routing matrix stats poisoned")
-            .clear();
-        self.routing_destinations
-            .lock()
-            .expect("routing destination stats poisoned")
-            .clear();
+        self.latency.clear();
+        self.redirects_by_target.clear();
+        self.upstream_ttfb_by_provider.clear();
+        self.served_by_provider.clear();
+        self.model_usage.clear();
+        self.routing_matrix.clear();
+        self.routing_destinations.clear();
     }
 
     /// Stable snake_case keys: the admin UI treats this shape as a contract.
     pub(crate) fn snapshot_json(&self) -> Value {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
-        let latency = |window: &LatencyWindow| {
-            let (p50, p99, samples) = window.percentiles();
-            json!({ "p50_ms": p50, "p99_ms": p99, "samples": samples })
-        };
+        let latency = |window: &LatencyRing<LATENCY_WINDOW_CAP>| window.summary().to_json();
         let saved_prompt = load(&self.tokens_saved_prompt);
         let saved_completion = load(&self.tokens_saved_completion);
         let redirects = self
             .redirects_by_target
-            .lock()
-            .expect("redirect stats poisoned")
-            .iter()
-            .map(|(target, count)| (target.clone(), json!(count)))
+            .snapshot()
+            .into_iter()
+            .map(|([target], count)| (target.to_string(), json!(load(&count))))
             .collect::<serde_json::Map<_, _>>();
         let providers = self
             .served_by_provider
-            .lock()
-            .expect("provider stats poisoned")
-            .iter()
-            .map(|(provider, calls)| {
-                let (p50, p99, samples) = calls.latency.percentiles();
-                (
-                    provider.clone(),
-                    json!({
-                        "count": calls.count,
-                        "p50_ms": p50,
-                        "p99_ms": p99,
-                        "samples": samples,
-                    }),
-                )
+            .snapshot()
+            .into_iter()
+            .map(|([provider], calls)| {
+                let mut summary = calls.latency.summary().to_json();
+                summary["count"] = json!(load(&calls.count));
+                (provider.to_string(), summary)
             })
+            .collect::<serde_json::Map<_, _>>();
+        let upstream_by_provider = self
+            .upstream_ttfb_by_provider
+            .snapshot()
+            .into_iter()
+            .map(|([provider], ring)| (provider.to_string(), ring.summary().to_json()))
             .collect::<serde_json::Map<_, _>>();
         let mut model_usage = self
             .model_usage
-            .lock()
-            .expect("model usage stats poisoned")
-            .iter()
-            .map(|((provider, model), usage)| {
+            .snapshot()
+            .into_iter()
+            .map(|([provider, model], usage)| {
+                let input_tokens = load(&usage.input_tokens);
+                let output_tokens = load(&usage.output_tokens);
                 json!({
-                    "provider": provider,
-                    "model": model,
-                    "requests": usage.requests,
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "total_tokens": usage.input_tokens.saturating_add(usage.output_tokens),
-                    "total_time_ms": usage.total_time_ms,
-                    "estimated_requests": usage.estimated_requests,
-                    "cost_usd": usage.cost_usd,
-                    "baseline_usd": usage.baseline_usd,
-                    "priced_requests": usage.priced_requests,
+                    "provider": provider.as_ref(),
+                    "model": model.as_ref(),
+                    "requests": load(&usage.requests),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens.saturating_add(output_tokens),
+                    "total_time_ms": load(&usage.total_time_ms),
+                    "estimated_requests": load(&usage.estimated_requests),
+                    "cost_usd": usage.cost_usd.get(),
+                    "baseline_usd": usage.baseline_usd.get(),
+                    "priced_requests": load(&usage.priced_requests),
                 })
             })
             .collect::<Vec<_>>();
@@ -568,31 +751,25 @@ impl ProxyStats {
                 .then_with(|| left["model"].as_str().cmp(&right["model"].as_str()))
         });
         let mut matrix = serde_json::Map::new();
-        for ((frontend, provider), count) in self
-            .routing_matrix
-            .lock()
-            .expect("routing matrix stats poisoned")
-            .iter()
-        {
+        for ([frontend, provider], count) in self.routing_matrix.snapshot() {
             matrix
-                .entry(frontend.clone())
+                .entry(frontend.to_string())
                 .or_insert_with(|| Value::Object(serde_json::Map::new()))
                 .as_object_mut()
                 .expect("routing matrix rows are objects")
-                .insert(provider.clone(), json!(count));
+                .insert(provider.to_string(), json!(load(&count)));
         }
         let mut destinations = self
             .routing_destinations
-            .lock()
-            .expect("routing destination stats poisoned")
-            .iter()
-            .map(|((frontend, provider, model), destination)| {
+            .snapshot()
+            .into_iter()
+            .map(|([frontend, provider, model], destination)| {
                 json!({
-                    "frontend": frontend,
-                    "provider": provider,
-                    "model": model,
-                    "requests": destination.requests,
-                    "errors": destination.errors,
+                    "frontend": frontend.as_ref(),
+                    "provider": provider.as_ref(),
+                    "model": model.as_ref(),
+                    "requests": load(&destination.requests),
+                    "errors": load(&destination.errors),
                 })
             })
             .collect::<Vec<_>>();
@@ -635,8 +812,19 @@ impl ProxyStats {
             "latency": {
                 "local": latency(&self.latency_local),
                 "external": latency(&self.latency_external),
+                // Phase attribution. `overhead` is the number this project is
+                // answerable for; `upstream` is the provider's, and the two
+                // are measured per request rather than inferred by subtracting
+                // one percentile from another.
+                "phases": self.latency.to_json(),
+                "upstream_by_provider": upstream_by_provider,
             },
             "model_usage": model_usage,
+            "privacy": {
+                "screens": load(&self.privacy_screens),
+                "screen_errors": load(&self.privacy_screen_errors),
+                "blocks": load(&self.privacy_blocks),
+            },
             "resilience": {
                 "failovers": load(&self.failovers),
                 "breaker_skips": load(&self.breaker_skips),
@@ -655,6 +843,10 @@ impl ProxyStats {
                 "total": saved_prompt + saved_completion,
                 "estimated": load(&self.tokens_saved_estimated),
                 "approximate": true,
+                "estimate_sources": {
+                    "calibrated": load(&self.estimate_calls[TOKEN_SOURCE_CALIBRATED]),
+                    "default": load(&self.estimate_calls[TOKEN_SOURCE_DEFAULT]),
+                },
             },
         })
     }
@@ -724,10 +916,12 @@ pub(crate) struct ResponseTracking<'a> {
     class: RouteClass,
     provider: &'a str,
     model: &'a str,
-    frontend: &'a str,
+    /// The client-facing endpoint name. Always a literal at the call sites, so
+    /// it is borrowed for the life of the process and never copied.
+    frontend: &'static str,
     request_started: Instant,
     model_started: Instant,
-    estimated_input_tokens: u64,
+    input_estimate: TokenEstimate,
     estimate_output_tokens: bool,
     pricing: RequestPricing,
 }
@@ -737,10 +931,10 @@ impl<'a> ResponseTracking<'a> {
         class: RouteClass,
         provider: &'a str,
         model: &'a str,
-        frontend: &'a str,
+        frontend: &'static str,
         request_started: Instant,
         model_started: Instant,
-        estimated_input_tokens: u64,
+        input_estimate: TokenEstimate,
     ) -> Self {
         Self {
             class,
@@ -749,7 +943,7 @@ impl<'a> ResponseTracking<'a> {
             frontend,
             request_started,
             model_started,
-            estimated_input_tokens,
+            input_estimate,
             estimate_output_tokens: true,
             pricing: RequestPricing::default(),
         }
@@ -776,21 +970,33 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
         frontend,
         request_started,
         model_started,
-        estimated_input_tokens,
+        input_estimate,
         estimate_output_tokens,
         pricing,
     } = tracking;
-    let provider = provider.to_string();
-    let model = model.to_string();
-    let frontend = frontend.to_string();
+    // The tracked stream outlives this call, so the route identity has to be
+    // owned. `Arc<str>` rather than `String`: the identity is interned once
+    // per route and every later request clones a refcount instead of copying
+    // the bytes again.
+    let provider: Arc<str> = Arc::from(provider);
+    let model: Arc<str> = Arc::from(model);
     let status = response.status();
     let success = status.is_success();
-    proxy_stats().record_routing_destination(&frontend, &provider, &model, !success);
+    proxy_stats().record_routing_destination(frontend, &provider, &model, !success);
+    // Everything the proxy did before any network work: extraction, screening,
+    // routing, rewriting, and token estimation. Recorded now rather than at
+    // completion so the figure lands even for a response that never finishes.
+    let pre_dispatch = model_started.saturating_duration_since(request_started);
+    proxy_stats().latency.record_pre_dispatch(pre_dispatch);
+    // Captured, not read, here: the body below is polled by the server after
+    // the handler's timing scope has ended, and for a streamed response the
+    // wait for the upstream's first byte has not even happened yet.
+    let timing = crate::latency::current_timing();
     if !success {
         error!(
             route_class = class.as_str(),
-            provider,
-            model,
+            provider = %provider,
+            model = %model,
             frontend,
             status = status.as_u16(),
             "proxied response returned an error status"
@@ -817,8 +1023,8 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
                     chunk_index = chunk_index.saturating_add(1);
                     trace!(
                         route_class = class.as_str(),
-                        provider,
-                        model,
+                        provider = %provider,
+                        model = %model,
                         frontend,
                         status = status.as_u16(),
                         chunk_index,
@@ -829,8 +1035,8 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
                     if !success {
                         error!(
                             route_class = class.as_str(),
-                            provider,
-                            model,
+                            provider = %provider,
+                            model = %model,
                             frontend,
                             status = status.as_u16(),
                             chunk_index,
@@ -842,6 +1048,19 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
                     }
                     if !logged_first_chunk && !bytes.is_empty() {
                         logged_first_chunk = true;
+                        // By now every upstream wait this request paid for has
+                        // been attributed, including the gap between the
+                        // provider's response headers and its first token.
+                        let upstream_wait = timing
+                            .as_ref()
+                            .map(|timing| timing.upstream_wait())
+                            .unwrap_or_default();
+                        proxy_stats().record_upstream_wait(&provider, upstream_wait);
+                        proxy_stats().latency.record_first_byte(
+                            request_started.elapsed(),
+                            pre_dispatch,
+                            upstream_wait,
+                        );
                         if traffic_log().enabled() {
                             let head = &bytes[..bytes.len().min(TRAFFIC_PREVIEW_CHARS * 2)];
                             traffic_log().record(
@@ -856,12 +1075,12 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
                 Err(stream_error) => {
                     completed = false;
                     if success {
-                        proxy_stats().record_routing_error(&frontend, &provider, &model);
+                        proxy_stats().record_routing_error(frontend, &provider, &model);
                     }
                     error!(
                         route_class = class.as_str(),
-                        provider,
-                        model,
+                        provider = %provider,
+                        model = %model,
                         frontend,
                         status = status.as_u16(),
                         error = %stream_error,
@@ -877,8 +1096,9 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
             yield chunk;
         }
         if success && completed {
-            let usage = sniffer.finish(estimated_input_tokens, estimate_output_tokens);
-            proxy_stats().record_served(class, &provider, &frontend, request_started.elapsed());
+            let usage = sniffer.finish(&input_estimate, estimate_output_tokens);
+            proxy_stats().latency.record_total(request_started.elapsed());
+            proxy_stats().record_served(class, &provider, frontend, request_started.elapsed());
             proxy_stats().record_model_usage(
                 &provider,
                 &model,
@@ -890,7 +1110,8 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
                 proxy_stats().record_tokens_saved(
                     usage.input_tokens,
                     usage.output_tokens,
-                    usage.estimated,
+                    usage.input_source,
+                    usage.output_source,
                 );
             }
         }
@@ -905,6 +1126,7 @@ const SNIFFER_TAIL_CAP: usize = 16 * 1024;
 struct UsageSniffer {
     tail: Vec<u8>,
     total_bytes: u64,
+    decoded_chars: u64,
     is_sse: bool,
 }
 
@@ -913,12 +1135,18 @@ impl UsageSniffer {
         Self {
             tail: Vec::new(),
             total_bytes: 0,
+            decoded_chars: 0,
             is_sse,
         }
     }
 
     fn feed(&mut self, chunk: &[u8]) {
         self.total_bytes += chunk.len() as u64;
+        // Decoded characters drive the calibrated estimate; bytes drive the
+        // crude fallback. Counting them separately is what lets a learned
+        // ratio apply to the content the client actually sees rather than its
+        // UTF-8 on-the-wire size.
+        self.decoded_chars += String::from_utf8_lossy(chunk).chars().count() as u64;
         if chunk.len() >= SNIFFER_TAIL_CAP {
             self.tail.clear();
             self.tail
@@ -932,20 +1160,35 @@ impl UsageSniffer {
         self.tail.extend_from_slice(chunk);
     }
 
-    fn finish(self, estimated_input_tokens: u64, estimate_output_tokens: bool) -> TokenUsage {
-        let divisor = if self.is_sse { 6 } else { 4 };
-        let estimated_output_tokens = if estimate_output_tokens {
-            self.total_bytes / divisor
+    fn finish(self, input_estimate: &TokenEstimate, estimate_output_tokens: bool) -> TokenUsage {
+        // Calibrate first: the response tail is the most representative text of
+        // what the provider actually generated, and it is what we classify when
+        // folding a real output count into the estimator.
+        let (exact_input, exact_output) = extract_last_usage(&self.tail).unwrap_or_default();
+        let tail_text = String::from_utf8_lossy(&self.tail).into_owned();
+        proxy_stats().calibrate_from_usage(
+            exact_input,
+            exact_output,
+            input_estimate,
+            None,
+            &tail_text,
+        );
+        let estimated_output = if estimate_output_tokens {
+            proxy_stats().estimate_output(self.decoded_chars, self.total_bytes, self.is_sse)
         } else {
-            0
+            (0, TokenSource::Exact)
         };
-        let (input, output) = extract_last_usage(&self.tail).unwrap_or_default();
-        TokenUsage::from_fields(
-            input,
-            output,
-            estimated_input_tokens,
-            estimated_output_tokens,
-        )
+        TokenUsage {
+            input_tokens: exact_input.unwrap_or(input_estimate.tokens),
+            output_tokens: exact_output.unwrap_or(estimated_output.0),
+            input_source: exact_input
+                .map(|_| TokenSource::Exact)
+                .unwrap_or(input_estimate.source),
+            output_source: exact_output
+                .map(|_| TokenSource::Exact)
+                .unwrap_or(estimated_output.1),
+            estimated: exact_input.is_none() || exact_output.is_none(),
+        }
     }
 }
 
@@ -1029,7 +1272,7 @@ fn usage_tokens(usage: &Value) -> Option<(u64, u64)> {
     Some((input.unwrap_or(0), output.unwrap_or(0)))
 }
 
-fn usage_token_fields(usage: &Value) -> (Option<u64>, Option<u64>) {
+pub(crate) fn usage_token_fields(usage: &Value) -> (Option<u64>, Option<u64>) {
     let field = |names: [&str; 2]| {
         names
             .iter()

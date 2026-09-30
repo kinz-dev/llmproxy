@@ -1,0 +1,17 @@
+target/
+.git/
+.gitignore
+.github/
+.idea/
+.plan/
+.remember/
+.claude/
+.cargo/
+nohup.out
+config.toml
+**/config.toml
+**/*.log
+*.md
+Dockerfile
+build-and-deploy.sh
+.dockerignore

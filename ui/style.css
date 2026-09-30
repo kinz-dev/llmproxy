@@ -725,6 +725,30 @@ code.mono { font-size: 0.85em; color: var(--muted); }
 
 .latency-figures { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
 
+/* Latency budget: where the time to first byte actually went. */
+
+.budget-band {
+  display: flex;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--panel-2);
+  margin: 6px 0 4px;
+}
+
+.budget-band.is-empty { border: 1px solid var(--line); }
+
+.budget-seg { height: 100%; transition: width 0.6s ease; }
+/* A healthy proxy is a sliver next to the model, so floor its segments: a
+   share too small to render is still a share that must stay watchable. */
+.budget-seg.is-proxy { background: var(--local); min-width: 2px; }
+.budget-seg.is-upstream { background: var(--external-dim); }
+
+.budget-caption { margin-bottom: 14px; }
+.latency-name.is-proxy { color: var(--local); }
+.budget-row { grid-template-columns: 76px minmax(0, 1fr); }
+.budget-row .latency-figures { text-align: right; }
+
 /* Traffic log */
 
 .log-controls {

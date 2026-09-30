@@ -35,9 +35,10 @@ use crate::interceptor::{IntegratedTarget, InterceptorConfig};
 use crate::stats::{proxy_stats, route_class_for_base_url, routing_decision_log, traffic_log};
 use crate::{
     AdminConfig, AnthropicMode, AppState, Config, INTEGRATED_AUTO_MODEL, ModelAlias,
-    ModelRoutingMode, ResponsesMode, RoutingMode, SharedState, build_provider_state,
-    configure_daemon_process, effective_provider_configs, finalize_config_keys, parse_config,
-    refresh_upstream_models, update_runtime_mode, validate_config,
+    ModelRoutingMode, ResponsesMode, RoutingMode, SharedState, attach_privacy_boundary,
+    build_provider_state, configure_daemon_process, effective_provider_configs,
+    finalize_config_keys, parse_config, refresh_upstream_models, update_runtime_mode,
+    validate_config,
 };
 
 /// Effective bind address: missing config means loopback on a random port.
@@ -1073,13 +1074,17 @@ async fn apply_config_change(
     }
 
     let auto_mapping = config.model_routing == ModelRoutingMode::Remap;
-    let new_state = AppState {
+    // The post-swap providers must carry the new policy snapshot, or the
+    // transport gate would stay disarmed on a rebuilt provider until a restart:
+    // a runtime privacy toggle would not take effect for dispatch verification
+    // while routing already honored the new policy.
+    let new_state = attach_privacy_boundary(AppState {
         forward_caller_credentials: config.routing_mode != RoutingMode::Integrated,
         config: Arc::new(config),
         providers: Arc::new(providers),
         launcher_kind: None,
         launcher_mode: None,
-    };
+    });
     state.shared.replace(new_state.clone());
     if let Some(addr) = state.context.proxy_addr.get()
         && let Err(error) = update_runtime_mode(*addr, new_state.config.routing_mode)

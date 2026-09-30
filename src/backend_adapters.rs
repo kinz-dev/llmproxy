@@ -526,7 +526,7 @@ fn push_message(messages: &mut Vec<Value>, role: &str, mut content: Vec<Value>) 
     messages.push(json!({ "role": role, "content": content }));
 }
 
-fn strip_provider_artifacts(value: &mut Value) {
+pub(crate) fn strip_provider_artifacts(value: &mut Value) {
     match value {
         Value::Object(object) => {
             for key in [

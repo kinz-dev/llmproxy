@@ -46,6 +46,7 @@ mod agent_launcher;
 mod backend_adapters;
 mod claude_launcher;
 mod codex_launcher;
+mod context_budget;
 mod copilot_launcher;
 mod interceptor;
 mod latency;
@@ -243,6 +244,7 @@ struct Config {
     listen_addr: String,
     max_logging_retention_days: u64,
     default_provider: String,
+    default_model: Option<String>,
     upstream: UpstreamConfig,
     providers: HashMap<String, UpstreamConfig>,
     interceptor: InterceptorConfig,
@@ -274,6 +276,7 @@ impl Default for Config {
                 .unwrap_or_else(|_| "127.0.0.1:8080".to_string()),
             max_logging_retention_days: 7,
             default_provider: "default".to_string(),
+            default_model: None,
             upstream: UpstreamConfig::default(),
             providers: HashMap::new(),
             interceptor: InterceptorConfig::default(),
@@ -915,6 +918,7 @@ struct RuntimeInfo {
 #[derive(Debug, Clone, Default)]
 struct UpstreamModels {
     ids: Vec<String>,
+    limits: HashMap<String, context_budget::ModelLimits>,
     response: Option<Value>,
     fetched_at: Option<Instant>,
 }
@@ -1187,15 +1191,37 @@ impl ModelMappingSource {
 
 impl ModelCache {
     fn replace_upstream_models(&self, ids: Vec<String>, response: Value) -> bool {
+        let limits = response
+            .get("data")
+            .and_then(Value::as_array)
+            .or_else(|| response.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|model| {
+                Some((
+                    model.get("id")?.as_str()?.to_owned(),
+                    context_budget::ModelLimits::from_model(model),
+                ))
+            })
+            .collect();
         let mut upstream = self
             .upstream
             .lock()
             .expect("upstream model cache mutex poisoned");
         let changed = upstream.ids != ids;
         upstream.ids = ids;
+        upstream.limits = limits;
         upstream.response = Some(response);
         upstream.fetched_at = Some(Instant::now());
         changed
+    }
+
+    fn model_limits(&self, model: &str) -> context_budget::ModelLimits {
+        let upstream = self
+            .upstream
+            .lock()
+            .expect("upstream model cache mutex poisoned");
+        upstream.limits.get(model).copied().unwrap_or_default()
     }
 
     fn first_upstream_model(&self) -> Option<String> {
@@ -1204,6 +1230,14 @@ impl ModelCache {
             .lock()
             .expect("upstream model cache mutex poisoned");
         upstream.ids.first().cloned()
+    }
+
+    fn contains_upstream_model(&self, model: &str) -> bool {
+        let upstream = self
+            .upstream
+            .lock()
+            .expect("upstream model cache mutex poisoned");
+        upstream.ids.iter().any(|id| id == model)
     }
 
     /// Cached upstream model ids and whether the cache was ever filled.
@@ -2377,6 +2411,7 @@ const CONFIG_KEYS: &[&str] = &[
     "listen_addr",
     "max_logging_retention_days",
     "default_provider",
+    "default_model",
     "routing_mode",
     "upstream",
     "providers",
@@ -3074,8 +3109,19 @@ async fn model_by_id_impl(
 
     let provider = state.default_provider();
     let provider_headers = provider_request_headers(&state, &headers, provider);
-    match ensure_default_upstream_model(provider, &provider_headers).await {
+    match ensure_default_upstream_model(
+        provider,
+        &provider_headers,
+        state.config.default_model.as_deref(),
+    )
+    .await
+    {
         Ok(target) => {
+            let target = if provider.model_cache.contains_upstream_model(&model) {
+                model.clone()
+            } else {
+                target
+            };
             provider.model_cache.log_first_seen_model(
                 &provider.name,
                 &model,
@@ -3967,18 +4013,26 @@ fn models_cache_ttl(config: &Config) -> Option<Duration> {
 async fn ensure_default_upstream_model(
     provider: &ProviderState,
     incoming_headers: &HeaderMap,
+    configured_model: Option<&str>,
 ) -> std::result::Result<String, Response> {
+    let configured_model = configured_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
     if let Some(model) = provider.model_cache.first_upstream_model() {
-        return Ok(model);
+        return Ok(configured_model.map_or(model.clone(), str::to_owned));
     }
 
     let _refresh_guard = provider.model_refresh.lock().await;
     if let Some(model) = provider.model_cache.first_upstream_model() {
-        return Ok(model);
+        return Ok(configured_model.map_or(model.clone(), str::to_owned));
     }
 
     match refresh_upstream_models(provider, incoming_headers).await {
-        Ok(ids) => ids.first().cloned().ok_or_else(no_upstream_models_response),
+        Ok(ids) => configured_model
+            .map(str::to_owned)
+            .or_else(|| ids.first().cloned())
+            .ok_or_else(no_upstream_models_response),
+        Err(_) if configured_model.is_some() => Ok(configured_model.unwrap().to_owned()),
         Err(error) => Err((
             StatusCode::BAD_GATEWAY,
             Json(json!({
@@ -4006,15 +4060,22 @@ async fn rewrite_proxy_request_value(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let provider_headers = provider_request_headers(state, incoming_headers, &provider);
+    let configured_default_model = (provider.name == state.config.default_provider)
+        .then_some(state.config.default_model.as_deref())
+        .flatten();
     let preserve_explicit_model = requested_model
         .as_deref()
         .is_some_and(|model| preserve_integrated_model(&state.config, model));
-    let default_model =
-        if !preserve_explicit_model && request_needs_default_model(value, &state.config) {
-            Some(ensure_default_upstream_model(&provider, &provider_headers).await?)
-        } else {
-            None
-        };
+    let default_model = if !preserve_explicit_model
+        && request_needs_default_model(value, &state.config)
+    {
+        Some(
+            ensure_default_upstream_model(&provider, &provider_headers, configured_default_model)
+                .await?,
+        )
+    } else {
+        None
+    };
 
     rewrite_request_value(value, &state.config, &provider, default_model.as_deref());
     if let Some(requested) = requested_model
@@ -4172,6 +4233,25 @@ pub(crate) async fn send_upstream_once(
         proxy_stats().record_privacy_block();
         return Err(UpstreamFailure::privacy(meta, gate.reason));
     }
+    let generation = meta.method == Method::POST
+        && matches!(
+            meta.path.as_ref(),
+            "chat/completions" | "responses" | "messages" | "v1/messages"
+        );
+    let fitted = body.map(|body| {
+        let limits = if generation {
+            provider.model_cache.model_limits(request_model(body))
+        } else {
+            context_budget::ModelLimits::default()
+        };
+        let fitted = context_budget::FittedRequest::new(body, limits);
+        if let Some(cap) = fitted.cap {
+            info!(provider = %meta.provider, request_id = %meta.request_id,
+                model = request_model(body), context_window = limits.context,
+                output_token_limit = cap, "fitted output token limit to advertised model context");
+        }
+        fitted
+    });
     debug!(
         provider = %meta.provider,
         request_id = %meta.request_id,
@@ -4182,7 +4262,7 @@ pub(crate) async fn send_upstream_once(
         "sending upstream request"
     );
     if meta.log_bodies
-        && let Some(body) = body
+        && let Some(body) = fitted.as_ref()
     {
         trace!(
             provider = %meta.provider,
@@ -4208,7 +4288,7 @@ pub(crate) async fn send_upstream_once(
         .client
         .request(meta.method.clone(), provider.upstream_url(&meta.path))
         .headers(header_map);
-    if let Some(body) = body {
+    if let Some(body) = fitted.as_ref() {
         request = request.json(body);
     }
     if meta.response_kind != UpstreamResponseKind::Stream {
@@ -5812,7 +5892,12 @@ fn rewrite_request_value(
                         )
                     })
                     .or_else(|| {
-                        default_upstream_model.map(|target| (target, ModelMappingSource::Auto))
+                        (!provider.model_cache.contains_upstream_model(&requested))
+                            .then(|| {
+                                default_upstream_model
+                                    .map(|target| (target, ModelMappingSource::Auto))
+                            })
+                            .flatten()
                     });
 
                 if let Some((target, source)) = mapping {

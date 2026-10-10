@@ -63,6 +63,15 @@ pub(crate) fn chat_to_anthropic_request(chat: &Value) -> Value {
             continue;
         };
         let role = object.get("role").and_then(Value::as_str).unwrap_or("user");
+        // Legacy chat templates may require `tool -> user` role rewriting.
+        // The retained tool_call_id still identifies a result on Anthropic's
+        // wire, where ordinary user text cannot answer a tool_use block.
+        let role = if role == "user" && object.get("tool_call_id").and_then(Value::as_str).is_some()
+        {
+            "tool"
+        } else {
+            role
+        };
         match role {
             "system" | "developer" => {
                 if let Some(content) = object.get("content") {

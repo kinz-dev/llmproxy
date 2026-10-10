@@ -22,7 +22,7 @@
     <div class="masthead-meta mono">
       <span class="meta-item"><span class="lamp" id="lamp-proxy" aria-hidden="true"></span><span id="meta-proxy-addr">—</span></span>
       <span class="meta-item" id="meta-uptime" title="proxy uptime">—</span>
-      <span class="meta-item" id="meta-routing-mode">mode —</span>
+      <span class="meta-item mode-indicator mono" id="meta-routing-mode">— MODE</span>
       <button class="button button-quiet masthead-restart" id="restart-proxy" type="button">Restart</button>
     </div>
   </div>
@@ -43,7 +43,7 @@
       <div class="tab-group">
         <span class="tab-group-label mono">Route</span>
         <a class="tab" id="tab-routing" href="#/routing/triage">
-          <span class="tab-index mono">03</span><span>Routing</span>
+          <span class="tab-index mono">03</span><span>Mode &amp; routes</span>
         </a>
         <a class="tab" id="tab-models" href="#/models">
           <span class="tab-index mono">04</span><span>Models</span>
@@ -133,7 +133,9 @@
                 <path id="flow-local" class="flow-line local drift" d="M 388 76 C 470 76 490 40 570 40"/>
                 <path id="flow-ext" class="flow-line external drift" d="M 388 92 C 470 92 490 128 570 128"/>
                 <text class="flow-count mono local" id="flow-local-count" x="584" y="45">0 private</text>
+                <text class="flow-model mono local" id="flow-local-models" x="584" y="61">models: —</text>
                 <text class="flow-count mono external" id="flow-ext-count" x="584" y="133">0 remote</text>
+                <text class="flow-model mono external" id="flow-ext-models" x="584" y="149">models: —</text>
               </svg>
             </div>
             <div class="split-band" id="split-band" role="img" aria-label="Share of responses served on the private network">
@@ -354,25 +356,26 @@
     <div id="view-routing" class="page-view" aria-labelledby="tab-routing" hidden>
       <header class="page-head">
         <div>
-          <p class="page-kicker mono">Route / Routing</p>
-          <h2>Shape provider decisions</h2>
-          <p>Configure the triage provider and execution targets, then edit and test their routing policy.</p>
+          <p class="page-kicker mono">Route / Mode &amp; destinations</p>
+          <h2>Choose how requests flow</h2>
+          <p>Set the active mode and the provider and model used for normal requests.</p>
         </div>
       </header>
       <nav class="subtabs" role="tablist" aria-label="Routing views">
-        <a class="subtab" id="subtab-routing-triage" role="tab" href="#/routing/triage">Triage setup</a>
+        <a class="subtab" id="subtab-routing-triage" role="tab" href="#/routing/triage">Mode &amp; destinations</a>
         <a class="subtab" id="subtab-routing-policy" role="tab" href="#/routing/policy">Policy &amp; test</a>
       </nav>
 
       <div id="subview-routing-triage" class="subview" role="tabpanel" aria-labelledby="subtab-routing-triage">
-        <section class="panel" aria-labelledby="routing-mode-label">
+        <section class="panel mode-panel" id="routing-mode-panel" aria-labelledby="routing-mode-label">
           <h3 class="panel-label" id="routing-mode-label">Instance routing mode</h3>
           <p class="panel-intro">One mode applies to direct API traffic and every Codex, Claude Code, or Copilot launcher.</p>
+          <div class="mode-current" id="mode-current" aria-live="polite"></div>
           <form class="field-form" id="routing-mode-form">
             <div class="field-row">
               <label class="field"><span class="field-name mono">routing_mode</span>
                 <select class="input mono" id="routing-mode">
-                  <option value="proxy">proxy · default provider only</option>
+                  <option value="proxy">proxy · normal requests to selected provider</option>
                   <option value="intercept">intercept · triage answer or PASS</option>
                   <option value="integrated">integrated · provider routing for Auto</option>
                 </select></label>
@@ -384,7 +387,54 @@
           </form>
         </section>
 
-        <section class="panel" aria-labelledby="cfg-int-label">
+        <section class="panel" id="proxy-destination-panel" aria-labelledby="proxy-destination-label">
+          <h3 class="panel-label" id="proxy-destination-label">Normal request destination</h3>
+          <p class="panel-intro" id="destination-intro">Choose the provider and upstream model used when a request does not select a route of its own.</p>
+          <form class="field-form" id="proxy-destination-form">
+            <div class="field-row">
+              <label class="field"><span class="field-name mono">upstream provider</span>
+                <select class="input mono" id="proxy-provider"></select></label>
+              <label class="field"><span class="field-name mono">default upstream model</span>
+                <select class="input mono" id="proxy-model"></select>
+                <span class="choice-note">Auto uses the first model returned by this provider.</span></label>
+            </div>
+            <div class="form-actions">
+              <span class="hint form-note">Aliases and provider/model requests can still choose another destination.</span>
+              <button class="button button-primary" type="submit">Save destination</button>
+            </div>
+          </form>
+          <div class="local-destination">
+            <label class="field field-check local-destination-toggle">
+              <input type="checkbox" id="local-destination-enabled">
+              <span><strong>Enable LOCAL destination</strong><span class="choice-note">Integrated mode may route requests here. DEFAULT remains the PASS destination.</span></span>
+            </label>
+            <form class="field-form" id="local-destination-form">
+              <div class="field-row">
+                <label class="field"><span class="field-name mono">local provider</span>
+                  <select class="input mono" id="local-provider"></select></label>
+                <label class="field"><span class="field-name mono">local model</span>
+                  <select class="input mono" id="local-model"></select>
+                  <span class="choice-note">Choose one model from this provider’s cached /v1/models list.</span></label>
+              </div>
+              <div class="form-actions">
+                <span class="hint form-note" id="local-destination-note">LOCAL is available only in integrated mode.</span>
+                <button class="button button-primary" type="submit">Save LOCAL destination</button>
+              </div>
+            </form>
+          </div>
+        </section>
+
+        <section class="panel mode-policy-panel" id="mode-policy-panel" hidden aria-labelledby="mode-policy-title">
+          <h3 class="panel-label" id="mode-policy-title">Decision prompt</h3>
+          <p class="panel-intro" id="mode-policy-intro"></p>
+          <details>
+            <summary class="mono" id="mode-policy-summary">View prompt</summary>
+            <pre class="prompt-preview mono" id="mode-policy-text"></pre>
+          </details>
+          <a class="button button-link" id="mode-policy-edit" href="#/routing/policy">Edit and test this prompt</a>
+        </section>
+
+        <section class="panel" id="interceptor-panel" aria-labelledby="cfg-int-label">
           <h3 class="panel-label" id="cfg-int-label">Triage provider</h3>
           <p class="panel-intro">This provider sees each eligible request first and executes deterministic work only above the policy threshold.</p>
           <form class="field-form" id="interceptor-form">
@@ -421,7 +471,7 @@
           </form>
         </section>
 
-        <section class="panel" aria-labelledby="cfg-integrated-label">
+        <section class="panel" id="integrated-panel" aria-labelledby="cfg-integrated-label">
           <h3 class="panel-label" id="cfg-integrated-label">Integrated targets</h3>
           <p class="panel-intro">Model <code class="mono">Auto</code> enables target tools and
           <code class="mono">PASS</code>. Explicit models bypass integrated triage;
@@ -608,8 +658,6 @@
         <h3 class="panel-label" id="cfg-set-label">Defaults &amp; protocol</h3>
         <form class="field-form" id="settings-form">
           <div class="field-row">
-            <label class="field"><span class="field-name mono">default_provider</span>
-              <select class="input mono" id="set-default-provider"></select></label>
             <label class="field"><span class="field-name mono">responses.mode</span>
               <select class="input mono" id="set-responses-mode">
                 <option value="chat_completions">chat_completions</option>

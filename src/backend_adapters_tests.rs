@@ -53,6 +53,39 @@ fn chat_to_anthropic_preserves_tools_results_and_images() {
 }
 
 #[test]
+fn chat_to_anthropic_recovers_results_after_legacy_tool_role_rewrite() {
+    let request = chat_to_anthropic_request(&json!({
+        "model": "claude-test",
+        "messages": [
+            { "role": "user", "content": "inspect both pages", "name": "reader" },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    { "id": "call_1", "type": "function", "function": { "name": "read", "arguments": "{}" } },
+                    { "id": "call_2", "type": "function", "function": { "name": "read", "arguments": "{}" } }
+                ]
+            },
+            { "role": "user", "tool_call_id": "call_1", "content": "page one" },
+            { "role": "user", "tool_call_id": "call_2", "content": "page two" },
+            { "role": "user", "content": "summarize" }
+        ]
+    }));
+
+    let messages = request["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["content"][0]["type"], "text");
+    assert_eq!(messages[1]["content"][0]["id"], "call_1");
+    assert_eq!(messages[1]["content"][1]["id"], "call_2");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+    assert_eq!(messages[2]["content"][0]["tool_use_id"], "call_1");
+    assert_eq!(messages[2]["content"][1]["type"], "tool_result");
+    assert_eq!(messages[2]["content"][1]["tool_use_id"], "call_2");
+    assert_eq!(messages[2]["content"][2]["type"], "text");
+}
+
+#[test]
 fn cross_provider_sanitizer_removes_signed_history_artifacts() {
     let mut request = json!({
         "messages": [{

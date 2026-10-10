@@ -53,6 +53,7 @@ function applyToast(result, what) {
 }
 
 const fmtInt = new Intl.NumberFormat("en-US");
+let providerClasses = new Map();
 
 function fmtCount(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + "M";
@@ -170,7 +171,7 @@ function renderLaunch() {
   const hints = [];
   if (launchData.routing_mode === "proxy") {
     hints.push(
-      `Routes every model request to ${launchData.default_provider}; only protocol and message structure are remapped.`
+      `Normal requests use ${launchData.default_provider}${launchData.default_model ? ` / ${launchData.default_model}` : " / the first upstream model"}; aliases and provider/model routes can select another destination.`
     );
     hints.push("No interceptor prompt, routing controls, or integrated provider tools are added.");
   } else if (launchData.routing_mode === "intercept") {
@@ -331,6 +332,7 @@ function renderStats(stats) {
   renderProviderCalls(served.providers || {});
   renderRoutingDestinations(served.destinations || []);
   renderModelUsage(stats.model_usage || []);
+  renderFlowModels(stats.model_usage || []);
 
   // Flow strip: stroke weight follows each branch's share of responses.
   const totalServed = served.local + served.external;
@@ -364,6 +366,22 @@ function renderStats(stats) {
   setLatencyRow("#lat-local-bar", "#lat-local-figures", stats.latency.local, maxP99);
   setLatencyRow("#lat-ext-bar", "#lat-ext-figures", stats.latency.external, maxP99);
   renderLatencyBudget(stats.latency.phases);
+}
+
+function renderFlowModels(modelUsage) {
+  for (const [routeClass, id] of [["local", "#flow-local-models"], ["external", "#flow-ext-models"]]) {
+    const counts = new Map();
+    for (const entry of modelUsage) {
+      if (providerClasses.get(entry.provider) !== routeClass || !entry.model) continue;
+      counts.set(entry.model, (counts.get(entry.model) || 0) + Number(entry.requests || 0));
+    }
+    const models = [...counts.keys()].sort((a, b) => counts.get(b) - counts.get(a) || a.localeCompare(b));
+    const label = $(id);
+    label.textContent = models.length
+      ? `models: ${models[0].length > 22 ? `${models[0].slice(0, 10)}…${models[0].slice(-9)}` : models[0]}${models.length > 1 ? ` +${models.length - 1}` : ""}`
+      : "models: —";
+    label.setAttribute("title", models.length ? models.join("\n") : "No completed model calls yet");
+  }
 }
 
 // A single round-trip number cannot tell a slow model from a slow proxy. The
@@ -807,6 +825,7 @@ async function loadMonitor() {
       apiGet("/api/models"),
       apiGet("/api/launch"),
     ]);
+    providerClasses = new Map((models.providers || []).map((provider) => [provider.name, provider.class]));
     launchData = launch;
     renderLaunch();
     renderRouting(models);
@@ -814,7 +833,10 @@ async function loadMonitor() {
     proxyAddr = overview.proxy_addr || overview.listen_addr;
     if (catalogLoaded) renderCatalog();
     $("#meta-proxy-addr").textContent = proxyAddr;
-    $("#meta-routing-mode").textContent = `mode ${overview.routing_mode}`;
+    const modeBadge = $("#meta-routing-mode");
+    modeBadge.textContent = `${overview.routing_mode.toUpperCase()} MODE`;
+    modeBadge.dataset.mode = overview.routing_mode;
+    modeBadge.dataset.unsaved = "false";
     $("#footer-version").textContent = `llmproxy ${overview.version}` +
       (overview.launcher ? ` · ${overview.launcher} session` : "");
     $("#footer-config").textContent = overview.config_path || "no config file (defaults)";
@@ -1248,9 +1270,117 @@ function renderAliasEditor() {
   providerOptions($("#alias-add-provider"), "", true);
 }
 
+function renderModeDependentControls(mode, preview = false) {
+  const modeInfo = {
+    proxy: ["Proxy mode", "Sends normal requests to the selected provider and model; model aliases and provider/model routes can override it."],
+    intercept: ["Intercept mode", "Screens requests first; the triage model can answer directly or pass through to the selected provider."],
+    integrated: ["Integrated mode", "Model Auto enables triage and configured provider tools; PASS uses the selected provider."],
+  }[mode];
+  $("#routing-mode-panel").dataset.mode = mode;
+  $("#mode-current").replaceChildren(
+    el("strong", { class: "mode-current-title", text: `${modeInfo[0]}${preview ? " · UNSAVED" : " · ACTIVE"}` }),
+    el("span", { text: modeInfo[1] })
+  );
+  const modeBadge = $("#meta-routing-mode");
+  modeBadge.textContent = `${mode.toUpperCase()} MODE`;
+  modeBadge.dataset.mode = mode;
+  modeBadge.dataset.unsaved = String(preview);
+  $("#interceptor-panel").hidden = mode === "proxy";
+  $("#integrated-panel").hidden = mode !== "integrated";
+  $("#subtab-routing-policy").hidden = mode === "proxy";
+  const policyViewActive = currentRoute().secondary === "policy";
+  $("#subview-routing-policy").hidden = mode === "proxy" || !policyViewActive;
+  $("#subtab-routing-policy").setAttribute("aria-selected", String(mode !== "proxy" && policyViewActive));
+  $("#mode-policy-panel").hidden = mode === "proxy";
+  if (mode === "intercept") {
+    $("#mode-policy-title").textContent = "Intercept decision prompt";
+    $("#mode-policy-intro").textContent =
+      `Triage uses ${configData.interceptor.provider} / ${configData.interceptor.model}. This prompt guides when it answers directly and when it passes through.`;
+    $("#mode-policy-summary").textContent = "View intercept prompt";
+    $("#mode-policy-text").textContent = configData.interceptor.instructions || "";
+  } else if (mode === "integrated") {
+    $("#mode-policy-title").textContent = "Integrated routing prompt";
+    $("#mode-policy-intro").textContent =
+      `Triage uses ${configData.interceptor.provider} / ${configData.interceptor.model}. This prompt guides selection from the integrated targets below or PASS to the normal destination.`;
+    $("#mode-policy-summary").textContent = "View integrated prompt";
+    $("#mode-policy-text").textContent = configData.integrated.instructions || "";
+  }
+
+  $("#proxy-destination-label").textContent = mode === "proxy"
+    ? "Default upstream destination"
+    : mode === "intercept"
+      ? "PASS / fallback destination"
+      : "PASS / explicit model destination";
+  $("#destination-intro").textContent = mode === "proxy"
+    ? "Proxy mode sends ordinary requests to this provider and model."
+    : mode === "intercept"
+      ? "PASS and other normally routed requests use this provider and model."
+      : "PASS and explicit normal routes use this provider and model; Auto requests can use the integrated targets below.";
+  $("#local-destination-note").textContent = mode === "integrated"
+    ? "Integrated policy can select LOCAL when this destination is enabled."
+    : "Saved for integrated mode; this mode does not select LOCAL automatically.";
+}
+
+function renderLocalDestination() {
+  const targets = configData.integrated?.targets || {};
+  const entry = Object.entries(targets).find(([name]) => name.toUpperCase() === "LOCAL");
+  const target = entry?.[1];
+  const providers = Object.entries(configData.providers || {})
+    .filter(([, provider]) => provider.class === "local")
+    .sort(([a], [b]) => a.localeCompare(b));
+  const providerSelect = $("#local-provider");
+  providerSelect.replaceChildren(...providers.map(([name]) =>
+    el("option", { value: name, text: `${name} · ${configData.providers[name].kind || "provider"}` })
+  ));
+  if (target?.provider && providers.some(([name]) => name === target.provider)) {
+    providerSelect.value = target.provider;
+  }
+
+  const fillModels = (providerChanged = false) => {
+    const provider = configData.providers?.[providerSelect.value];
+    const models = provider?.models || [];
+    const selected = providerChanged ? models[0] || "" : target?.model || models[0] || "";
+    const options = [];
+    if (selected && !models.includes(selected)) {
+      options.push(el("option", { value: selected, text: `Configured · ${selected}` }));
+    }
+    options.push(...models.map((model) => el("option", { value: model, text: model })));
+    providerSelect.disabled = !providers.length;
+    $("#local-model").replaceChildren(...options);
+    $("#local-model").value = selected;
+    $("#local-model").disabled = !providers.length || !models.length && !selected;
+  };
+  providerSelect.onchange = () => fillModels(true);
+  fillModels();
+  $("#local-destination-enabled").checked = Boolean(target);
+  $("#local-destination-enabled").disabled = !providers.length && !target;
+}
+
 function renderInterceptorForm() {
   const interceptor = configData.interceptor;
   $("#routing-mode").value = configData.routing_mode;
+  renderModeDependentControls(configData.routing_mode);
+  const providerSelect = $("#proxy-provider");
+  providerOptions(providerSelect, configData.default_provider, false);
+  for (const option of providerSelect.options) {
+    const provider = configData.providers?.[option.value];
+    option.textContent = `${option.value} · ${provider?.kind || "provider"}`;
+  }
+  const modelSelect = $("#proxy-model");
+  const fillModelOptions = (providerChanged = false) => {
+    const models = configData.providers?.[providerSelect.value]?.models || [];
+    const selected = providerChanged ? "" : configData.default_model || "";
+    const options = [el("option", { value: "", text: "Auto · first model from /v1/models" })];
+    if (selected && !models.includes(selected)) {
+      options.push(el("option", { value: selected, text: `Configured · ${selected}` }));
+    }
+    options.push(...models.map((model) => el("option", { value: model, text: model })));
+    modelSelect.replaceChildren(...options);
+    modelSelect.value = selected;
+  };
+  providerSelect.onchange = () => fillModelOptions(true);
+  fillModelOptions();
+  renderLocalDestination();
   $("#int-reject-sensitive").checked = interceptor.reject_sensitive;
   providerOptions($("#int-provider"), interceptor.provider, false);
   $("#int-model").value = interceptor.model;
@@ -1319,11 +1449,19 @@ function renderIntegratedForm() {
   $("#integrated-capacity").value = integrated.sticky_capacity;
   const tbody = $("#integrated-targets tbody");
   tbody.replaceChildren();
-  for (const [name, target] of Object.entries(integrated.targets).sort(([a], [b]) => a.localeCompare(b))) {
+  for (const [name, target] of Object.entries(integrated.targets)
+    .filter(([name]) => name.toUpperCase() !== "LOCAL")
+    .sort(([a], [b]) => a.localeCompare(b))) {
     appendIntegratedTargetRow(name, target);
   }
   if (!tbody.children.length) {
-    tbody.append(el("tr", { class: "integrated-empty" }, [el("td", { colspan: "6", text: "no redirect targets configured" })]));
+    const hasLocalDestination = Object.keys(integrated.targets || {}).some((name) => name.toUpperCase() === "LOCAL");
+    tbody.append(el("tr", { class: "integrated-empty" }, [el("td", {
+      colspan: "6",
+      text: hasLocalDestination
+        ? "LOCAL destination is configured above; add other provider routes here."
+        : "no redirect targets configured",
+    })]));
   }
   providerOptions($("#integrated-add-provider"), "", false);
   const addEffort = $("#integrated-add-effort");
@@ -1346,7 +1484,7 @@ function collectIntegratedTargets() {
     const reasoningEffort = row.querySelector(".target-effort").value;
     const hint = row.querySelector(".target-hint").value.trim();
     const canonicalName = name.replaceAll("-", "_").toUpperCase();
-    if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || ["PASS", "REJECT", "ROUTE_DEFAULT"].includes(canonicalName)) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || ["PASS", "REJECT", "ROUTE_DEFAULT", "LOCAL"].includes(canonicalName)) {
       throw new Error(`${name || "target"}: use a non-reserved 1-64 character tool name containing letters, digits, _, or -`);
     }
     if (!provider || !model || !hint || hint.includes("\n")) throw new Error(`${name}: provider, model, and one-line hint are required`);
@@ -1354,6 +1492,9 @@ function collectIntegratedTargets() {
     canonicalNames.add(canonicalName);
     targets[name] = { provider, model, reasoning_effort: reasoningEffort || null, hint };
   }
+  const local = Object.entries(configData.integrated?.targets || {})
+    .find(([name]) => name.toUpperCase() === "LOCAL");
+  if (local) targets[local[0]] = local[1];
   return targets;
 }
 
@@ -1506,7 +1647,6 @@ function collectRoleMap() {
 }
 
 function renderSettingsForm() {
-  providerOptions($("#set-default-provider"), configData.default_provider, false);
   $("#set-log-retention").value = configData.max_logging_retention_days;
   $("#set-responses-mode").value = configData.responses.mode;
   $("#set-disable-thinking").checked = configData.chat.disable_thinking;
@@ -1606,6 +1746,12 @@ document.addEventListener("DOMContentLoaded", () => {
     } catch (error) {
       toast("Routing mode was not saved.", "error", error.message);
     }
+  });
+
+  $("#routing-mode").addEventListener("change", () => {
+    if (!configData) return;
+    const selectedMode = $("#routing-mode").value;
+    renderModeDependentControls(selectedMode, selectedMode !== configData.routing_mode);
   });
 
   $("#reset-stats").addEventListener("click", async () => {
@@ -1767,7 +1913,6 @@ document.addEventListener("DOMContentLoaded", () => {
     event.preventDefault();
     try {
       const result = await apiSend("/api/settings", "PUT", {
-        default_provider: $("#set-default-provider").value,
         max_logging_retention_days: Math.max(0, Math.trunc(Number($("#set-log-retention").value)) || 0),
         responses_mode: $("#set-responses-mode").value,
         disable_thinking: $("#set-disable-thinking").checked,
@@ -1779,6 +1924,54 @@ document.addEventListener("DOMContentLoaded", () => {
       refreshFromResult(result);
     } catch (error) {
       toast("Settings were not saved.", "error", error.message);
+    }
+  });
+
+  $("#proxy-destination-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      const result = await apiSend("/api/settings", "PUT", {
+        default_provider: $("#proxy-provider").value,
+        default_model: $("#proxy-model").value,
+      });
+      applyToast(result, "Default destination");
+      refreshFromResult(result);
+    } catch (error) {
+      toast("Default destination was not saved.", "error", error.message);
+    }
+  });
+
+  $("#local-destination-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const targets = { ...(configData.integrated?.targets || {}) };
+    const existingLocalName = Object.keys(targets).find((name) => name.toUpperCase() === "LOCAL");
+    for (const name of Object.keys(targets)) {
+      if (name.toUpperCase() === "LOCAL") delete targets[name];
+    }
+    if ($("#local-destination-enabled").checked) {
+      const provider = $("#local-provider").value;
+      const model = $("#local-model").value;
+      if (!provider || !model) {
+        toast("Choose a local provider and model before enabling LOCAL.", "error");
+        return;
+      }
+      targets[existingLocalName || "LOCAL"] = {
+        provider,
+        model,
+        reasoning_effort: null,
+        hint: "Use for requests that should stay on the local or private provider.",
+      };
+    }
+    try {
+      const result = await apiSend("/api/integrated", "PUT", {
+        sticky_ttl_secs: configData.integrated.sticky_ttl_secs,
+        sticky_capacity: configData.integrated.sticky_capacity,
+        targets,
+      });
+      applyToast(result, $("#local-destination-enabled").checked ? "LOCAL destination enabled" : "LOCAL destination disabled");
+      refreshFromResult(result);
+    } catch (error) {
+      toast("LOCAL destination was not saved.", "error", error.message);
     }
   });
 

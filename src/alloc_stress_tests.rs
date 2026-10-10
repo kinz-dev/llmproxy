@@ -186,6 +186,29 @@ fn estimate_tokens_budget_does_not_scale_with_body_size() {
 }
 
 #[test]
+fn fitting_output_budget_does_not_copy_the_request_tree() {
+    let provider = state_with_config(Config::default())
+        .default_provider()
+        .clone();
+    provider.model_cache.replace_upstream_models(
+        vec!["m".to_string()],
+        json!({"data":[{"id":"m","meta":{"n_ctx":32768}}]}),
+    );
+    for size in [8, 8000] {
+        let body = json!({"model":"m","messages":[{"role":"user","content":"hello ".repeat(size)}],"max_tokens":32768});
+        let count = allocations(&|| {
+            let fitted =
+                context_budget::FittedRequest::new(&body, provider.model_cache.model_limits("m"));
+            assert!(fitted.cap.is_some());
+            // Streaming serialization of the borrowed overlay also must not
+            // allocate nodes or materialize another copy of the prompt.
+            serde_json::to_writer(std::io::sink(), &fitted).unwrap();
+        });
+        assert_eq!(count, 0, "fitting allocations for body size {size}");
+    }
+}
+
+#[test]
 fn request_identity_path_has_a_small_allocation_budget() {
     // One call per request for the id and conversation header. These allocate
     // (the id is a fresh string when absent) but the count must stay constant:

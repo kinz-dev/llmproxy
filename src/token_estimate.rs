@@ -100,32 +100,26 @@ pub(crate) struct ClassifyWindow {
 }
 
 /// Scan the text form of a `Value` through the classification window without
-/// materializing the whole body: serialization writes into a fixed stack
-/// buffer and the writer reports overflow the moment the window is exceeded.
+/// materializing the whole body: serialization captures a fixed stack prefix
+/// while counting the full payload in the same pass.
 pub(crate) fn classify_window(value: &serde_json::Value) -> ClassifyWindow {
     let mut buf = [0_u8; CLASSIFY_WINDOW_BYTES];
     let mut writer = WindowWriter {
         buf: &mut buf,
         len: 0,
-        overflow: false,
+        total_chars: 0,
     };
-    // The writer reports overflow as an error to stop serialization early; a
-    // truncated preview is exactly as valid for classification as a full one.
-    // serde's `to_writer` writes fragments one by one; io::Write's default
-    // `write_all` would probe-allocate a 1 KiB scratch buffer, so this path
-    // serializes through the explicit writer (same result, zero allocation).
+    // Continue counting after the prefix fills. Returning an overflow error
+    // allocated both an IO error and a serde error on large prompts, then
+    // required a second serialization to count their tail.
     let _ = serde_json::to_writer(&mut writer, value);
-    let text = String::from_utf8_lossy(&writer.buf[..writer.len]);
-    let (structural, non_latin, latin_letters, newlines, indented, _) = scan_structural(&text);
+    let prefix = &writer.buf[..writer.len];
+    let text = std::str::from_utf8(prefix).unwrap_or_else(|error| {
+        // The bounded prefix may end inside a multi-byte character.
+        std::str::from_utf8(&prefix[..error.valid_up_to()]).expect("valid UTF-8 prefix")
+    });
+    let (structural, non_latin, latin_letters, newlines, indented, _) = scan_structural(text);
     let chars = text.chars().count() as u64;
-    let total_chars = if writer.overflow {
-        // The window missed the tail. Counting the whole payload streams
-        // through serde's Display with a counting formatter, so it too
-        // allocates nothing while staying proportional to the real body.
-        count_display_chars(value)
-    } else {
-        chars
-    };
     ClassifyWindow {
         kind: decide_kind(
             structural,
@@ -135,92 +129,24 @@ pub(crate) fn classify_window(value: &serde_json::Value) -> ClassifyWindow {
             indented,
             chars,
         ),
-        total_chars,
+        total_chars: writer.total_chars,
     }
-}
-
-/// Counts characters in a value's serialized form by streaming it through
-/// serde with a counting writer. No text is ever materialized and no internal
-/// buffer grows: every serialized chunk is counted and discarded, so the cost
-/// stays constant per chunk regardless of payload size.
-fn count_display_chars(value: &serde_json::Value) -> u64 {
-    struct CharCounter(u64);
-
-    impl CharCounter {
-        fn count(&mut self, data: &[u8]) {
-            // Serialized JSON is valid UTF-8; lossy decoding is a safety net
-            // for split multi-byte sequences at chunk boundaries, which the
-            // byte count still accounts for.
-            self.0 += String::from_utf8_lossy(data).chars().count() as u64;
-        }
-    }
-
-    impl std::io::Write for CharCounter {
-        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            self.count(data);
-            Ok(data.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    // Reuse one small stack buffer for the entire stream. serde's compact
-    // formatter writes fragments one at a time and io::Write's default
-    // `write_all` probe-allocates a 1 KiB scratch buffer the first time a
-    // caller relies on it, which is exactly the body-size scaling this path
-    // must not have. A fixed buffer turns the count into zero allocations.
-    struct Buffered<'a> {
-        counter: &'a mut CharCounter,
-        buf: &'a mut [u8; 256],
-    }
-
-    impl std::io::Write for Buffered<'_> {
-        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            if data.len() <= self.buf.len() {
-                self.buf[..data.len()].copy_from_slice(data);
-                self.counter.count(data);
-            } else {
-                // No ordinary JSON fragment reaches this size; counting
-                // directly keeps the result correct without buffering.
-                self.counter.count(data);
-            }
-            Ok(data.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut counter = CharCounter(0);
-    let mut scratch = [0_u8; 256];
-    let mut writer = Buffered {
-        counter: &mut counter,
-        buf: &mut scratch,
-    };
-    let _ = serde_json::to_writer(&mut writer, value);
-    counter.0
 }
 
 struct WindowWriter<'a> {
     buf: &'a mut [u8; CLASSIFY_WINDOW_BYTES],
     len: usize,
-    overflow: bool,
+    total_chars: u64,
 }
 
 impl std::io::Write for WindowWriter<'_> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        if data.len() > self.buf.len() - self.len {
-            self.overflow = true;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "classification window reached",
-            ));
-        }
-        self.buf[self.len..self.len + data.len()].copy_from_slice(data);
-        self.len += data.len();
+        // UTF-8 characters have exactly one non-continuation byte. This also
+        // counts correctly if a serializer splits a character across writes.
+        self.total_chars += data.iter().filter(|byte| **byte & 0xc0 != 0x80).count() as u64;
+        let copy = data.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + copy].copy_from_slice(&data[..copy]);
+        self.len += copy;
         Ok(data.len())
     }
 

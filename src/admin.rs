@@ -491,6 +491,7 @@ async fn api_overview(State(state): State<AdminState>) -> Response {
         "config_persistable": context.config_path.is_some(),
         "launcher": context.launcher,
         "default_provider": config.default_provider,
+        "default_model": config.default_model,
         "routing_mode": config.routing_mode.as_str(),
         "providers": snapshot.providers.len(),
         "model_routing": match config.model_routing {
@@ -561,10 +562,15 @@ async fn api_models(State(state): State<AdminState>) -> Response {
         })
         .collect::<Vec<_>>();
 
-    let default_auto_model = snapshot
+    let discovered_default_model = snapshot
         .providers
         .get(&config.default_provider)
         .and_then(|provider| provider.model_cache.first_upstream_model());
+    let default_auto_model = config
+        .default_model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+        .or(discovered_default_model.as_deref());
 
     Json(json!({
         "providers": providers,
@@ -747,6 +753,7 @@ async fn api_launch(State(state): State<AdminState>) -> Response {
     Json(json!({
         "proxy_addr": proxy_addr,
         "default_provider": config.default_provider,
+        "default_model": config.default_model,
         "routing_mode": config.routing_mode.as_str(),
         "config_path": context.config_path.as_ref().map(|path| path.display().to_string()),
         "interceptor_enabled": config.interceptor.enabled,
@@ -905,6 +912,9 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
                         .providers
                         .get(name)
                         .map_or(0, |provider| provider.breaker_failures()),
+                    "models": snapshot.providers.get(name).map(|provider| {
+                        provider.model_cache.cached_ids().0
+                    }).unwrap_or_default(),
                 }),
             )
         })
@@ -965,6 +975,7 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
         "listen_addr": config.listen_addr,
         "max_logging_retention_days": config.max_logging_retention_days,
         "default_provider": config.default_provider,
+        "default_model": config.default_model,
         "routing_mode": config.routing_mode.as_str(),
         "providers": providers,
         "model_aliases": aliases,
@@ -1648,6 +1659,7 @@ async fn api_provider_delete(
 #[derive(Clone, Deserialize)]
 struct SettingsPutBody {
     default_provider: Option<String>,
+    default_model: Option<String>,
     max_logging_retention_days: Option<u64>,
     disable_thinking: Option<bool>,
     responses_mode: Option<String>,
@@ -1689,6 +1701,10 @@ async fn api_settings_put(
             if let Some(default_provider) = body.default_provider {
                 config.default_provider = default_provider.trim().to_string();
             }
+            if let Some(default_model) = body.default_model {
+                let model = default_model.trim().to_string();
+                config.default_model = (!model.is_empty()).then_some(model);
+            }
             if let Some(days) = body.max_logging_retention_days {
                 config.max_logging_retention_days = days;
             }
@@ -1715,6 +1731,14 @@ async fn api_settings_put(
         Persist::Edit(Box::new(move |doc| {
             if let Some(default_provider) = doc_body.default_provider {
                 doc.insert("default_provider", value(default_provider.trim()));
+            }
+            if let Some(default_model) = doc_body.default_model {
+                let model = default_model.trim();
+                if model.is_empty() {
+                    doc.remove("default_model");
+                } else {
+                    doc.insert("default_model", value(model));
+                }
             }
             if let Some(days) = doc_body.max_logging_retention_days {
                 doc.insert("max_logging_retention_days", value(days as i64));

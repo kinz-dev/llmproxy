@@ -1,5 +1,87 @@
 use super::*;
 
+#[tokio::test]
+async fn context_fitting_uses_model_catalog_updates_on_every_generation_wire() {
+    let app = Router::new().fallback(post(|Json(body): Json<Value>| async move { Json(body) }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let provider = provider_for(format!("http://{address}/v1"));
+    let update = |context| {
+        cache_upstream_models(
+            &provider,
+            json!({"data":[
+                {"id":"test","meta":{"n_ctx":context}},
+                {"id":"other","context_window":65536}
+            ]}),
+            "test",
+        );
+    };
+    update(32768);
+    let headers = HeaderMap::new();
+    for (path, field) in [
+        ("chat/completions", "max_tokens"),
+        ("chat/completions", "max_completion_tokens"),
+        ("responses", "max_output_tokens"),
+        ("messages", "max_tokens"),
+        ("v1/messages", "max_tokens"),
+    ] {
+        for streaming in [false, true] {
+            let body = json!({"model":"test",field:30000,"messages":[{"role":"user","content":"hello world ".repeat(2000)}],"stream":streaming});
+            let meta = UpstreamRequestMeta::new(
+                &provider.name,
+                &headers,
+                Method::POST,
+                path,
+                if streaming {
+                    UpstreamResponseKind::Stream
+                } else {
+                    UpstreamResponseKind::Json
+                },
+                false,
+            );
+            let response = send_upstream_once(&provider, &headers, &meta, Some(&body))
+                .await
+                .unwrap();
+            let wire: Value = response.json().await.unwrap();
+            assert!(wire[field].as_u64().unwrap() < 30000);
+            assert_eq!(wire["messages"], body["messages"]);
+            assert_eq!(wire["stream"], streaming);
+            update(16384);
+            let response = send_upstream_once(&provider, &headers, &meta, Some(&body))
+                .await
+                .unwrap();
+            let smaller: Value = response.json().await.unwrap();
+            assert!(smaller[field].as_u64().unwrap() < wire[field].as_u64().unwrap());
+            update(32768);
+        }
+    }
+    // A model with more context must not inherit the previous model's cap;
+    // control requests do not acquire generation policy.
+    for (model, path) in [
+        ("other", "chat/completions"),
+        ("unknown", "chat/completions"),
+        ("test", "responses/compact"),
+    ] {
+        let body = json!({"model":model,"max_tokens":30000,"messages":[]});
+        let meta = UpstreamRequestMeta::new(
+            &provider.name,
+            &headers,
+            Method::POST,
+            path,
+            UpstreamResponseKind::Json,
+            false,
+        );
+        let response = send_upstream_once(&provider, &headers, &meta, Some(&body))
+            .await
+            .unwrap();
+        assert_eq!(response.json::<Value>().await.unwrap(), body);
+    }
+    server.abort();
+}
+
 #[test]
 fn sensitive_screening_errors_do_not_retain_upstream_body_details() {
     let meta = UpstreamRequestMeta::new(

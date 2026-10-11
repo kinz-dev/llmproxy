@@ -1451,6 +1451,8 @@ details.provider-editor .field-row { margin-top: 10px; }
   border-color: var(--local);
   background: repeating-linear-gradient(135deg, var(--local-dim) 0 3px, transparent 3px 6px);
 }
+.slot-wait { border-style: dashed; }
+.slot-wait.busy { background: var(--muted); border: 1px solid var(--muted); }
 .slot-sep { width: 1px; height: 18px; background: var(--line-strong); margin: 0 4px; }
 
 .sharing-stats { margin-top: 14px; }

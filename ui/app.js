@@ -1836,6 +1836,10 @@ function renderSlotGauges(sharing) {
       lent ? "peer slot used by this node" : busy ? "peer job" : "peer slot",
     ]);
   }
+  if (cells.length && slots.queue_depth) cells.push(["slot-sep", ""]);
+  for (let i = 0; i < cap(slots.queue_depth); i += 1) {
+    cells.push(["slot slot-wait" + (i < slots.queued ? " busy" : ""), i < slots.queued ? "waiting" : "wait place"]);
+  }
   const parts = [];
   if (slots.local_total) parts.push(`this node ${slots.local_busy}/${slots.local_total}`);
   if (slots.incoming_total) parts.push(`peer jobs ${slots.incoming_busy}/${slots.incoming_total}`);

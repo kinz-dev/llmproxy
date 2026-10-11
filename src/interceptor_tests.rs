@@ -3,10 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use axum::http::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
-use super::{
-    IntegratedConfig, IntegratedTarget, classify_completion_details,
-    classify_completion_with_targets, enforce_router_only,
-};
+use super::{IntegratedConfig, IntegratedTarget, classify_completion_details, enforce_router_only};
 use crate::Config;
 use crate::INTEGRATED_AUTO_MODEL;
 use crate::interceptor::CompletionDecision;
@@ -14,8 +11,6 @@ use crate::interceptor::InterceptionPolicy;
 use crate::interceptor::InterceptorConfig;
 use crate::interceptor::InterceptorProtocol;
 use crate::interceptor::build_local_request;
-use crate::interceptor::classify_completion;
-use crate::interceptor::is_pass_tool;
 use crate::text_from_value;
 
 #[test]
@@ -780,4 +775,19 @@ fn integrated_target_names_are_generic_tool_names() {
             .is_err()
         );
     }
+}
+
+fn is_pass_tool(tool: &Value) -> bool {
+    super::tool_name(tool) == Some(super::PASS_TOOL_NAME)
+}
+
+fn classify_completion(completion: &Value) -> CompletionDecision {
+    classify_completion_with_targets(completion, &BTreeMap::new())
+}
+
+fn classify_completion_with_targets(
+    completion: &Value,
+    targets: &BTreeMap<String, super::IntegratedTarget>,
+) -> CompletionDecision {
+    super::classify_completion_details(completion, targets, false).decision
 }

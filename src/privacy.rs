@@ -28,9 +28,6 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use reqwest::Method;
 use serde::Deserialize;
-#[cfg(test)]
-pub(crate) use serde_json::Value;
-#[cfg(not(test))]
 use serde_json::Value;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
@@ -208,23 +205,6 @@ impl PrivacyDecision {
     /// result from another revision is never honored.
     pub(crate) fn produced_under(&self, fingerprint: u64) -> bool {
         self.policy_fingerprint == fingerprint
-    }
-
-    /// Carries a sticky restriction forward into a later screening pass. The
-    /// current classification can never weaken an already-private session: the
-    /// more sensitive of the two wins, so a compacted turn that no longer
-    /// contains the triggering text still cannot reopen a public destination.
-    #[cfg(test)]
-    pub(crate) fn merge_sticky(&mut self, sticky: &PrivacyDecision) {
-        if sensitivity_rank(sticky.classification) > sensitivity_rank(self.classification) {
-            self.classification = sticky.classification;
-            self.source_label = sticky.source_label;
-            for category in &sticky.categories {
-                if !self.categories.contains(category) {
-                    self.categories.push(*category);
-                }
-            }
-        }
     }
 }
 
@@ -446,12 +426,6 @@ impl HopPrivacy {
         &self.decision
     }
 
-    /// The canonical form this hop was screened from.
-    #[allow(dead_code)]
-    pub(crate) fn canonical_json(&self) -> &str {
-        &self.canonical_json
-    }
-
     /// A hop may make the content more sensitive, never less.
     fn tighten(&mut self, decision: PrivacyDecision) {
         if sensitivity_rank(decision.classification)
@@ -463,11 +437,6 @@ impl HopPrivacy {
                 ..decision
             };
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn decision_mut(&mut self) -> &mut PrivacyDecision {
-        &mut self.decision
     }
 }
 
@@ -1917,16 +1886,6 @@ impl SensitiveSessions {
         );
         order.push_back(key);
     }
-
-    #[cfg(test)]
-    fn clear(&self) {
-        let mut guard = self
-            .entries
-            .lock()
-            .expect("sensitive session store poisoned");
-        guard.0.clear();
-        guard.1.clear();
-    }
 }
 
 fn sensitive_sessions() -> &'static SensitiveSessions {
@@ -2023,27 +1982,6 @@ pub(crate) fn sticky_decision(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn clear_sensitive_sessions() {
-    sensitive_sessions().clear();
-}
-
-/// Records a classification in the exact-content cache under the same keys the
-/// screening and dispatch paths use (`provider_payload_text` of the canonical
-/// chat form). This mirrors what a completed classifier pass stores, so a test
-/// can drive the verified-clear public dispatch path without a live model.
-#[cfg(test)]
-pub(crate) fn prime_verified_clear(
-    body: &Value,
-    fingerprint: u64,
-    classification: Classification,
-    categories: Vec<SensitiveCategory>,
-) {
-    let canonical = canonical_chat_request(body);
-    let digest = content_digest(&provider_payload_text(&canonical));
-    cache_classification(digest, fingerprint, classification, categories);
-}
-
 /// A cached classifier result: (content digest, policy fingerprint) to the
 /// classification and its safe categories.
 type ClassificationKey = (u64, u64);
@@ -2108,13 +2046,6 @@ impl ClassificationCache {
         );
         order.push_back(key);
     }
-
-    #[cfg(test)]
-    fn clear(&self) {
-        let mut guard = self.entries.lock().expect("classification cache poisoned");
-        guard.0.clear();
-        guard.1.clear();
-    }
 }
 
 fn classification_cache() -> &'static ClassificationCache {
@@ -2136,18 +2067,6 @@ fn cache_classification(
     categories: Vec<SensitiveCategory>,
 ) {
     classification_cache().insert((digest, fingerprint), classification, categories);
-}
-
-/// Revokes every cached classification and sticky private session. A policy
-/// change must never leave a queued or later request relying on an
-/// authorization that the new policy would not have granted. The boundary keys
-/// every cache by the policy fingerprint, so a live policy swap already
-/// invalidates prior authorizations without an explicit call; this reset exists
-/// for tests that reuse the process-global caches across cases.
-#[cfg(test)]
-pub(crate) fn revoke_cached_state() {
-    classification_cache().clear();
-    sensitive_sessions().clear();
 }
 
 // ---------------------------------------------------------------------------

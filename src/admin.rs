@@ -41,6 +41,11 @@ use crate::{
     validate_config,
 };
 
+#[path = "admin_models.rs"]
+mod model_sync;
+#[path = "admin_sharing.rs"]
+mod sharing_api;
+
 /// Effective bind address: missing config means loopback on a random port.
 pub(crate) fn listen_address(admin: &AdminConfig) -> String {
     admin
@@ -120,7 +125,9 @@ pub(crate) async fn spawn(
     }
     info!(admin_url = %format!("http://{bound}/"), "admin interface listening");
 
-    let app = router(AdminState { shared, context });
+    let state = AdminState { shared, context };
+    model_sync::spawn(state.clone());
+    let app = router(state);
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             error!(error = %error, "admin interface server exited");
@@ -162,7 +169,21 @@ fn router(state: AdminState) -> Router {
             "/api/providers/{name}",
             put(api_provider_put).delete(api_provider_delete),
         )
+        .route("/api/providers/detect", get(api_providers_detect))
         .route("/api/settings", put(api_settings_put))
+        .route(
+            "/api/sharing",
+            get(sharing_api::get_sharing).put(sharing_api::put_sharing),
+        )
+        .route("/api/sharing/key", post(sharing_api::post_key))
+        .route("/api/sharing/peers", post(sharing_api::post_peer))
+        .route("/api/cloud-overflow", put(sharing_api::put_cloud_overflow))
+        .route(
+            "/api/peers/{name}",
+            put(sharing_api::put_peer).delete(sharing_api::delete_peer),
+        )
+        .route("/api/listen-guard", put(sharing_api::put_listen_guard))
+        .route("/api/pricing", put(sharing_api::put_pricing))
         .fallback(get(ui_asset))
         .with_state(state.clone())
         .route_layer(middleware::from_fn_with_state(state, require_local_origin))
@@ -589,8 +610,13 @@ fn class_str(base_url: &str) -> &'static str {
     }
 }
 
-async fn api_stats() -> Response {
-    Json(proxy_stats().snapshot_json()).into_response()
+async fn api_stats(State(state): State<AdminState>) -> Response {
+    let mut stats = proxy_stats().snapshot_json();
+    let snapshot = state.shared.snapshot();
+    if let (Some(object), Some(sharing)) = (stats.as_object_mut(), snapshot.sharing.as_ref()) {
+        object.insert("sharing".to_string(), sharing.admin_json(&snapshot));
+    }
+    Json(stats).into_response()
 }
 
 async fn api_stats_reset() -> Response {
@@ -872,7 +898,7 @@ async fn api_restart(State(state): State<AdminState>, Json(_body): Json<Value>) 
 
 fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
     let config = &snapshot.config;
-    let provider_configs = effective_provider_configs(config).unwrap_or_default();
+    let provider_configs = crate::configured_provider_configs(config).unwrap_or_default();
     let mut provider_names = provider_configs.keys().cloned().collect::<Vec<_>>();
     provider_names.sort();
     let providers = provider_names
@@ -885,6 +911,7 @@ fn config_view(snapshot: &AppState, context: &AdminContext) -> Value {
             (
                 name.clone(),
                 json!({
+                    "enabled": upstream.enabled,
                     "kind": upstream.kind.as_str(),
                     "base_url": upstream.base_url,
                     "auth": upstream.auth.as_str(),
@@ -1089,12 +1116,19 @@ async fn apply_config_change(
     // transport gate would stay disarmed on a rebuilt provider until a restart:
     // a runtime privacy toggle would not take effect for dispatch verification
     // while routing already honored the new policy.
+    let config = Arc::new(config);
+    if let Some(sharing) = current.sharing.as_ref()
+        && let Err(error) = sharing.reconfigure(config.clone())
+    {
+        return api_error(StatusCode::BAD_REQUEST, format!("{error:#}"));
+    }
     let new_state = attach_privacy_boundary(AppState {
         forward_caller_credentials: config.routing_mode != RoutingMode::Integrated,
-        config: Arc::new(config),
+        config: config.clone(),
         providers: Arc::new(providers),
         launcher_kind: None,
         launcher_mode: None,
+        sharing: current.sharing.clone(),
     });
     state.shared.replace(new_state.clone());
     if let Some(addr) = state.context.proxy_addr.get()
@@ -1145,8 +1179,11 @@ fn persist_change(state: &AdminState, persist: Persist) -> (bool, Option<String>
             let text = fs::read_to_string(path).unwrap_or_default();
             match DocumentMut::from_str(&text) {
                 Err(error) => Err(format!("config file is not editable TOML: {error}")),
-                Ok(mut doc) => edit(&mut doc)
-                    .and_then(|()| fs::write(path, doc.to_string()).map_err(|e| e.to_string())),
+                Ok(mut doc) => {
+                    sharing_api::migrate_legacy_doc(&mut doc);
+                    edit(&mut doc)
+                        .and_then(|()| fs::write(path, doc.to_string()).map_err(|e| e.to_string()))
+                }
             }
         }
     };
@@ -1458,6 +1495,7 @@ async fn api_integrated_put(
 
 #[derive(Clone, Deserialize)]
 struct ProviderPutBody {
+    enabled: Option<bool>,
     kind: Option<crate::ProviderKind>,
     base_url: Option<String>,
     /// Borrowed-OAuth mode: "none", "codex-oauth", or "claude-oauth".
@@ -1472,10 +1510,17 @@ struct ProviderPutBody {
     connect_timeout_secs: Option<u64>,
     pool_max_idle_per_host: Option<usize>,
     pool_idle_timeout_secs: Option<u64>,
+    /// Replaces the ordered failover list; empty clears it.
+    fallback: Option<Vec<String>>,
+    circuit_breaker_threshold: Option<u32>,
+    circuit_breaker_cooldown_secs: Option<u64>,
 }
 
 impl ProviderPutBody {
     fn apply(&self, upstream: &mut crate::UpstreamConfig) -> Result<(), String> {
+        if let Some(enabled) = self.enabled {
+            upstream.enabled = enabled;
+        }
         if let Some(kind) = self.kind {
             upstream.kind = kind;
         }
@@ -1514,10 +1559,32 @@ impl ProviderPutBody {
         if let Some(pool_idle_timeout_secs) = self.pool_idle_timeout_secs {
             upstream.pool_idle_timeout_secs = pool_idle_timeout_secs;
         }
+        if let Some(fallback) = &self.fallback {
+            upstream.fallback = fallback
+                .iter()
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect();
+        }
+        if let Some(threshold) = self.circuit_breaker_threshold {
+            upstream.circuit_breaker_threshold = threshold;
+        }
+        if let Some(cooldown) = self.circuit_breaker_cooldown_secs {
+            upstream.circuit_breaker_cooldown_secs = cooldown;
+        }
         Ok(())
     }
 
     fn apply_to_doc(&self, table: &mut Table) {
+        match self.enabled {
+            Some(false) => {
+                table.insert("enabled", value(false));
+            }
+            Some(true) => {
+                table.remove("enabled");
+            }
+            None => {}
+        }
         if let Some(kind) = self.kind {
             table.insert("kind", value(kind.as_str()));
         }
@@ -1576,6 +1643,24 @@ impl ProviderPutBody {
                 value(pool_idle_timeout_secs as i64),
             );
         }
+        if let Some(fallback) = &self.fallback {
+            let entries = fallback
+                .iter()
+                .map(|entry| entry.trim())
+                .filter(|entry| !entry.is_empty())
+                .collect::<toml_edit::Array>();
+            if entries.is_empty() {
+                table.remove("fallback");
+            } else {
+                table.insert("fallback", value(entries));
+            }
+        }
+        if let Some(threshold) = self.circuit_breaker_threshold {
+            table.insert("circuit_breaker_threshold", value(i64::from(threshold)));
+        }
+        if let Some(cooldown) = self.circuit_breaker_cooldown_secs {
+            table.insert("circuit_breaker_cooldown_secs", value(cooldown as i64));
+        }
     }
 }
 
@@ -1631,29 +1716,330 @@ async fn api_provider_put(
     .await
 }
 
+/// Local agent logins and API-key variables this process can see. Reports
+/// presence only, never a value, and changes nothing: a detected provider is
+/// added only when the operator adds it.
+async fn api_providers_detect(State(state): State<AdminState>) -> Response {
+    let snapshot = state.shared.snapshot();
+    let config = &snapshot.config;
+    let configured: Vec<(&str, &crate::UpstreamConfig)> =
+        std::iter::once((config.default_provider.as_str(), &config.upstream))
+            .chain(
+                config
+                    .providers
+                    .iter()
+                    .map(|(name, up)| (name.as_str(), up)),
+            )
+            .collect();
+    let file = |path: Result<PathBuf>| path.ok().filter(|path| path.is_file());
+    let env_set = |name: &str| env::var_os(name).is_some_and(|value| !value.is_empty());
+    let mut found = Vec::new();
+    let mut push = |name: &str,
+                    source: String,
+                    kind: &str,
+                    base_url: &str,
+                    auth: crate::ProviderAuth,
+                    key_env: Option<&str>| {
+        let existing = configured.iter().find(|(_, up)| match key_env {
+            Some(var) => up.auth == auth && up.api_key_env.as_deref() == Some(var),
+            None => up.auth == auth,
+        });
+        let mut suggested = existing.map_or(name, |(taken, _)| taken).to_string();
+        while existing.is_none() && configured.iter().any(|(taken, _)| *taken == suggested) {
+            suggested.push_str("-2");
+        }
+        found.push(json!({
+            "source": source,
+            "name": suggested,
+            "kind": kind,
+            "base_url": base_url,
+            "auth": auth.as_str(),
+            "api_key_env": key_env,
+            "configured_as": existing.map(|(name, _)| *name),
+        }));
+    };
+    if let Some(path) = file(crate::oauth::codex_auth_path()) {
+        push(
+            "codex",
+            format!("Codex CLI login ({})", path.display()),
+            "openai",
+            "https://chatgpt.com/backend-api/codex",
+            crate::ProviderAuth::CodexOauth,
+            None,
+        );
+    }
+    if let Some(path) = file(crate::oauth::claude_credentials_path()) {
+        push(
+            "claude",
+            format!("Claude Code login ({})", path.display()),
+            "anthropic",
+            "https://api.anthropic.com/v1",
+            crate::ProviderAuth::ClaudeOauth,
+            None,
+        );
+    }
+    if env_set("OPENAI_API_KEY") {
+        push(
+            "openai",
+            "OPENAI_API_KEY environment variable".into(),
+            "openai",
+            "https://api.openai.com/v1",
+            crate::ProviderAuth::None,
+            Some("OPENAI_API_KEY"),
+        );
+    }
+    if env_set("ANTHROPIC_API_KEY") {
+        push(
+            "anthropic",
+            "ANTHROPIC_API_KEY environment variable".into(),
+            "anthropic",
+            "https://api.anthropic.com/v1",
+            crate::ProviderAuth::None,
+            Some("ANTHROPIC_API_KEY"),
+        );
+    }
+    Json(json!({ "found": found })).into_response()
+}
+
+fn names_provider(reference: &str, provider: &str) -> bool {
+    reference == provider
+        || reference
+            .split_once('/')
+            .is_some_and(|(prefix, _)| prefix == provider)
+}
+
+/// Removes every config reference to `provider`. Returns what was removed.
+fn purge_provider(config: &mut Config, provider: &str) -> Result<Vec<String>, String> {
+    if config.default_provider == provider {
+        return Err(format!(
+            "{provider:?} is the default provider; choose another default first"
+        ));
+    }
+    if config.interceptor.provider == provider && config.routing_mode != RoutingMode::Proxy {
+        return Err(format!(
+            "{provider:?} is the triage provider; choose another triage provider first"
+        ));
+    }
+    if config.providers.remove(provider).is_none() {
+        return Err(format!("unknown provider {provider:?}"));
+    }
+    let mut removed = Vec::new();
+    if config.interceptor.provider == provider {
+        config.interceptor.provider.clear();
+        removed.push("triage provider".to_string());
+    }
+    config.model_aliases.retain(|alias, target| {
+        let keep = !matches!(target, crate::ModelAlias::Route { provider: p, .. } if p == provider);
+        if !keep {
+            removed.push(format!("alias {alias}"));
+        }
+        keep
+    });
+    let mut dropped_targets = Vec::new();
+    config.integrated.targets.retain(|name, target| {
+        let keep = target.provider != provider;
+        if !keep {
+            dropped_targets.push(name.clone());
+            removed.push(format!("route {name}"));
+        }
+        keep
+    });
+    config.routing_rules.retain(|rule| {
+        let keep = !names_provider(&rule.route, provider) && !dropped_targets.contains(&rule.route);
+        if !keep {
+            removed.push(format!("rule {}", rule.name));
+        }
+        keep
+    });
+    for (name, upstream) in std::iter::once((config.default_provider.clone(), &mut config.upstream))
+        .chain(
+            config
+                .providers
+                .iter_mut()
+                .map(|(name, up)| (name.clone(), up)),
+        )
+    {
+        let before = upstream.fallback.len();
+        upstream
+            .fallback
+            .retain(|entry| !names_provider(entry, provider));
+        if upstream.fallback.len() != before {
+            removed.push(format!("fallback in {name}"));
+        }
+    }
+    if config
+        .sharing
+        .cloud_overflow
+        .as_deref()
+        .is_some_and(|route| names_provider(route, provider))
+    {
+        config.sharing.cloud_overflow = None;
+        removed.push("cloud overflow".to_string());
+    }
+    if config.sharing.onprem_provider == provider {
+        config.sharing.onprem_provider = config.default_provider.clone();
+        removed.push("sharing on-prem provider".to_string());
+    }
+    let prefix = format!("{provider}/");
+    let before = config.pricing.models.len();
+    config
+        .pricing
+        .models
+        .retain(|key, _| !key.starts_with(&prefix));
+    if config.pricing.models.len() != before {
+        removed.push("prices".to_string());
+    }
+    if config
+        .pricing
+        .baseline_model
+        .as_deref()
+        .is_some_and(|model| model.starts_with(&prefix))
+    {
+        config.pricing.baseline_model = None;
+    }
+    Ok(removed)
+}
+
+/// File-side mirror of `purge_provider`, so the saved config matches.
+fn purge_provider_doc(doc: &mut DocumentMut, provider: &str, default_provider: &str) {
+    let prefix = format!("{provider}/");
+    let item_names = |item: &Item, key: &str| {
+        item.get(key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == provider)
+    };
+    if let Some(providers) = doc.get_mut("providers").and_then(Item::as_table_like_mut) {
+        providers.remove(provider);
+        for (_, upstream) in providers.iter_mut() {
+            if let Some(fallback) = upstream.get_mut("fallback").and_then(Item::as_array_mut) {
+                fallback
+                    .retain(|entry| !entry.as_str().is_some_and(|e| names_provider(e, provider)));
+            }
+        }
+    }
+    if let Some(fallback) = doc
+        .get_mut("upstream")
+        .and_then(|up| up.get_mut("fallback"))
+        .and_then(Item::as_array_mut)
+    {
+        fallback.retain(|entry| !entry.as_str().is_some_and(|e| names_provider(e, provider)));
+    }
+    if let Some(interceptor) = doc.get_mut("interceptor").and_then(Item::as_table_like_mut)
+        && interceptor.get("provider").and_then(Item::as_str) == Some(provider)
+    {
+        interceptor.remove("provider");
+    }
+    if let Some(aliases) = doc
+        .get_mut("model_aliases")
+        .and_then(Item::as_table_like_mut)
+    {
+        let doomed: Vec<String> = aliases
+            .iter()
+            .filter(|(_, item)| item_names(item, "provider"))
+            .map(|(key, _)| key.to_string())
+            .collect();
+        for key in doomed {
+            aliases.remove(&key);
+        }
+    }
+    let mut dropped_targets = Vec::new();
+    if let Some(targets) = doc
+        .get_mut("integrated")
+        .and_then(|integrated| integrated.get_mut("targets"))
+        .and_then(Item::as_table_like_mut)
+    {
+        dropped_targets = targets
+            .iter()
+            .filter(|(_, item)| item_names(item, "provider"))
+            .map(|(key, _)| key.to_string())
+            .collect();
+        for key in &dropped_targets {
+            targets.remove(key);
+        }
+    }
+    if let Some(rules) = doc
+        .get_mut("routing_rules")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        rules.retain(|rule| {
+            rule.get("route")
+                .and_then(Item::as_str)
+                .is_none_or(|route| {
+                    !names_provider(route, provider) && !dropped_targets.iter().any(|t| t == route)
+                })
+        });
+    }
+    if let Some(sharing) = doc.get_mut("sharing").and_then(Item::as_table_like_mut) {
+        if sharing
+            .get("cloud_overflow")
+            .and_then(Item::as_str)
+            .is_some_and(|route| names_provider(route, provider))
+        {
+            sharing.remove("cloud_overflow");
+        }
+        if sharing.get("onprem_provider").and_then(Item::as_str) == Some(provider) {
+            sharing.insert("onprem_provider", value(default_provider));
+        }
+    }
+    if let Some(pricing) = doc.get_mut("pricing").and_then(Item::as_table_like_mut) {
+        if pricing
+            .get("baseline_model")
+            .and_then(Item::as_str)
+            .is_some_and(|model| model.starts_with(&prefix))
+        {
+            pricing.remove("baseline_model");
+        }
+        if let Some(models) = pricing.get_mut("models").and_then(Item::as_table_like_mut) {
+            let doomed: Vec<String> = models
+                .iter()
+                .map(|(key, _)| key.to_string())
+                .filter(|key| key.starts_with(&prefix))
+                .collect();
+            for key in doomed {
+                models.remove(&key);
+            }
+        }
+    }
+}
+
 async fn api_provider_delete(
     State(state): State<AdminState>,
     AxumPath(name): AxumPath<String>,
 ) -> Response {
+    let mut preview = (*state.shared.snapshot().config).clone();
+    let removed = match purge_provider(&mut preview, &name) {
+        Ok(removed) => removed,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
+    };
+    let default_provider = preview.default_provider.clone();
     let mutate_name = name.clone();
-    apply_config_change(
+    let response = apply_config_change(
         &state,
-        move |config| {
-            if config.providers.remove(&mutate_name).is_none() {
-                return Err(format!(
-                    "unknown provider {mutate_name:?} (the [upstream] default cannot be deleted)"
-                ));
-            }
-            Ok(())
-        },
+        move |config| purge_provider(config, &mutate_name).map(|_| ()),
         Persist::Edit(Box::new(move |doc| {
-            if let Some(providers) = doc.get_mut("providers").and_then(Item::as_table_mut) {
-                providers.remove(&name);
-            }
+            purge_provider_doc(doc, &name, &default_provider);
             Ok(())
         })),
     )
-    .await
+    .await;
+    if removed.is_empty() {
+        return response;
+    }
+    with_field(response, "removed", json!(removed)).await
+}
+
+/// Adds `key` to a successful JSON response.
+async fn with_field(response: Response, key: &str, field: Value) -> Response {
+    if !response.status().is_success() {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "response lost");
+    };
+    let mut json: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+    json[key] = field;
+    (parts.status, Json(json)).into_response()
 }
 
 #[derive(Clone, Deserialize)]

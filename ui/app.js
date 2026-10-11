@@ -96,26 +96,23 @@ function fmtUptime(secs) {
 
 /* Navigation */
 
-const PRIMARY_VIEWS = ["overview", "activity", "routing", "models", "providers", "settings"];
+const PRIMARY_VIEWS = ["providers", "destination", "triage", "agents", "overview", "activity", "sharing", "cost", "settings"];
 
 function currentRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   let primary = parts[0] || "overview";
   let secondary = parts[1] || "";
-
-  // Preserve bookmarks from the previous four-tab layout.
-  if (primary === "monitor") primary = "overview";
-  if (primary === "configure") {
-    primary = "routing";
-    secondary = "triage";
-  }
-  if (primary === "prompt") {
-    primary = "routing";
-    secondary = "policy";
-  }
+  const legacy = {
+    monitor: "overview",
+    cluster: "sharing",
+    models: "providers",
+    configure: "triage",
+    prompt: "triage",
+    routing: secondary === "policy" ? "triage" : "destination",
+  };
+  primary = legacy[primary] || primary;
   if (!PRIMARY_VIEWS.includes(primary)) primary = "overview";
   if (primary === "activity" && !["usage", "decisions", "logs"].includes(secondary)) secondary = "usage";
-  if (primary === "routing" && !["triage", "policy"].includes(secondary)) secondary = "triage";
   return { primary, secondary };
 }
 
@@ -136,16 +133,11 @@ function renderTab() {
     else $(`#tab-${name}`).removeAttribute("aria-current");
   }
   renderSubview("activity", primary === "activity" ? secondary : "usage", ["usage", "decisions", "logs"]);
-  renderSubview("routing", primary === "routing" ? secondary : "triage", ["triage", "policy"]);
   document.title = `llmproxy · ${primary}`;
-
-  if (primary === "models") {
-    loadModelsTab();
-    loadConfigEditors();
-  } else if (["routing", "providers", "settings"].includes(primary)) {
-    loadConfigEditors();
-  }
-  if (primary === "routing" && secondary === "policy") loadPromptTab();
+  if (["providers", "destination", "cost"].includes(primary)) loadModelsTab();
+  if (["providers", "destination", "triage", "cost", "settings"].includes(primary)) loadConfigEditors();
+  if (["destination", "sharing", "settings"].includes(primary)) loadSharingTab();
+  if (primary === "triage") loadPromptTab();
 }
 
 window.addEventListener("hashchange", () => {
@@ -211,6 +203,12 @@ async function copyLaunchCommand() {
   }
 }
 
+function networkBadge(routeClass) {
+  return routeClass === "local"
+    ? el("span", { class: "badge badge-local", text: "on-prem" })
+    : el("span", { class: "badge badge-external", text: "cloud" });
+}
+
 function renderRouting(data) {
   const list = $("#provider-list");
   list.replaceChildren();
@@ -222,30 +220,13 @@ function renderRouting(data) {
     list.append(
       el("li", { class: "provider-item" }, [
         el("span", { class: "provider-name", text: provider.name }),
+        networkBadge(provider.class),
         provider.is_default ? el("span", { class: "badge badge-neutral", text: "default" }) : null,
-        provider.is_interceptor ? el("span", { class: "badge badge-neutral", text: "interceptor" }) : null,
+        provider.is_interceptor ? el("span", { class: "badge badge-neutral", text: "triage" }) : null,
         el("span", { class: "provider-url", text: provider.base_url }),
         el("span", { class: "provider-models", text: models, title }),
       ])
     );
-  }
-
-  const tbody = $("#alias-table tbody");
-  tbody.replaceChildren();
-  for (const alias of data.aliases) {
-    tbody.append(
-      el("tr", {}, [
-        el("td", { text: alias.alias }),
-        el("td", { class: "arrow-cell", text: "→" }),
-        el("td", {}, [
-          `${alias.model} `,
-          el("span", { class: "badge badge-neutral", text: alias.provider }),
-        ]),
-      ])
-    );
-  }
-  if (!data.aliases.length) {
-    tbody.append(el("tr", {}, [el("td", { colspan: "3", text: "no aliases configured" })]));
   }
 
   $("#alias-hint").textContent = data.auto_mapping
@@ -253,11 +234,14 @@ function renderRouting(data) {
       ? `Other model names map automatically to ${data.default_auto_model}.`
       : "Other model names map automatically to the default provider's first model."
     : "Automatic remapping is off (passthrough session); original model names are preserved.";
-
-  const roles = Object.entries(data.role_map).sort();
-  $("#rolemap-line").textContent = roles.length
-    ? roles.map(([from, to]) => `${from} → ${to}`).join("  ·  ")
-    : "none";
+  const aliasCount = data.aliases.length;
+  const roleCount = Object.keys(data.role_map || {}).length;
+  $("#alias-summary").replaceChildren(
+    `${aliasCount} model alias${aliasCount === 1 ? "" : "es"} `,
+    el("a", { class: "tab-link", href: "#/destination", text: "Destination" }),
+    ` · ${roleCount} role rewrite${roleCount === 1 ? "" : "s"} `,
+    el("a", { class: "tab-link", href: "#/settings", text: "Settings" })
+  );
 }
 
 function setLatencyRow(barId, figuresId, entry, maxP99) {
@@ -296,10 +280,29 @@ function renderStats(stats) {
     (intercept.reject ? ` · reject ${fmtCount(intercept.reject)}` : "") +
     (intercept.bypass ? ` · bypass ${fmtCount(intercept.bypass)}` : "") +
     (intercept.errors ? ` · errors ${fmtCount(intercept.errors)}` : "");
-  $("#stat-local").textContent = fmtCount(served.local);
+  // Peer-served calls are recorded under `peer:<name>` providers and counted in
+  // the network class of the peer URL. Split them out of that class's total.
+  const peerClass = new Map((stats.sharing?.peers || []).map((peer) => [peer.name, peer.class]));
+  const peerServed = { local: 0, external: 0 };
+  for (const [name, entry] of Object.entries(served.providers || {})) {
+    if (!name.startsWith("peer:")) continue;
+    peerServed[peerClass.get(name.slice(5)) === "external" ? "external" : "local"] += Number(entry.count || 0);
+  }
+  const toPeers = peerServed.local + peerServed.external;
+  const onPrem = Math.max(0, served.local - peerServed.local);
+  const cloud = Math.max(0, served.external - peerServed.external);
+  $("#stat-local").textContent = fmtCount(onPrem);
   $("#stat-local-sub").textContent = intercept.local ? `${fmtCount(intercept.local)} by interceptor` : " ";
-  $("#stat-external").textContent = fmtCount(served.external);
-  // Latency gives the remote tile the same sub-line weight the private tile has.
+  $("#stat-external").textContent = fmtCount(cloud);
+  const sharing = stats.sharing || null;
+  const sharingRejected = sharing
+    ? Number(sharing.metrics.rejected + sharing.metrics.queue_full + sharing.metrics.queue_timeouts)
+    : 0;
+  $("#stat-peer").textContent = fmtCount(toPeers);
+  $("#stat-peer-sub").textContent = sharing?.mode === "peers"
+    ? `${fmtCount(sharing.metrics.inbound_accepted)} inbound · ${fmtCount(sharingRejected)} rejected`
+    : "sharing mode off";
+  // Latency gives the cloud tile the same sub-line weight the on-prem tile has.
   const extLatency = (stats.latency || {}).external || {};
   $("#stat-external-sub").textContent = extLatency.samples
     ? `p50 ${fmtMs(extLatency.p50_ms)} · p99 ${fmtMs(extLatency.p99_ms)}`
@@ -337,17 +340,31 @@ function renderStats(stats) {
   // Flow strip: stroke weight follows each branch's share of responses.
   const totalServed = served.local + served.external;
   $("#flow-in-count").textContent = fmtCount(requests.total);
-  $("#flow-local-count").textContent = `${fmtCount(served.local)} private`;
-  $("#flow-ext-count").textContent = `${fmtCount(served.external)} remote`;
+  $("#flow-local-count").textContent = `${fmtCount(onPrem)} on-prem`;
+  $("#flow-peer-count").textContent = `${fmtCount(toPeers)} to peers`;
+  $("#flow-ext-count").textContent = `${fmtCount(cloud)} cloud`;
+  const peerNames = (sharing?.peers || []).map((peer) => peer.name);
+  $("#flow-peer-names").textContent = peerNames.length
+    ? `peers: ${peerNames.slice(0, 3).join(", ")}${peerNames.length > 3 ? ` +${peerNames.length - 3}` : ""}`
+    : "peers: none registered";
   const width = (n) => (totalServed ? 2 + 5 * (n / totalServed) : 2).toFixed(2);
-  const flowLocal = $("#flow-local");
-  const flowExt = $("#flow-ext");
-  flowLocal.style.strokeWidth = width(served.local);
-  flowExt.style.strokeWidth = width(served.external);
-  flowLocal.classList.toggle("idle", !served.local);
-  flowExt.classList.toggle("idle", !served.external);
+  for (const [id, count] of [["#flow-local", onPrem], ["#flow-peer", toPeers], ["#flow-ext", cloud]]) {
+    $(id).style.strokeWidth = width(count);
+    $(id).classList.toggle("idle", !count);
+  }
+  $("#flow-peer").classList.toggle("disabled", sharing?.mode === "peers" && !sharing.send_outgoing);
+  const inbound = Number(sharing?.metrics?.inbound_accepted || 0);
+  $("#flow-inbound").classList.toggle("idle", !inbound);
+  $("#flow-inbound").classList.toggle("disabled", !sharing?.peer_listener);
+  $("#flow-inbound-count").textContent = sharing?.peer_listener
+    ? `${fmtCount(inbound)} inbound from peers`
+    : "peer port closed";
+  $("#flow-reject").classList.toggle("hidden", !sharingRejected);
+  $("#flow-reject-count").classList.toggle("hidden", !sharingRejected);
+  $("#flow-reject-count").textContent = `${fmtCount(sharingRejected)} rejected (429)`;
   $("#flow-in").classList.toggle("idle", !requests.total);
   $("#flow-in").style.strokeWidth = requests.total ? "2.5" : "2";
+  if (sharing) renderSharing(sharing);
 
   const band = $("#split-band");
   if (totalServed) {
@@ -355,7 +372,7 @@ function renderStats(stats) {
     const share = (served.local / totalServed) * 100;
     $("#split-local").style.width = share.toFixed(1) + "%";
     $("#split-caption").textContent =
-      `${share.toFixed(share >= 10 ? 0 : 1)}% of ${fmtCount(totalServed)} responses stayed on the private network`;
+      `${share.toFixed(share >= 10 ? 0 : 1)}% of ${fmtCount(totalServed)} responses stayed on-prem or on peers`;
   } else {
     band.classList.add("is-empty");
     $("#split-local").style.width = "0%";
@@ -432,15 +449,18 @@ function renderLatencyBudget(phases) {
     `${share < 1 ? share.toFixed(2) : share.toFixed(1)}% spent in llmproxy`;
 }
 
-// Cost and resilience only earn a tile once they have something to say: an
-// unpriced instance should not stare at a permanent $0.00.
+// An unpriced instance must not claim $0.00, so an empty cost tile says why it
+// is empty and where to fix that instead of disappearing.
 function renderCost(cost) {
-  const tile = $("#stat-cost-tile");
   if (!cost || (!cost.priced_requests && !cost.spend_usd)) {
-    tile.hidden = true;
+    const ratesConfigured = Object.keys(configData?.pricing?.models || {}).length > 0;
+    $("#stat-cost").textContent = "—";
+    $("#stat-cost-sub").replaceChildren(
+      ratesConfigured ? "no priced calls yet" : "no rates configured · ",
+      ratesConfigured ? "" : el("a", { class: "tab-link", href: "#/cost", text: "add rates" })
+    );
     return;
   }
-  tile.hidden = false;
   $("#stat-cost").textContent = fmtUsd(cost.spend_usd);
   const parts = [];
   if (cost.saved_usd > 0) parts.push(`${fmtUsd(cost.saved_usd)} saved vs baseline`);
@@ -449,12 +469,11 @@ function renderCost(cost) {
 }
 
 function renderResilience(resilience) {
-  const tile = $("#stat-resilience-tile");
   if (!resilience || (!resilience.failovers && !resilience.breaker_skips && !resilience.rule_matches)) {
-    tile.hidden = true;
+    $("#stat-resilience").textContent = "0";
+    $("#stat-resilience-sub").textContent = "no failovers or breaker skips";
     return;
   }
-  tile.hidden = false;
   $("#stat-resilience").textContent = fmtCount(resilience.failovers);
   const parts = [];
   if (resilience.breaker_skips) parts.push(`${fmtCount(resilience.breaker_skips)} breaker skips`);
@@ -535,18 +554,29 @@ function renderRoutingDestinations(destinations) {
   }
 }
 
+function rateFor(provider, model) {
+  const rates = configData?.pricing?.models || {};
+  return rates[`${provider}/${model}`] || rates[model] || null;
+}
+
+function fmtRate(value) {
+  const amount = Number(value) || 0;
+  return amount >= 10 ? amount.toFixed(0) : String(Number(amount.toFixed(3)));
+}
+
 function renderModelUsage(models) {
   const body = $("#model-usage tbody");
   body.replaceChildren();
   if (!models.length) {
-    body.append(el("tr", {}, [el("td", { colspan: "7", text: "no completed model calls yet" })]));
+    body.append(el("tr", {}, [el("td", { colspan: "8", text: "no completed model calls yet" })]));
     return;
   }
   for (const entry of models) {
     const estimated = entry.estimated_requests ? "≈ " : "";
     // An unpriced model shows a dash rather than $0.00, which would claim the
     // calls were free instead of admitting the rate is simply unknown.
-    const cost = entry.priced_requests ? fmtUsd(entry.cost_usd) : "—";
+    const cost = entry.priced_requests ? estimated + fmtUsd(entry.cost_usd) : "—";
+    const rate = rateFor(entry.provider, entry.model);
     body.append(
       el("tr", {}, [
         el("td", { class: "mono", text: entry.provider }),
@@ -554,6 +584,10 @@ function renderModelUsage(models) {
         el("td", { class: "mono", text: fmtCount(entry.requests) }),
         el("td", { class: "mono", text: estimated + fmtCount(entry.input_tokens) }),
         el("td", { class: "mono", text: estimated + fmtCount(entry.output_tokens) }),
+        el("td", {
+          class: rate ? "mono" : "mono status-muted",
+          text: rate ? `$${fmtRate(rate.input_per_mtok)} · $${fmtRate(rate.output_per_mtok)}` : "unpriced",
+        }),
         el("td", { class: "mono", text: fmtMs(entry.total_time_ms) }),
         el("td", { class: "mono", text: cost }),
       ])
@@ -683,6 +717,7 @@ const DECISION_BOARD_MAX = 512;
 
 function decisionGroup(entry) {
   if (entry.decision === "reject") return "reject";
+  if (String(entry.provider || "").startsWith("peer:")) return "peer";
   if (entry.error || ["error", "fallback", "invalid"].includes(entry.decision)) return "error";
   if (entry.decision === "bypass") return "bypass";
   return entry.class || (entry.decision === "direct" ? "local" : "external");
@@ -718,7 +753,7 @@ function decisionMatches(entry) {
 function useDecisionInTest(entry) {
   $("#test-prompt").value = entry.prompt || "";
   setPromptMode(entry.mode === "integrated" ? "integrated" : "intercept");
-  location.hash = "#/routing/policy";
+  location.hash = "#/triage";
   $("#test-prompt").focus();
 }
 
@@ -750,7 +785,9 @@ function renderDecisions() {
       .join(" · ");
     const destinationMeta = [
       destinationLabel(entry),
-      entry.class && `${entry.class} network scope`,
+      String(entry.provider || "").startsWith("peer:")
+        ? "served by a peer node"
+        : entry.class && (entry.class === "local" ? "on-prem" : "cloud"),
       entry.reasoning_effort && `${entry.reasoning_effort} reasoning`,
       entry.target && `target ${entry.target}`,
     ]
@@ -833,10 +870,7 @@ async function loadMonitor() {
     proxyAddr = overview.proxy_addr || overview.listen_addr;
     if (catalogLoaded) renderCatalog();
     $("#meta-proxy-addr").textContent = proxyAddr;
-    const modeBadge = $("#meta-routing-mode");
-    modeBadge.textContent = `${overview.routing_mode.toUpperCase()} MODE`;
-    modeBadge.dataset.mode = overview.routing_mode;
-    modeBadge.dataset.unsaved = "false";
+    setModeSwitch(overview.routing_mode);
     $("#footer-version").textContent = `llmproxy ${overview.version}` +
       (overview.launcher ? ` · ${overview.launcher} session` : "");
     $("#footer-config").textContent = overview.config_path || "no config file (defaults)";
@@ -1002,7 +1036,7 @@ function renderModeChrome() {
   $("#mode-intercept").setAttribute("aria-pressed", String(promptMode === "intercept"));
   $("#mode-integrated").setAttribute("aria-pressed", String(promptMode === "integrated"));
   $("#mode-explainer").textContent = MODE_EXPLAINERS[promptMode];
-  $("#test-run").textContent = `Test in ${promptMode} mode`;
+  $("#test-run").textContent = `Test with ${promptMode} prompt`;
   const routesBlock = $("#sys-routes-block");
   routesBlock.hidden = promptMode !== "integrated";
   if (promptMode === "integrated") renderPromptRoutes();
@@ -1270,55 +1304,50 @@ function renderAliasEditor() {
   providerOptions($("#alias-add-provider"), "", true);
 }
 
-function renderModeDependentControls(mode, preview = false) {
-  const modeInfo = {
-    proxy: ["Proxy mode", "Sends normal requests to the selected provider and model; model aliases and provider/model routes can override it."],
-    intercept: ["Intercept mode", "Screens requests first; the triage model can answer directly or pass through to the selected provider."],
-    integrated: ["Integrated mode", "Model Auto enables triage and configured provider tools; PASS uses the selected provider."],
-  }[mode];
-  $("#routing-mode-panel").dataset.mode = mode;
-  $("#mode-current").replaceChildren(
-    el("strong", { class: "mode-current-title", text: `${modeInfo[0]}${preview ? " · UNSAVED" : " · ACTIVE"}` }),
-    el("span", { text: modeInfo[1] })
-  );
-  const modeBadge = $("#meta-routing-mode");
-  modeBadge.textContent = `${mode.toUpperCase()} MODE`;
-  modeBadge.dataset.mode = mode;
-  modeBadge.dataset.unsaved = String(preview);
+function setModeSwitch(mode) {
+  for (const button of document.querySelectorAll("#mode-switch button")) {
+    button.setAttribute("aria-checked", String(button.dataset.mode === mode));
+  }
+  $("#tab-triage").hidden = mode === "proxy";
+  let step = 0;
+  for (const tab of document.querySelectorAll("[data-step]")) {
+    if (!tab.hidden) tab.querySelector(".tab-index").textContent = String(++step);
+  }
+  $("#setup-label").textContent = `Set up · ${mode}`;
+  renderSteps();
+}
+
+function renderSteps() {
+  if (!configData) return;
+  const providers = configData.providers || {};
+  const defaultModels = providers[configData.default_provider]?.models || [];
+  const interceptor = configData.interceptor || {};
+  const mode = configData.routing_mode;
+  const marks = {
+    providers: defaultModels.length > 0,
+    destination: defaultModels.length > 0 || Boolean(configData.default_model),
+    triage: Boolean(interceptor.provider && interceptor.model) &&
+      (mode !== "integrated" || Object.keys(configData.integrated?.targets || {}).length > 0),
+  };
+  for (const [name, done] of Object.entries(marks)) {
+    const mark = $(`#tab-${name} .step-mark`);
+    mark.textContent = done ? "✓" : "!";
+    mark.className = `step-mark mono ${done ? "is-done" : "is-missing"}`;
+    mark.title = done ? "set" : "needs attention";
+  }
+}
+
+function renderModeDependentControls(mode) {
+  setModeSwitch(mode);
   $("#interceptor-panel").hidden = mode === "proxy";
   $("#integrated-panel").hidden = mode !== "integrated";
-  $("#subtab-routing-policy").hidden = mode === "proxy";
-  const policyViewActive = currentRoute().secondary === "policy";
-  $("#subview-routing-policy").hidden = mode === "proxy" || !policyViewActive;
-  $("#subtab-routing-policy").setAttribute("aria-selected", String(mode !== "proxy" && policyViewActive));
-  $("#mode-policy-panel").hidden = mode === "proxy";
-  if (mode === "intercept") {
-    $("#mode-policy-title").textContent = "Intercept decision prompt";
-    $("#mode-policy-intro").textContent =
-      `Triage uses ${configData.interceptor.provider} / ${configData.interceptor.model}. This prompt guides when it answers directly and when it passes through.`;
-    $("#mode-policy-summary").textContent = "View intercept prompt";
-    $("#mode-policy-text").textContent = configData.interceptor.instructions || "";
-  } else if (mode === "integrated") {
-    $("#mode-policy-title").textContent = "Integrated routing prompt";
-    $("#mode-policy-intro").textContent =
-      `Triage uses ${configData.interceptor.provider} / ${configData.interceptor.model}. This prompt guides selection from the integrated targets below or PASS to the normal destination.`;
-    $("#mode-policy-summary").textContent = "View integrated prompt";
-    $("#mode-policy-text").textContent = configData.integrated.instructions || "";
-  }
 
-  $("#proxy-destination-label").textContent = mode === "proxy"
-    ? "Default upstream destination"
-    : mode === "intercept"
-      ? "PASS / fallback destination"
-      : "PASS / explicit model destination";
+  $("#proxy-destination-label").textContent = mode === "proxy" ? "Default destination" : "PASS destination";
   $("#destination-intro").textContent = mode === "proxy"
-    ? "Proxy mode sends ordinary requests to this provider and model."
-    : mode === "intercept"
-      ? "PASS and other normally routed requests use this provider and model."
-      : "PASS and explicit normal routes use this provider and model; Auto requests can use the integrated targets below.";
-  $("#local-destination-note").textContent = mode === "integrated"
-    ? "Integrated policy can select LOCAL when this destination is enabled."
-    : "Saved for integrated mode; this mode does not select LOCAL automatically.";
+    ? "Requests without their own route go here."
+    : "Requests triage passes on go here.";
+  $("#local-destination-block").hidden = mode !== "integrated";
+  $("#local-destination-note").textContent = "";
 }
 
 function renderLocalDestination() {
@@ -1358,7 +1387,6 @@ function renderLocalDestination() {
 
 function renderInterceptorForm() {
   const interceptor = configData.interceptor;
-  $("#routing-mode").value = configData.routing_mode;
   renderModeDependentControls(configData.routing_mode);
   const providerSelect = $("#proxy-provider");
   providerOptions(providerSelect, configData.default_provider, false);
@@ -1532,6 +1560,12 @@ function renderProviderEditors() {
     });
     const timeout = el("input", { class: "input mono", type: "number", min: "1", value: provider.timeout_secs });
     const connectTimeout = el("input", { class: "input mono", type: "number", min: "1", value: provider.connect_timeout_secs });
+    const fallback = el("input", {
+      class: "input mono", value: (provider.fallback || []).join(", "),
+      placeholder: "provider or provider/model, in order", "aria-label": `Fallback providers for ${name}`,
+    });
+    const breakerThreshold = el("input", { class: "input mono", type: "number", min: "0", value: provider.circuit_breaker_threshold });
+    const breakerCooldown = el("input", { class: "input mono", type: "number", min: "1", value: provider.circuit_breaker_cooldown_secs });
 
     const save = el("button", { class: "button button-primary", type: "button", text: "Save" });
     save.addEventListener("click", async () => {
@@ -1541,6 +1575,9 @@ function renderProviderEditors() {
         reasoning_effort: reasoningEffort.value,
         timeout_secs: Number(timeout.value) || provider.timeout_secs,
         connect_timeout_secs: Number(connectTimeout.value) || provider.connect_timeout_secs,
+        fallback: fallback.value.split(",").map((entry) => entry.trim()).filter(Boolean),
+        circuit_breaker_threshold: Math.max(0, Math.trunc(Number(breakerThreshold.value)) || 0),
+        circuit_breaker_cooldown_secs: Math.max(1, Math.trunc(Number(breakerCooldown.value)) || provider.circuit_breaker_cooldown_secs),
       };
       const envValue = apiKeyEnv.value.trim();
       if (envValue !== (provider.api_key_env || "")) body.api_key_env = envValue;
@@ -1559,13 +1596,38 @@ function renderProviderEditors() {
       : provider.api_key_env
         ? el("span", { class: "badge badge-neutral", text: `env ${provider.api_key_env}` })
         : null;
-    const summary = el("summary", { class: "provider-summary" }, [
+    const use = el("input", {
+      type: "checkbox",
+      class: "provider-use",
+      title: provider.is_default ? "The default provider is always used" : "Use this provider",
+      "aria-label": `Use ${name}`,
+    });
+    use.checked = provider.enabled !== false;
+    use.disabled = provider.is_default;
+    use.addEventListener("click", (event) => event.stopPropagation());
+    use.addEventListener("change", async () => {
+      try {
+        const result = await apiSend(`/api/providers/${encodeURIComponent(name)}`, "PUT", { enabled: use.checked });
+        applyToast(result, `${name} ${use.checked ? "on" : "off"};`);
+        refreshFromResult(result);
+      } catch (error) {
+        use.checked = !use.checked;
+        toast(`${name} was not changed.`, "error", error.message);
+      }
+    });
+    const models = provider.models || [];
+    const summary = el("summary", { class: `provider-summary${use.checked ? "" : " is-off"}` }, [
+      use,
       el("span", { class: "provider-name mono", text: name }),
+      networkBadge(provider.class),
       provider.is_default ? el("span", { class: "badge badge-neutral", text: "default" }) : null,
-      provider.from_upstream_section ? el("span", { class: "badge badge-neutral", text: "[upstream]" }) : null,
-      provider.reasoning_effort ? el("span", { class: "badge badge-neutral", text: `reasoning ${provider.reasoning_effort}` }) : null,
+      provider.breaker_status === "open" ? el("span", { class: "badge badge-danger", text: "breaker open" }) : null,
       keyBadge,
-      el("span", { class: "provider-url", text: provider.base_url }),
+      el("span", {
+        class: "provider-url mono",
+        text: models.length ? `${models.length} model${models.length === 1 ? "" : "s"}` : "no models",
+        title: provider.base_url,
+      }),
     ]);
 
     const dangerActions = [];
@@ -1586,10 +1648,10 @@ function renderProviderEditors() {
     if (!provider.is_default && !provider.from_upstream_section) {
       const remove = el("button", { class: "button button-danger", type: "button", text: "Delete provider" });
       remove.addEventListener("click", async () => {
-        if (!confirm(`Delete provider ${name}? Aliases pointing at it will block the change.`)) return;
+        if (!confirm(`Delete provider ${name}? Aliases, routes, rules, fallbacks and prices that use it are removed too.`)) return;
         try {
           const result = await apiSend(`/api/providers/${encodeURIComponent(name)}`, "DELETE");
-          applyToast(result, `Provider ${name} removed;`);
+          applyToast(result, result.removed?.length ? `Provider ${name} removed with ${result.removed.join(", ")};` : `Provider ${name} removed;`);
           refreshFromResult(result);
         } catch (error) {
           toast(`Could not delete ${name}.`, "error", error.message);
@@ -1612,6 +1674,11 @@ function renderProviderEditors() {
         el("label", { class: "field" }, [el("span", { class: "field-name mono", text: "reasoning_effort" }), reasoningEffort]),
         el("label", { class: "field" }, [el("span", { class: "field-name mono", text: "timeout_secs" }), timeout]),
         el("label", { class: "field" }, [el("span", { class: "field-name mono", text: "connect_timeout_secs" }), connectTimeout]),
+      ]),
+      el("div", { class: "field-row" }, [
+        el("label", { class: "field" }, [el("span", { class: "field-name mono", text: "fallback" }), fallback]),
+        el("label", { class: "field" }, [el("span", { class: "field-name mono", text: "breaker threshold · 0 off" }), breakerThreshold]),
+        el("label", { class: "field" }, [el("span", { class: "field-name mono", text: "breaker cooldown s" }), breakerCooldown]),
       ]),
       el("div", { class: "provider-actions" }, [...dangerActions, el("span", { class: "spacer" }), save]),
     ]);
@@ -1662,6 +1729,7 @@ function renderConfigEditors() {
   renderIntegratedForm();
   renderProviderEditors();
   renderSettingsForm();
+  renderPricingEditor();
 }
 
 function refreshFromResult(result) {
@@ -1712,12 +1780,449 @@ async function loadRawConfig() {
   }
 }
 
+/* Sharing */
+
+let sharingData = null;
+
+function sharingRejected(sharing) {
+  const metrics = sharing.metrics || {};
+  return Number(metrics.rejected || 0) + Number(metrics.queue_full || 0) + Number(metrics.queue_timeouts || 0);
+}
+
+async function saveSharing(changes, what) {
+  try {
+    const result = await apiSend("/api/sharing", "PUT", changes);
+    applyToast(result, what);
+    configData = result.config || configData;
+    pollStats();
+    return true;
+  } catch (error) {
+    toast(`${what} was not saved.`, "error", error.message);
+    pollStats();
+    return false;
+  }
+}
+
+function renderShareSummary(sharing) {
+  const ready = (sharing.peers || []).filter((peer) => peer.enabled && peer.state === "ready").length;
+  const chip = (label, value, cls) => el("span", { class: `share-chip ${cls}` }, [
+    el("span", { class: "share-chip-label mono", text: label }), value,
+  ]);
+  const host = $("#share-summary");
+  if (!host) return;
+  host.replaceChildren(
+    chip("this node", sharing.local_limit ? `up to ${sharing.local_limit}` : "no limit", "is-local"),
+    chip("peers", (sharing.mode === "peers")
+      ? `${[sharing.send_outgoing && "send", sharing.accept_incoming && "accept"].filter(Boolean).join(" + ") || "paused"} · ${ready} ready`
+      : "local only", (sharing.mode === "peers") ? "is-peer" : ""),
+    chip("cloud overflow", sharing.cloud_overflow_active || "off", sharing.cloud_overflow_active ? "is-external" : ""),
+  );
+}
+
+function renderSlotGauges(sharing) {
+  const slots = sharing.slots || {};
+  const cells = [];
+  const cap = (n) => Math.min(Number(n || 0), 48);
+  for (let i = 0; i < cap(slots.local_total); i += 1) {
+    cells.push(["slot slot-local" + (i < slots.local_busy ? " busy" : ""), "this node"]);
+  }
+  if (cells.length && slots.incoming_total) cells.push(["slot-sep", ""]);
+  const peerJobs = Math.max(0, (slots.incoming_busy || 0) - (slots.borrowed || 0));
+  for (let i = 0; i < cap(slots.incoming_total); i += 1) {
+    const lent = i < (slots.borrowed || 0);
+    const busy = !lent && i < (slots.borrowed || 0) + peerJobs;
+    cells.push([
+      "slot slot-remote" + (lent ? " borrowed" : busy ? " busy" : ""),
+      lent ? "peer slot used by this node" : busy ? "peer job" : "peer slot",
+    ]);
+  }
+  const parts = [];
+  if (slots.local_total) parts.push(`this node ${slots.local_busy}/${slots.local_total}`);
+  if (slots.incoming_total) parts.push(`peer jobs ${slots.incoming_busy}/${slots.incoming_total}`);
+  if (slots.queue_depth) parts.push(`waiting ${slots.queued}/${slots.queue_depth}`);
+  for (const host of document.querySelectorAll("[data-slot-gauge]")) {
+    host.replaceChildren(...cells.map(([cls, title]) => el("i", { class: cls, title: title || null })));
+  }
+  for (const node of document.querySelectorAll("[data-slot-caption]")) {
+    node.textContent = parts.join(" · ");
+    node.closest(".slot-row").hidden = !cells.length;
+  }
+}
+
+function renderSharingStats(sharing) {
+  const metrics = sharing.metrics || {};
+  const tile = (value, label, cls = "") => el("div", { class: "stat" }, [
+    el("span", { class: `stat-value mono ${cls}`, text: value }),
+    el("span", { class: "stat-label mono", text: label }),
+  ]);
+  $("#sharing-stats").replaceChildren(
+    tile(fmtCount(metrics.served_local + metrics.served_borrowed), "ran here", "is-local"),
+    tile(fmtCount(metrics.served_peer), "sent to peers", "is-peer"),
+    tile(fmtCount(metrics.inbound_accepted), "peer jobs run", "is-peer"),
+    tile(fmtCount(metrics.served_cloud), "cloud overflow", "is-external"),
+    tile(fmtCount(metrics.queued), "waited"),
+    tile(fmtCount(sharingRejected(sharing)), "rejected"),
+  );
+}
+
+const PEER_STATE_BADGE = {
+  ready: "badge-local",
+  full: "badge-external",
+  unreachable: "badge-danger",
+  unauthorized: "badge-danger",
+};
+
+async function savePeer(peer, changes, what) {
+  const body = {
+    url: peer.url,
+    public_key: peer.public_key,
+    enabled: peer.enabled,
+    accept_incoming: peer.accept_incoming,
+    send_outgoing: peer.send_outgoing,
+    ...changes,
+  };
+  try {
+    const result = await apiSend(`/api/peers/${encodeURIComponent(peer.name)}`, "PUT", body);
+    applyToast(result, what);
+    configData = result.config || configData;
+  } catch (error) {
+    toast(`Peer ${peer.name} was not updated.`, "error", error.message);
+  }
+  pollStats();
+}
+
+function renderPeers(sharing) {
+  const body = $("#peer-table tbody");
+  const peers = sharing.peers || [];
+  body.replaceChildren(...peers.map((peer) => {
+    const toggle = (field, label) => {
+      const box = el("input", { type: "checkbox", "aria-label": `${label} ${peer.name}` });
+      box.checked = Boolean(peer.enabled && peer[field]);
+      box.addEventListener("change", () => savePeer(peer, { enabled: true, [field]: box.checked },
+        `${peer.name}: ${label} ${box.checked ? "on" : "off"};`));
+      return el("td", { class: "switch-cell" }, [box]);
+    };
+    const remove = el("button", { class: "button button-danger", type: "button", text: "Remove" });
+    remove.addEventListener("click", async () => {
+      if (!confirm(`Remove peer ${peer.name}?`)) return;
+      try {
+        const result = await apiSend(`/api/peers/${encodeURIComponent(peer.name)}`, "DELETE");
+        applyToast(result, `Peer ${peer.name} removed;`);
+        configData = result.config || configData;
+      } catch (error) {
+        toast(`Could not remove ${peer.name}.`, "error", error.message);
+      }
+      pollStats();
+    });
+    return el("tr", {}, [
+      el("td", {}, [
+        el("div", { class: "peer-name mono", text: peer.name }),
+        el("div", { class: "peer-url mono", text: peer.url, title: peer.fingerprint || "" }),
+      ]),
+      el("td", {}, [el("span", {
+        class: `badge ${PEER_STATE_BADGE[peer.state] || "badge-neutral"}`,
+        text: peer.state,
+        title: peer.last_error || "",
+      })]),
+      toggle("send_outgoing", "send"),
+      toggle("accept_incoming", "accept"),
+      el("td", { class: "mono", text: `${fmtCount(peer.sent)} · ${fmtCount(peer.inbound_accepted)}` }),
+      el("td", {}, [remove]),
+    ]);
+  }));
+  $("#peer-table").hidden = !peers.length;
+  $("#peers-summary").textContent = sharing.peer_listener ? `port ${sharing.peer_listener}` : "";
+}
+
+function renderPairStatus(sharing) {
+  const peers = (sharing.peers || []).filter((peer) => peer.enabled);
+  const node = $("#pair-status");
+  const down = peers.filter((peer) => !["ready", "full"].includes(peer.state));
+  node.className = `pair-status ${!peers.length ? "" : down.length ? "is-warn" : "is-ok"}`;
+  node.textContent = !peers.length
+    ? "No peers yet: each node adds the other's key."
+    : down.length
+      ? down.map((peer) => `${peer.name}: ${peer.state}${peer.state === "unreachable" ? " (have they added your key?)" : ""}`).join(" · ")
+      : `Connected to ${peers.map((peer) => peer.name).join(", ")}`;
+}
+
+function renderSharing(sharing) {
+  sharingData = sharing;
+  renderShareSummary(sharing);
+  renderSlotGauges(sharing);
+  if (currentRoute().primary !== "sharing") return;
+  const active = document.activeElement;
+  for (const radio of document.querySelectorAll('input[name="sharing-mode"]')) {
+    radio.checked = radio.value === ((sharing.mode === "peers") ? "peers" : "local");
+  }
+  if (active !== $("#local-limit")) $("#local-limit").value = sharing.local_limit;
+  if (active !== $("#incoming-limit")) $("#incoming-limit").value = sharing.incoming_limit;
+  $("#send-outgoing").checked = Boolean(sharing.send_outgoing);
+  $("#accept-incoming").checked = Boolean(sharing.accept_incoming);
+  $("#peers-panel").hidden = !(sharing.mode === "peers");
+  $("#own-key").textContent = sharing.public_key || "press Copy";
+  $("#own-address").textContent = `address ${sharing.advertised_url}`;
+  $("#node-key-meta").textContent = sharing.key_error
+    ? `key error: ${sharing.key_error}`
+    : sharing.fingerprint ? `key ${sharing.fingerprint}` : "no key yet";
+  renderSharingStats(sharing);
+  renderPeers(sharing);
+  renderPairStatus(sharing);
+}
+
+function fillSharingForm() {
+  if (!sharingData || !configData) return;
+  const sharing = sharingData;
+  $("#sharing-node-name").value = sharing.node_name || "";
+  $("#sharing-listen").value = sharing.peer_listen || "";
+  $("#sharing-advertise").value = sharing.advertise_url || "";
+  const providers = Object.entries(configData.providers || {}).sort(([a], [b]) => a.localeCompare(b));
+  const local = $("#sharing-local-provider");
+  local.replaceChildren(...providers.filter(([, p]) => p.class === "local")
+    .map(([name]) => el("option", { value: name, text: name })));
+  local.value = sharing.onprem_provider || configData.default_provider || "";
+}
+
+function fillCloudOverflow() {
+  if (!sharingData || !configData) return;
+  const modes = sharingData.cloud_overflow_modes || {};
+  $("#cloud-route").value = sharingData.cloud_overflow || "";
+  $("#cloud-proxy").checked = modes.proxy !== false;
+  $("#cloud-intercept").checked = modes.intercept !== false;
+  $("#cloud-integrated").checked = modes.integrated !== false;
+  $("#cloud-route-options").replaceChildren(...Object.entries(configData.providers || {})
+    .filter(([, provider]) => provider.class !== "local")
+    .flatMap(([name, provider]) => (provider.models || []).map((model) => el("option", { value: `${name}/${model}` }))));
+}
+
+function fillLimits() {
+  if (!sharingData) return;
+  $("#limit-local").value = sharingData.local_limit;
+  $("#limit-incoming").value = sharingData.incoming_limit;
+  $("#limit-queue").value = sharingData.queue_depth;
+  $("#limit-wait").value = sharingData.queue_wait_ms;
+  $("#limit-retry").value = sharingData.retry_after_secs;
+}
+
+function fillGuard() {
+  if (!sharingData || !configData) return;
+  $("#guard-sources").value = (sharingData.allowed_sources || []).join("\n");
+  $("#guard-listen").textContent = configData.listen_addr || "—";
+  $("#guard-rejections").textContent = sharingData.guard_rejections
+    ? `${fmtCount(sharingData.guard_rejections)} refused since start`
+    : "";
+}
+
+async function loadSharingTab() {
+  try {
+    if (!configData) configData = await apiGet("/api/config");
+    renderSharing(await apiGet("/api/sharing"));
+    fillSharingForm();
+    fillCloudOverflow();
+    fillLimits();
+    fillGuard();
+  } catch (error) {
+    toast("Failed to load sharing state.", "error", String(error.message || error));
+  }
+}
+
+/* Pricing */
+
+function appendPricingRow(key, price) {
+  const tbody = $("#pricing-table tbody");
+  tbody.querySelector(".pricing-empty")?.remove();
+  const keyInput = el("input", { class: "input mono price-key", value: key, "aria-label": "Model key" });
+  const input = el("input", { class: "input mono price-in", type: "number", min: "0", step: "0.01", value: price.input_per_mtok, "aria-label": `Input rate for ${key}` });
+  const output = el("input", { class: "input mono price-out", type: "number", min: "0", step: "0.01", value: price.output_per_mtok, "aria-label": `Output rate for ${key}` });
+  tbody.append(el("tr", {}, [
+    el("td", {}, [keyInput]),
+    el("td", {}, [input]),
+    el("td", {}, [output]),
+    el("td", {}, [el("button", {
+      class: "button button-danger", type: "button", text: "Remove",
+      onclick: (event) => event.target.closest("tr").remove(),
+    })]),
+  ]));
+}
+
+function renderPricingEditor() {
+  const pricing = configData.pricing || { models: {} };
+  const tbody = $("#pricing-table tbody");
+  tbody.replaceChildren();
+  const entries = Object.entries(pricing.models || {}).sort(([a], [b]) => a.localeCompare(b));
+  for (const [key, price] of entries) appendPricingRow(key, price);
+  if (!entries.length) {
+    tbody.append(el("tr", { class: "pricing-empty" }, [el("td", { colspan: "4", text: "no rates yet: every call is counted as unpriced" })]));
+  }
+  const baseline = $("#pricing-baseline");
+  baseline.replaceChildren(el("option", { value: "", text: "none" }),
+    ...entries.map(([key]) => el("option", { value: key, text: key })));
+  baseline.value = pricing.baseline_model || "";
+  $("#pricing-key-options").replaceChildren(...Object.entries(configData.providers || {})
+    .flatMap(([name, provider]) => (provider.models || []).map((model) => el("option", { value: `${name}/${model}` }))));
+}
+
+function collectPricing() {
+  const models = {};
+  for (const row of document.querySelectorAll("#pricing-table tbody tr:not(.pricing-empty)")) {
+    const key = row.querySelector(".price-key").value.trim();
+    if (!key) continue;
+    const input = Number(row.querySelector(".price-in").value);
+    const output = Number(row.querySelector(".price-out").value);
+    if (!Number.isFinite(input) || !Number.isFinite(output) || input < 0 || output < 0) {
+      throw new Error(`${key}: rates must be non-negative numbers`);
+    }
+    if (models[key]) throw new Error(`duplicate rate for ${key}`);
+    models[key] = { input_per_mtok: input, output_per_mtok: output };
+  }
+  return models;
+}
+
 /* Initialization */
 
 document.addEventListener("DOMContentLoaded", () => {
   renderTab();
   loadMonitor();
+  apiGet("/api/config").then((config) => {
+    configData = configData || config;
+    renderSteps();
+  }).catch(() => {});
   startPolling();
+
+  $("#sharing-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      const result = await apiSend("/api/sharing", "PUT", {
+        node_name: $("#sharing-node-name").value.trim(),
+        peer_listen: $("#sharing-listen").value.trim(),
+        advertise_url: $("#sharing-advertise").value.trim(),
+        onprem_provider: $("#sharing-local-provider").value,
+      });
+      applyToast(result, "Node");
+      configData = result.config || configData;
+      await loadSharingTab();
+    } catch (error) {
+      toast("Node settings were not saved.", "error", error.message);
+    }
+  });
+  for (const radio of document.querySelectorAll('input[name="sharing-mode"]')) {
+    radio.addEventListener("change", () => saveSharing({ mode: radio.value },
+      radio.value === "peers" ? "Local + peers" : "Local only"));
+  }
+  $("#local-limit").addEventListener("change", (event) =>
+    saveSharing({ local_limit: Math.max(0, Math.trunc(Number(event.target.value)) || 0) }, "Local limit"));
+  $("#incoming-limit").addEventListener("change", (event) =>
+    saveSharing({ incoming_limit: Math.max(1, Math.trunc(Number(event.target.value)) || 1) }, "Incoming limit"));
+  $("#send-outgoing").addEventListener("change", (event) =>
+    saveSharing({ send_outgoing: event.target.checked }, "Send outgoing"));
+  $("#accept-incoming").addEventListener("change", (event) =>
+    saveSharing({ accept_incoming: event.target.checked }, "Accept incoming"));
+  $("#cloud-overflow-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      const result = await apiSend("/api/cloud-overflow", "PUT", {
+        route: $("#cloud-route").value.trim(),
+        modes: {
+          proxy: $("#cloud-proxy").checked,
+          intercept: $("#cloud-intercept").checked,
+          integrated: $("#cloud-integrated").checked,
+        },
+      });
+      applyToast(result, "Cloud overflow");
+      configData = result.config || configData;
+      await loadSharingTab();
+    } catch (error) {
+      toast("Cloud overflow was not saved.", "error", error.message);
+    }
+  });
+  $("#limits-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const number = (id, min = 0) => Math.max(min, Math.trunc(Number($(id).value)) || 0);
+    try {
+      const result = await apiSend("/api/sharing", "PUT", {
+        local_limit: number("#limit-local"),
+        incoming_limit: number("#limit-incoming", 1),
+        queue_depth: number("#limit-queue"),
+        queue_wait_ms: number("#limit-wait"),
+        retry_after_secs: number("#limit-retry", 1),
+      });
+      applyToast(result, "Limits");
+      configData = result.config || configData;
+      await loadSharingTab();
+    } catch (error) {
+      toast("Limits were not saved.", "error", error.message);
+    }
+  });
+  $("#guard-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      const result = await apiSend("/api/listen-guard", "PUT", {
+        allowed_sources: $("#guard-sources").value.split(/[\n,]/).map((line) => line.trim()).filter(Boolean),
+      });
+      applyToast(result, "Allowed clients");
+      configData = result.config || configData;
+      await loadSharingTab();
+    } catch (error) {
+      toast("Allowed clients were not saved.", "error", error.message);
+    }
+  });
+  $("#share-copy").addEventListener("click", async () => {
+    const button = $("#share-copy");
+    try {
+      let key = sharingData?.public_key;
+      if (!key) {
+        const result = await apiSend("/api/sharing/key", "POST", {});
+        renderSharing(result.sharing);
+        key = result.sharing.public_key;
+      }
+      await navigator.clipboard.writeText(key);
+      button.textContent = "Copied";
+      setTimeout(() => (button.textContent = "Copy"), 1300);
+    } catch (error) {
+      toast("The key was not copied.", "error", error.message || "select it and copy it manually");
+    }
+  });
+  $("#peer-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      const result = await apiSend("/api/sharing/peers", "POST", {
+        name: $("#peer-name").value.trim(),
+        url: $("#peer-url").value.trim(),
+        public_key: $("#peer-key").value.trim(),
+      });
+      for (const id of ["#peer-name", "#peer-url", "#peer-key"]) $(id).value = "";
+      configData = result.config || configData;
+      renderSharing(result.sharing);
+      toast("Peer added. It connects once they add your key too.");
+      pollStats();
+    } catch (error) {
+      toast("The peer was not added.", "error", error.message);
+    }
+  });
+  $("#pricing-add").addEventListener("click", () => {
+    const key = $("#pricing-add-key").value.trim();
+    if (!key) {
+      toast("Enter a model or provider/model key.", "warn");
+      return;
+    }
+    appendPricingRow(key, {
+      input_per_mtok: Number($("#pricing-add-input").value) || 0,
+      output_per_mtok: Number($("#pricing-add-output").value) || 0,
+    });
+    for (const id of ["#pricing-add-key", "#pricing-add-input", "#pricing-add-output"]) $(id).value = "";
+  });
+  $("#pricing-save").addEventListener("click", async () => {
+    try {
+      const result = await apiSend("/api/pricing", "PUT", {
+        baseline_model: $("#pricing-baseline").value,
+        models: collectPricing(),
+      });
+      applyToast(result, "Pricing");
+      refreshFromResult(result);
+    } catch (error) {
+      toast("Pricing was not saved.", "error", error.message);
+    }
+  });
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) pollStats();
   });
@@ -1736,23 +2241,21 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  $("#routing-mode-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    try {
-      const result = await apiSend("/api/routing-mode", "PUT", { mode: $("#routing-mode").value });
-      applyToast(result, "Routing mode");
-      refreshFromResult(result);
-      loadMonitor();
-    } catch (error) {
-      toast("Routing mode was not saved.", "error", error.message);
-    }
-  });
-
-  $("#routing-mode").addEventListener("change", () => {
-    if (!configData) return;
-    const selectedMode = $("#routing-mode").value;
-    renderModeDependentControls(selectedMode, selectedMode !== configData.routing_mode);
-  });
+  for (const button of document.querySelectorAll("#mode-switch button")) {
+    button.addEventListener("click", async () => {
+      const mode = button.dataset.mode;
+      if (button.getAttribute("aria-checked") === "true") return;
+      if (!confirm(`Switch to ${mode} mode? Relaunch running agents afterwards.`)) return;
+      try {
+        const result = await apiSend("/api/routing-mode", "PUT", { mode });
+        applyToast(result, `${mode[0].toUpperCase()}${mode.slice(1)} mode`);
+        refreshFromResult(result);
+        loadMonitor();
+      } catch (error) {
+        toast("Mode was not changed.", "error", error.message);
+      }
+    });
+  }
 
   $("#reset-stats").addEventListener("click", async () => {
     try {
@@ -1842,10 +2345,10 @@ document.addEventListener("DOMContentLoaded", () => {
     };
     try {
       const result = await apiSend("/api/interceptor", "PUT", body);
-      applyToast(result, "Interceptor");
+      applyToast(result, "Triage provider");
       refreshFromResult(result);
     } catch (error) {
-      toast("Interceptor settings were not saved.", "error", error.message);
+      toast("Triage provider settings were not saved.", "error", error.message);
     }
   });
 
@@ -1878,6 +2381,47 @@ document.addEventListener("DOMContentLoaded", () => {
       refreshFromResult(result);
     } catch (error) {
       toast("Integrated routing was not saved.", "error", error.message);
+    }
+  });
+
+  $("#provider-detect").addEventListener("click", async () => {
+    const box = $("#provider-detect-results");
+    try {
+      const { found } = await apiGet("/api/providers/detect");
+      box.replaceChildren();
+      if (!found.length) {
+        box.append(el("p", { class: "hint", text: "Nothing detected. In Docker, the container cannot see the host's ~/.codex or ~/.claude unless they are mounted." }));
+      }
+      for (const item of found) {
+        const row = el("div", { class: "detect-row" });
+        const text = el("div", { class: "detect-text" }, [
+          el("strong", { class: "mono", text: item.name }),
+          el("span", { class: "hint", text: ` ${item.kind} · ${item.base_url} · ${item.source}` }),
+        ]);
+        row.append(text);
+        if (item.configured_as) {
+          row.append(el("span", { class: "badge badge-neutral", text: `already configured as ${item.configured_as}` }));
+        } else {
+          const add = el("button", { class: "button button-primary", type: "button", text: "Add" });
+          add.addEventListener("click", async () => {
+            const body = { kind: item.kind, base_url: item.base_url, auth: item.auth };
+            if (item.api_key_env) body.api_key_env = item.api_key_env;
+            try {
+              const result = await apiSend(`/api/providers/${encodeURIComponent(item.name)}`, "PUT", body);
+              applyToast(result, `Provider ${item.name}`);
+              refreshFromResult(result);
+              add.replaceWith(el("span", { class: "badge badge-neutral", text: "added, not routed" }));
+            } catch (error) {
+              toast(`Provider ${item.name} was not added.`, "error", error.message);
+            }
+          });
+          row.append(add);
+        }
+        box.append(row);
+      }
+      box.hidden = false;
+    } catch (error) {
+      toast("Environment detection failed.", "error", error.message);
     }
   });
 

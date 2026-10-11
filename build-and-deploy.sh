@@ -4,18 +4,22 @@
 # `docker save | ssh docker load`, and run it there on the host network using
 # that host's own ~/.llmproxy/config.toml (mounted read-only).
 #
-# Defaults: HOST=sesame, config=~/.llmproxy/config.toml (on the host), proxy
-# binds 0.0.0.0 at the port named in the config (8080 unless overridden), the
-# loopback admin (11180) stays loopback, the container restarts always, and the
-# proxy port is opened on the host firewall.
+# Settings come from the environment, then ./deploy.env (git-ignored; copy
+# deploy.env.example), then flags. HOST is required. The image is built for the
+# host's CPU (amd64 or arm64, e.g. DGX Spark), cross-building with buildx when
+# it differs from this machine's.
 #
 # Examples:
-#   ./build-and-deploy.sh                 # deploy to sesame
+#   ./build-and-deploy.sh                 # HOST from deploy.env
 #   ./build-and-deploy.sh -h otherbox -p 9000
-#   HOST=sesame IMAGE=llmproxy:edge ./build-and-deploy.sh --no-build
+#   IMAGE=llmproxy:edge ./build-and-deploy.sh --no-build
 set -euo pipefail
 
-HOST="${HOST:-sesame}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+[[ -f "$REPO_DIR/deploy.env" ]] && source "$REPO_DIR/deploy.env"
+
+HOST="${HOST:-}"
 IMAGE="${IMAGE:-llmproxy:latest}"
 CONTAINER="${CONTAINER:-llmproxy}"
 PROXY_PORT="${PROXY_PORT:-}"          # empty -> auto-detect from the host config
@@ -24,7 +28,6 @@ FIREWALL="${FIREWALL:-1}"             # 1 opens the proxy port, keeps admin loop
 BUILD="${BUILD:-1}"                   # 1 builds locally before shipping
 DOCKER="${DOCKER:-docker}"            # set to "sudo docker" if needed
 CONFIG_REL=".llmproxy/config.toml"    # host-relative config, per product contract
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_CONTEXT="$REPO_DIR"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -49,6 +52,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+[[ -n "$HOST" ]] || die "no HOST: set it in deploy.env, the environment, or -h"
+
 if [[ -n "$PROXY_PORT" ]]; then
   [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] && (( PROXY_PORT >= 1 && PROXY_PORT <= 65535 )) \
     || die "invalid --proxy-port: $PROXY_PORT"
@@ -56,8 +61,15 @@ fi
 
 # --- 1. build locally --------------------------------------------------------
 if [[ "$BUILD" == "1" ]]; then
-  log "building $IMAGE from $BUILD_CONTEXT"
-  "$DOCKER" build -t "$IMAGE" "$BUILD_CONTEXT"
+  arch() { case "$1" in x86_64|amd64) echo amd64 ;; aarch64|arm64) echo arm64 ;; *) echo "$1" ;; esac; }
+  REMOTE_ARCH="$(arch "$(ssh "$HOST" uname -m)")"
+  if [[ "$REMOTE_ARCH" == "$(arch "$(uname -m)")" ]]; then
+    log "building $IMAGE from $BUILD_CONTEXT"
+    "$DOCKER" build -t "$IMAGE" "$BUILD_CONTEXT"
+  else
+    log "building $IMAGE for linux/$REMOTE_ARCH (buildx) from $BUILD_CONTEXT"
+    "$DOCKER" buildx build --platform "linux/$REMOTE_ARCH" --load -t "$IMAGE" "$BUILD_CONTEXT"
+  fi
 else
   log "skipping build (using existing $IMAGE)"
   "$DOCKER" image inspect "$IMAGE" >/dev/null 2>&1 || die "image $IMAGE not found locally"
@@ -100,7 +112,7 @@ $DOCKER run -d \\
   -e HOME=/home/llmproxy \\
   -e PROXY_PORT="$PROXY_PORT" \\
   -e RUST_LOG="\${RUST_LOG:-info}" \\
-  -v "\$HOME/$CONFIG_REL:/config/config.toml:ro" \\
+  -v "\$HOME/$CONFIG_REL:/config/config.toml" \\
   -v "\$HOME/.llmproxy/logs:/home/llmproxy/.llmproxy" \\
   "$IMAGE" --config /config/config.toml --listen 0.0.0.0:$PROXY_PORT
 echo "container: \$($DOCKER ps --filter name="$CONTAINER" --format '{{.Status}}')"

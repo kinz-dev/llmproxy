@@ -986,12 +986,20 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
     // Everything the proxy did before any network work: extraction, screening,
     // routing, rewriting, and token estimation. Recorded now rather than at
     // completion so the figure lands even for a response that never finishes.
-    let pre_dispatch = model_started.saturating_duration_since(request_started);
-    proxy_stats().latency.record_pre_dispatch(pre_dispatch);
     // Captured, not read, here: the body below is polled by the server after
     // the handler's timing scope has ended, and for a streamed response the
     // wait for the upstream's first byte has not even happened yet.
     let timing = crate::latency::current_timing();
+    // A wait for a sharing execution slot is complete by now. It is neither
+    // proxy work nor provider time, so it is excluded from both phases.
+    let queue_wait = timing
+        .as_ref()
+        .map(|timing| timing.queue_wait())
+        .unwrap_or_default();
+    let pre_dispatch = model_started
+        .saturating_duration_since(request_started)
+        .saturating_sub(queue_wait);
+    proxy_stats().latency.record_pre_dispatch(pre_dispatch);
     if !success {
         error!(
             route_class = class.as_str(),
@@ -1059,7 +1067,7 @@ pub(crate) fn track_response(tracking: ResponseTracking<'_>, response: Response)
                         proxy_stats().latency.record_first_byte(
                             request_started.elapsed(),
                             pre_dispatch,
-                            upstream_wait,
+                            upstream_wait + queue_wait,
                         );
                         if traffic_log().enabled() {
                             let head = &bytes[..bytes.len().min(TRAFFIC_PREVIEW_CHARS * 2)];
@@ -1260,16 +1268,6 @@ fn parse_usage_value(bytes: &[u8]) -> Option<Value> {
         }
     }
     None
-}
-
-/// (prompt, completion) from OpenAI- or Anthropic-style usage objects.
-#[cfg(test)]
-fn usage_tokens(usage: &Value) -> Option<(u64, u64)> {
-    let (input, output) = usage_token_fields(usage);
-    if input.is_none() && output.is_none() {
-        return None;
-    }
-    Some((input.unwrap_or(0), output.unwrap_or(0)))
 }
 
 pub(crate) fn usage_token_fields(usage: &Value) -> (Option<u64>, Option<u64>) {

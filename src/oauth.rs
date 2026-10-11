@@ -119,7 +119,7 @@ fn codex_store() -> &'static CodexStore {
     })
 }
 
-fn codex_auth_path() -> Result<PathBuf> {
+pub(crate) fn codex_auth_path() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(dir).join("auth.json"));
     }
@@ -278,7 +278,7 @@ fn claude_store() -> &'static ClaudeStore {
     })
 }
 
-fn claude_credentials_path() -> Result<PathBuf> {
+pub(crate) fn claude_credentials_path() -> Result<PathBuf> {
     if let Some(path) =
         std::env::var_os("CLAUDE_CREDENTIALS_PATH").filter(|value| !value.is_empty())
     {

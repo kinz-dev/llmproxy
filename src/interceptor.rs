@@ -78,6 +78,15 @@ pub(crate) fn intercept_instructions(interceptor: &InterceptorConfig) -> &str {
 
 /// The integrated-mode policy: its own override, or the built-in integrated
 /// default. Intercept-mode overrides never leak into integrated mode.
+fn rule_route_enabled(config: &crate::Config, route: &str) -> bool {
+    if let Some(target) = config.integrated.targets.get(route) {
+        return config.provider_enabled(&target.provider);
+    }
+    route
+        .split_once('/')
+        .is_none_or(|(provider, _)| config.provider_enabled(provider))
+}
+
 pub(crate) fn integrated_instructions(integrated: &IntegratedConfig) -> &str {
     if integrated.instructions.trim().is_empty() {
         DEFAULT_INTEGRATED_INSTRUCTIONS
@@ -162,6 +171,9 @@ pub(crate) fn match_routing_rule(
 
     for rule in &state.config.routing_rules {
         if !rule.matches(estimated_tokens, has_tools, &text, client_model) {
+            continue;
+        }
+        if !rule_route_enabled(&state.config, &rule.route) {
             continue;
         }
         let outcome = if rule.route.eq_ignore_ascii_case(crate::ROUTING_RULE_PASS) {
@@ -454,6 +466,14 @@ impl RoutingAuditDraft {
                 .map(crate::ReasoningEffort::as_str)
                 .map(str::to_string);
         }
+        routing_decision_log().record(self.audit);
+    }
+
+    /// A peer node served the request; it never reached a provider here.
+    pub(crate) fn record_peer_destination(mut self, peer: &str, url: &str, model: &str) {
+        self.audit.provider = Some(format!("peer:{peer}"));
+        self.audit.model = Some(model.to_string());
+        self.audit.route_class = Some(route_class_for_base_url(url));
         routing_decision_log().record(self.audit);
     }
 
@@ -758,7 +778,7 @@ pub(crate) async fn maybe_intercept(
     if !config.reject_sensitive
         && let Some(key) = conversation_key
         && let Some(target) = sticky_routes().lookup(key)
-        && state.config.integrated.targets.contains_key(&target)
+        && state.config.active_targets().contains_key(&target)
     {
         let target_config = state
             .config
@@ -1051,8 +1071,9 @@ pub(crate) async fn maybe_intercept(
     }
 
     let no_targets = BTreeMap::new();
+    let active_targets = state.config.active_targets();
     let decision_targets = if integrated {
-        &state.config.integrated.targets
+        &*active_targets
     } else {
         &no_targets
     };
@@ -1317,16 +1338,26 @@ async fn execute_target_redirect_impl(
     // An integrated destination is an audited routing decision, so it never
     // fails over for availability: the request goes to exactly the destination
     // the decision named, gated by the confidentiality boundary above.
-    let response = proxy_integrated_chat(
-        provider,
-        chat_request,
-        target,
-        client.protocol,
-        client.model.clone(),
-        client.streaming,
-        state.config.as_ref(),
-    )
-    .await;
+    let permit = match crate::sharing::admit_audited(state, &provider.name, client.protocol).await {
+        Ok(permit) => permit,
+        Err(response) => {
+            audit.record_route_error("no execution slot was available for the integrated target");
+            return InterceptionOutcome::Respond(*response);
+        }
+    };
+    let response = crate::sharing::hold(
+        proxy_integrated_chat(
+            provider,
+            chat_request,
+            target,
+            client.protocol,
+            client.model.clone(),
+            client.streaming,
+            state.config.as_ref(),
+        )
+        .await,
+        permit,
+    );
     if response.status().is_success() {
         proxy_stats().record_intercept_redirect(target_name);
         if let Some(key) = conversation_key {
@@ -1442,6 +1473,7 @@ pub(super) fn build_local_request(
     proxy_config: &crate::Config,
 ) -> std::result::Result<Value, String> {
     let integrated = integrated_routing_requested(&proxy_config.integrated, client_model);
+    let targets = proxy_config.active_targets();
     rewrite_request_roles(&mut request, role_map);
     let Some(object) = request.as_object_mut() else {
         return Err("triage request is not a JSON object".to_string());
@@ -1476,7 +1508,7 @@ pub(super) fn build_local_request(
         return Err(format!("request already defines a tool named {name}"));
     }
     if integrated {
-        for name in proxy_config.integrated.targets.keys() {
+        for name in targets.keys() {
             let canonical_name = canonical_target_name(name);
             if tools
                 .iter()
@@ -1493,9 +1525,7 @@ pub(super) fn build_local_request(
     tools.push(default_route_tool(integrated));
     if integrated {
         tools.extend(
-            proxy_config
-                .integrated
-                .targets
+            targets
                 .iter()
                 .map(|(name, target)| redirect_tool(name, target)),
         );
@@ -1514,7 +1544,7 @@ pub(super) fn build_local_request(
     );
     if integrated {
         dynamic_instructions.push_str("\n\nIntegrated provider routes:");
-        for (name, target) in &proxy_config.integrated.targets {
+        for (name, target) in targets.iter() {
             dynamic_instructions.push_str(&format!(
                 "\nCall {name} when: {}. Destination: {}/{} with {} reasoning effort.",
                 target.hint.trim(),
@@ -1650,11 +1680,6 @@ fn tool_name(tool: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-#[cfg(test)]
-pub(super) fn is_pass_tool(tool: &Value) -> bool {
-    tool_name(tool) == Some(PASS_TOOL_NAME)
-}
-
 fn is_default_route_name(name: &str) -> bool {
     matches!(
         canonical_target_name(name).as_str(),
@@ -1664,19 +1689,6 @@ fn is_default_route_name(name: &str) -> bool {
 
 fn canonical_target_name(name: &str) -> String {
     name.trim().replace('-', "_").to_ascii_uppercase()
-}
-
-#[cfg(test)]
-pub(super) fn classify_completion(completion: &Value) -> CompletionDecision {
-    classify_completion_with_targets(completion, &BTreeMap::new())
-}
-
-#[cfg(test)]
-fn classify_completion_with_targets(
-    completion: &Value,
-    targets: &BTreeMap<String, IntegratedTarget>,
-) -> CompletionDecision {
-    classify_completion_details(completion, targets, false).decision
 }
 
 fn classify_completion_details(

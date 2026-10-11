@@ -180,6 +180,7 @@ fn provider_put_body_merges_only_provided_fields() {
         ..crate::UpstreamConfig::default()
     };
     let body = ProviderPutBody {
+        enabled: None,
         kind: None,
         base_url: Some("http://127.0.0.1:9000/v1 ".to_string()),
         auth: None,
@@ -190,6 +191,9 @@ fn provider_put_body_merges_only_provided_fields() {
         connect_timeout_secs: None,
         pool_max_idle_per_host: None,
         pool_idle_timeout_secs: None,
+        fallback: None,
+        circuit_breaker_threshold: None,
+        circuit_breaker_cooldown_secs: None,
     };
     body.apply(&mut upstream).unwrap();
     assert_eq!(upstream.base_url, "http://127.0.0.1:9000/v1");
@@ -210,6 +214,7 @@ fn provider_put_body_merges_only_provided_fields() {
 fn provider_doc_edit_writes_section_style_tables() {
     let mut doc: DocumentMut = "listen_addr = \"127.0.0.1:4000\"\n".parse().unwrap();
     let body = ProviderPutBody {
+        enabled: None,
         kind: None,
         base_url: Some("http://127.0.0.1:11434/v1".to_string()),
         auth: None,
@@ -220,6 +225,9 @@ fn provider_doc_edit_writes_section_style_tables() {
         connect_timeout_secs: Some(2),
         pool_max_idle_per_host: None,
         pool_idle_timeout_secs: None,
+        fallback: Some(vec![" cloud/gpt ".to_string(), String::new()]),
+        circuit_breaker_threshold: Some(3),
+        circuit_breaker_cooldown_secs: Some(45),
     };
     let providers = ensure_table(&mut doc, "providers").unwrap();
     providers.set_implicit(true);
@@ -242,6 +250,9 @@ fn provider_doc_edit_writes_section_style_tables() {
     assert_eq!(provider.api_key_env.as_deref(), Some("LOCAL_KEY"));
     assert_eq!(provider.reasoning_effort, Some(crate::ReasoningEffort::Max));
     assert_eq!(provider.timeout_secs, 30);
+    assert_eq!(provider.fallback, ["cloud/gpt"]);
+    assert_eq!(provider.circuit_breaker_threshold, 3);
+    assert_eq!(provider.circuit_breaker_cooldown_secs, 45);
 }
 
 #[test]
@@ -281,4 +292,172 @@ fn integrated_doc_edit_writes_valid_target_tables() {
         config.integrated.instructions,
         "Route GUI work to the visual provider."
     );
+}
+
+#[test]
+fn deleting_a_provider_removes_every_reference_to_it() {
+    let raw = r#"
+[upstream]
+base_url = "http://127.0.0.1:9/v1"
+fallback = ["cloud", "other/m"]
+
+[providers.cloud]
+base_url = "https://api.example.com/v1"
+api_key = "k"
+
+[providers.other]
+base_url = "http://127.0.0.1:10/v1"
+fallback = ["cloud/m"]
+
+[model_aliases]
+plain = "local-model"
+big = { provider = "cloud", model = "m" }
+
+[integrated.targets.HARD]
+provider = "cloud"
+model = "m"
+
+[[routing_rules]]
+name = "to-target"
+route = "HARD"
+
+[[routing_rules]]
+name = "to-cloud"
+route = "cloud/m"
+
+[[routing_rules]]
+name = "keep"
+route = "PASS"
+
+[pricing]
+baseline_model = "cloud/m"
+[pricing.models]
+"cloud/m" = { input_per_mtok = 1.0, output_per_mtok = 2.0 }
+"other/x" = { input_per_mtok = 1.0, output_per_mtok = 1.0 }
+"#;
+    let mut config = parse_config(raw, "test").unwrap();
+    let removed = purge_provider(&mut config, "cloud").unwrap();
+    assert!(!config.providers.contains_key("cloud"));
+    assert_eq!(config.upstream.fallback, vec!["other/m".to_string()]);
+    assert!(config.providers["other"].fallback.is_empty());
+    assert!(
+        config.model_aliases.contains_key("plain") && !config.model_aliases.contains_key("big")
+    );
+    assert!(config.integrated.targets.is_empty());
+    assert_eq!(
+        config
+            .routing_rules
+            .iter()
+            .map(|rule| rule.name.as_str())
+            .collect::<Vec<_>>(),
+        ["keep"]
+    );
+    assert!(config.pricing.baseline_model.is_none());
+    assert!(
+        removed.iter().any(|item| item == "alias big"),
+        "{removed:?}"
+    );
+    validate_config(&config).unwrap();
+
+    let mut doc: DocumentMut = raw.parse().unwrap();
+    purge_provider_doc(&mut doc, "cloud", "default");
+    let reparsed = parse_config(&doc.to_string(), "test").unwrap();
+    assert!(!reparsed.providers.contains_key("cloud"));
+    assert_eq!(reparsed.routing_rules.len(), 1);
+    assert!(!reparsed.model_aliases.contains_key("big"));
+    assert!(reparsed.integrated.targets.is_empty());
+    assert_eq!(reparsed.upstream.fallback, vec!["other/m".to_string()]);
+    assert!(doc.to_string().contains("\"other/x\""));
+
+    let mut config = parse_config(raw, "test").unwrap();
+    assert!(
+        purge_provider(&mut config, "default").is_err(),
+        "default stays"
+    );
+}
+
+#[test]
+fn models_missing_from_a_catalog_become_its_first_model_in_config_and_file() {
+    let raw = r#"
+default_model = "gone"
+[upstream]
+base_url = "http://127.0.0.1:9/v1"
+fallback = ["cloud/old"]
+
+[providers.cloud]
+base_url = "https://api.example.com/v1"
+api_key = "k"
+
+[model_aliases]
+big = { provider = "cloud", model = "old" }
+fine = { provider = "cloud", model = "kept" }
+
+[[routing_rules]]
+name = "r"
+route = "cloud/old"
+"#;
+    let catalogs = HashMap::from([
+        ("default".to_string(), vec!["local-a".to_string()]),
+        (
+            "cloud".to_string(),
+            vec!["new".to_string(), "kept".to_string()],
+        ),
+    ]);
+    let mut config = parse_config(raw, "test").unwrap();
+    let fixes = model_sync::plan(&config, &catalogs);
+    model_sync::apply(&mut config, &fixes);
+    assert!(model_sync::plan(&config, &catalogs).is_empty());
+    assert_eq!(config.default_model.as_deref(), Some("local-a"));
+
+    let mut doc: DocumentMut = raw.parse().unwrap();
+    model_sync::write(&mut doc, &fixes, "default");
+    let saved = parse_config(&doc.to_string(), "test").unwrap();
+    assert!(model_sync::plan(&saved, &catalogs).is_empty(), "{doc}");
+    assert_eq!(saved.routing_rules[0].route, "cloud/new");
+    assert_eq!(saved.upstream.fallback, vec!["cloud/new".to_string()]);
+    assert!(
+        model_sync::plan(&saved, &HashMap::new()).is_empty(),
+        "empty catalogs change nothing"
+    );
+}
+
+#[test]
+fn a_turned_off_provider_is_never_routed_to() {
+    let raw = r#"
+routing_mode = "integrated"
+[upstream]
+base_url = "http://127.0.0.1:9/v1"
+
+[providers.cloud]
+enabled = false
+base_url = "https://api.example.com/v1"
+api_key = "k"
+
+[providers.lan]
+base_url = "http://10.0.0.5:8000/v1"
+
+[interceptor]
+provider = "default"
+model = "m"
+
+[integrated.targets.HARD]
+provider = "cloud"
+model = "m"
+hint = "hard"
+
+[integrated.targets.EASY]
+provider = "lan"
+model = "m"
+hint = "easy"
+"#;
+    let config = parse_config(raw, "test").unwrap();
+    validate_config(&config).unwrap();
+    assert!(
+        !effective_provider_configs(&config)
+            .unwrap()
+            .contains_key("cloud")
+    );
+    assert_eq!(config.active_targets().keys().collect::<Vec<_>>(), ["EASY"]);
+    let off_default = raw.replace("[upstream]", "[upstream]\nenabled = false");
+    assert!(validate_config(&parse_config(&off_default, "test").unwrap()).is_err());
 }

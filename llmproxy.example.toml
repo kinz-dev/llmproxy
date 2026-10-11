@@ -232,3 +232,34 @@ mode = "chat_completions"
 expose_aliases = true
 expose_upstream = true
 # cache_ttl_secs = 300 # optional; unset caches /v1/models indefinitely, 0 disables
+
+# Sharing: limit this node's on-prem model and share work with other llmproxy
+# nodes over a VPN. Pair from the admin Sharing page (copy your code, paste
+# theirs); the keys below are what that page writes.
+#
+# [listen_guard]
+# # Clients allowed on listen_addr. Loopback is always allowed; [] allows all.
+# allowed_sources = ["192.168.0.0/16", "127.0.0.1"]
+#
+# An old [cluster] table still loads; the admin rewrites it as [sharing] on save.
+# [sharing]
+# mode = "peers"                     # "local" (default) or "peers"
+# node_name = "home"                 # defaults to the host name
+# peer_listen = "0.0.0.0:4040"       # default; opens with the first enabled peer
+# advertise_url = "http://10.8.0.1:4040"  # the address shown to peers when they reach another one
+# onprem_provider = "default"        # defaults to default_provider
+# local_limit = 6                    # 0 (default) = no limit
+# send_outgoing = true               # to peers when full or down
+# accept_incoming = true
+# incoming_limit = 2
+# queue_depth = 8                    # 0 rejects immediately when full
+# queue_wait_ms = 1000
+# retry_after_secs = 2
+# cloud_overflow = "openai/gpt-5.5"  # when full; unset = off
+# cloud_overflow_modes = { proxy = true, intercept = true, integrated = true }
+#
+# [peers.office]
+# url = "http://10.8.0.2:4040"
+# public_key = "ed25519:..."
+# send_outgoing = true
+# accept_incoming = true

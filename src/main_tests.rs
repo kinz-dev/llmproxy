@@ -668,6 +668,7 @@ fn test_state_with_config(config: Config) -> AppState {
         launcher_kind: None,
         launcher_mode: None,
         forward_caller_credentials,
+        sharing: None,
     }
 }
 
@@ -5215,6 +5216,7 @@ pub(crate) mod test_support {
             launcher_kind: None,
             launcher_mode: None,
             forward_caller_credentials,
+            sharing: None,
         }
     }
 

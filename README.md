@@ -107,3 +107,10 @@ llmproxy --shutdown  # stop
 See [`llmproxy.example.toml`](llmproxy.example.toml) for the complete,
 credential-free reference. Builds target the current OS and architecture; CI
 checks Linux, macOS, and Windows on x86_64 and ARM64.
+
+## Docker
+
+The `Dockerfile` builds on amd64 and arm64 (for example DGX Spark).
+`build-and-deploy.sh` builds the image for the target host's CPU, ships it over
+SSH, and runs it on the host network with that host's `~/.llmproxy/config.toml`.
+Put the host in a git-ignored `deploy.env` (see `deploy.env.example`).

@@ -853,7 +853,7 @@ async fn a_policy_change_revokes_cached_clears_and_sticky_sessions() {
     );
 
     revoke_cached_state();
-    crate::privacy::clear_sensitive_sessions();
+    clear_sensitive_sessions();
 }
 
 #[tokio::test]
@@ -1235,4 +1235,49 @@ async fn privacy_state_is_not_reusable_across_providers_or_forged() {
 #[allow(dead_code)]
 fn unused_imports_keep_the_compiler_happy(map: HashMap<String, String>) -> HashMap<String, String> {
     map
+}
+
+impl PrivacyDecision {
+    fn merge_sticky(&mut self, sticky: &PrivacyDecision) {
+        if sensitivity_rank(sticky.classification) > sensitivity_rank(self.classification) {
+            self.classification = sticky.classification;
+            self.source_label = sticky.source_label;
+            for category in &sticky.categories {
+                if !self.categories.contains(category) {
+                    self.categories.push(*category);
+                }
+            }
+        }
+    }
+}
+
+impl HopPrivacy {
+    fn decision_mut(&mut self) -> &mut PrivacyDecision {
+        &mut self.decision
+    }
+}
+
+fn clear_sensitive_sessions() {
+    let mut guard = sensitive_sessions().entries.lock().unwrap();
+    guard.0.clear();
+    guard.1.clear();
+}
+
+fn prime_verified_clear(
+    body: &Value,
+    fingerprint: u64,
+    classification: Classification,
+    categories: Vec<SensitiveCategory>,
+) {
+    let canonical = canonical_chat_request(body);
+    let digest = content_digest(&provider_payload_text(&canonical));
+    cache_classification(digest, fingerprint, classification, categories);
+}
+
+fn revoke_cached_state() {
+    let mut guard = classification_cache().entries.lock().unwrap();
+    guard.0.clear();
+    guard.1.clear();
+    drop(guard);
+    clear_sensitive_sessions();
 }

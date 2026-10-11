@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     ffi::OsString,
     fs, io,
@@ -53,6 +53,7 @@ mod latency;
 mod logging;
 mod oauth;
 mod privacy;
+mod sharing;
 mod stats;
 mod token_estimate;
 
@@ -163,6 +164,10 @@ struct Cli {
     /// Internal: keep the proxy in the foreground instead of daemonizing.
     #[arg(long, hide = true)]
     foreground: bool,
+
+    /// Print this node's peer public key (creating the key on first use) and exit.
+    #[arg(long)]
+    peer_key: bool,
 }
 
 impl Cli {
@@ -260,6 +265,12 @@ struct Config {
     pricing: PricingConfig,
     /// Opt-in confidentiality boundary for public model dispatch.
     privacy: PrivacyConfig,
+    /// Local limit, peer offload, and cloud overflow.
+    sharing: sharing::SharingConfig,
+    /// Registered peers, keyed by a local label and identified by public key.
+    peers: BTreeMap<String, sharing::PeerConfig>,
+    /// Source networks admitted on the proxy (priority) listener.
+    listen_guard: sharing::ListenGuardConfig,
     /// The one routing behavior for this instance. Legacy configs without this
     /// key migrate from the per-section `enabled` flags in `parse_config`.
     routing_mode: RoutingMode,
@@ -290,6 +301,9 @@ impl Default for Config {
             routing_rules: Vec::new(),
             pricing: PricingConfig::default(),
             privacy: PrivacyConfig::default(),
+            sharing: sharing::SharingConfig::default(),
+            peers: BTreeMap::new(),
+            listen_guard: sharing::ListenGuardConfig::default(),
             routing_mode: RoutingMode::Proxy,
             model_routing: ModelRoutingMode::Remap,
             anthropic_mode: AnthropicMode::ChatCompletions,
@@ -318,6 +332,57 @@ impl Config {
                 )
             })
             .collect()
+    }
+
+    pub(crate) fn set_pricing(
+        &mut self,
+        baseline_model: Option<String>,
+        models: HashMap<String, (f64, f64)>,
+    ) {
+        self.pricing = PricingConfig {
+            baseline_model,
+            models: models
+                .into_iter()
+                .map(|(key, (input_per_mtok, output_per_mtok))| {
+                    (
+                        key,
+                        ModelPriceConfig {
+                            input_per_mtok,
+                            output_per_mtok,
+                        },
+                    )
+                })
+                .collect(),
+        };
+    }
+
+    pub(crate) fn provider_enabled(&self, name: &str) -> bool {
+        name == self.default_provider || self.providers.get(name).is_none_or(|p| p.enabled)
+    }
+
+    /// Integrated targets whose provider is on. Borrowed unless one is off.
+    pub(crate) fn active_targets(
+        &self,
+    ) -> std::borrow::Cow<'_, BTreeMap<String, interceptor::IntegratedTarget>> {
+        let targets = &self.integrated.targets;
+        if targets.values().all(|t| self.provider_enabled(&t.provider)) {
+            return std::borrow::Cow::Borrowed(targets);
+        }
+        std::borrow::Cow::Owned(
+            targets
+                .iter()
+                .filter(|(_, t)| self.provider_enabled(&t.provider))
+                .map(|(name, t)| (name.clone(), t.clone()))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn provider_config(&self, name: &str) -> Option<&UpstreamConfig> {
+        if name == self.default_provider {
+            Some(&self.upstream)
+        } else {
+            self.providers.get(name)
+        }
     }
 
     /// `routing_mode` is authoritative: the per-section `enabled` flags are
@@ -539,6 +604,8 @@ impl ModelAlias {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 struct UpstreamConfig {
+    /// Off keeps the provider configured but unused by any route.
+    enabled: bool,
     kind: ProviderKind,
     base_url: String,
     api_key: Option<String>,
@@ -564,6 +631,7 @@ struct UpstreamConfig {
 impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             kind: ProviderKind::OpenAiCompatible,
             base_url: env::var("OPENAI_BASE_URL")
                 .or_else(|_| env::var("VLLM_BASE_URL"))
@@ -755,6 +823,9 @@ struct AppState {
     launcher_kind: Option<LauncherKind>,
     launcher_mode: Option<LauncherMode>,
     forward_caller_credentials: bool,
+    /// `None` disables sharing scheduling for this state: tests, and inbound
+    /// peer jobs, which must never be scheduled onward.
+    sharing: Option<Arc<sharing::SharingRuntime>>,
 }
 
 const LAUNCHER_EXTERNAL_PROVIDER: &str = "__launcher_external";
@@ -1435,6 +1506,12 @@ async fn main() -> Result<()> {
     }
 
     let (config, config_path) = load_config(&cli)?;
+    if cli.peer_key {
+        let key = sharing::load_or_create_key(&config.sharing)?;
+        println!("{}", key.public_key());
+        println!("fingerprint: {}", key.fingerprint());
+        return Ok(());
+    }
     let logging_guard = logging::init(
         cli.foreground,
         agent_launcher::home_dir().as_deref(),
@@ -1497,12 +1574,14 @@ async fn run_server(
     for (name, upstream) in effective_provider_configs(&config)? {
         providers.insert(name.clone(), build_provider_state(name, upstream)?);
     }
+    let sharing_runtime = sharing::SharingRuntime::new(config.clone())?;
     let state = attach_privacy_boundary(AppState {
         config: config.clone(),
         providers: Arc::new(providers),
         launcher_kind: None,
         launcher_mode: None,
         forward_caller_credentials: config.routing_mode != RoutingMode::Integrated,
+        sharing: Some(sharing_runtime.clone()),
     });
     let shared = SharedState::new(state.clone());
 
@@ -1557,10 +1636,22 @@ async fn run_server(
     } else {
         None
     };
+    let peer_addr = sharing::spawn_peer_listener(shared.clone()).await?;
+    sharing::spawn_status_poller(sharing_runtime.clone());
     let runtime_info = RuntimeInfo::new(bound_addr, admin_addr, config.routing_mode, log_file);
     let _runtime_info_file = RuntimeInfoGuard::create(bound_addr, &runtime_info)?;
     println!("{}", startup_banner(&runtime_info, "running"));
+    if let Some(peer_addr) = peer_addr {
+        println!("peer listener: http://{peer_addr}");
+    }
+    if !config.listen_guard.allowed_sources.is_empty() {
+        println!(
+            "proxy sources: loopback, {}",
+            config.listen_guard.allowed_sources.join(", ")
+        );
+    }
 
+    let listener = sharing::GuardedListener::new(listener, sharing_runtime);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -2382,11 +2473,16 @@ fn read_config(path: &FsPath) -> Result<Config> {
 /// `routing_mode` existed declared the same thing with two `enabled` flags, so
 /// they migrate here; enabling both was never a valid instance shape.
 fn parse_config(raw: &str, source: &str) -> Result<Config> {
-    let document = raw
+    let mut document = raw
         .parse::<toml::Table>()
         .with_context(|| format!("invalid TOML config {source}"))?;
-    let mut config: Config =
-        toml::from_str(raw).with_context(|| format!("invalid TOML config {source}"))?;
+    sharing::migrate_legacy(&mut document);
+    let mut config: Config = toml::Value::Table(document.clone())
+        .try_into()
+        .with_context(|| format!("invalid TOML config {source}"))?;
+    if config.sharing.onprem_provider.is_empty() {
+        config.sharing.onprem_provider = config.default_provider.clone();
+    }
     if !document.contains_key("routing_mode") {
         config.routing_mode = match (config.interceptor.enabled, config.integrated.enabled) {
             (false, false) => RoutingMode::Proxy,
@@ -2426,8 +2522,12 @@ const CONFIG_KEYS: &[&str] = &[
     "routing_rules",
     "pricing",
     "privacy",
+    "sharing",
+    "peers",
+    "listen_guard",
 ];
 const PROVIDER_KEYS: &[&str] = &[
+    "enabled",
     "kind",
     "base_url",
     "api_key",
@@ -2603,7 +2703,18 @@ fn warn_on_unknown_config_keys(document: &toml::Table, source: &str, found: &mut
             }
         }
     }
+    if let Some(sharing) = table(document, "sharing") {
+        check(sharing, "sharing", sharing::SHARING_KEYS, found);
+    }
+    if let Some(peers) = table(document, "peers") {
+        for (name, item) in peers {
+            if let Some(peer) = item.as_table() {
+                check(peer, &format!("peers.{name}"), sharing::PEER_KEYS, found);
+            }
+        }
+    }
     for (section, known) in [
+        ("listen_guard", sharing::LISTEN_GUARD_KEYS),
         ("chat", CHAT_KEYS),
         ("responses", RESPONSES_KEYS),
         ("models", MODELS_KEYS),
@@ -2644,6 +2755,13 @@ fn resolve_api_key_with_env(
 }
 
 fn effective_provider_configs(config: &Config) -> Result<HashMap<String, UpstreamConfig>> {
+    let mut providers = configured_provider_configs(config)?;
+    providers.retain(|name, provider| provider.enabled || *name == config.default_provider);
+    Ok(providers)
+}
+
+/// Every configured provider, including ones turned off.
+fn configured_provider_configs(config: &Config) -> Result<HashMap<String, UpstreamConfig>> {
     let mut providers = config.providers.clone();
     if !providers.contains_key(&config.default_provider) {
         if config.default_provider == "default" {
@@ -3073,13 +3191,13 @@ async fn model_by_id_impl(
             Err(error_response) => error_response,
         };
     }
-    if model == INTEGRATED_AUTO_MODEL && !state.config.integrated.targets.is_empty() {
+    if model == INTEGRATED_AUTO_MODEL && !state.config.active_targets().is_empty() {
         return Json(integrated_auto_model()).into_response();
     }
     if let Some(route) = state.config.model_aliases.get(&model) {
         let provider_name = route.provider(&state.config.default_provider);
         let Some(provider) = state.providers.get(provider_name) else {
-            return unknown_provider_response(provider_name);
+            return unknown_provider_response(&state.config, provider_name);
         };
         provider.model_cache.log_first_seen_model(
             provider_name,
@@ -3096,7 +3214,7 @@ async fn model_by_id_impl(
     }
     if let Some((provider_name, target)) = namespaced_model_target(&state.config, &model) {
         let Some(provider) = state.providers.get(provider_name) else {
-            return unknown_provider_response(provider_name);
+            return unknown_provider_response(&state.config, provider_name);
         };
         provider.model_cache.log_first_seen_model(
             provider_name,
@@ -3280,10 +3398,18 @@ async fn chat_completions_impl(
     headers: HeaderMap,
     body: Value,
 ) -> Response {
-    let state = match request_state(shared, launcher_token) {
-        Ok(state) => state,
-        Err(response) => return *response,
-    };
+    match request_state(shared, launcher_token) {
+        Ok(state) => chat_completions_with_state(state, launcher_token, headers, body).await,
+        Err(response) => *response,
+    }
+}
+
+pub(crate) async fn chat_completions_with_state(
+    state: AppState,
+    launcher_token: Option<&str>,
+    headers: HeaderMap,
+    body: Value,
+) -> Response {
     trace_client_request(
         "chat_completions",
         launcher_token,
@@ -3303,7 +3429,7 @@ async fn chat_completions_impl(
             &enforcement,
         );
     }
-    let routing_audit = if state.triage_enabled() {
+    let mut routing_audit = if state.triage_enabled() {
         match maybe_intercept(
             &state,
             &headers,
@@ -3325,14 +3451,18 @@ async fn chat_completions_impl(
     };
 
     let mut body = body;
-    let provider = match rewrite_proxy_request_value(&state, &headers, &mut body).await {
-        Ok(provider) => provider,
-        Err(error_response) => {
-            if let Some(audit) = routing_audit {
-                audit.record_route_error("normal routing rejected the request");
-            }
-            return *error_response;
-        }
+    let (provider, permit) = match schedule_and_rewrite(
+        &state,
+        &headers,
+        InterceptorProtocol::ChatCompletions,
+        &mut body,
+        started,
+        &mut routing_audit,
+    )
+    .await
+    {
+        Ok(scheduled) => scheduled,
+        Err(error_response) => return *error_response,
     };
     let provider_headers = provider_request_headers(&state, &headers, &provider);
     if state.launcher_kind != Some(LauncherKind::Copilot) {
@@ -3381,7 +3511,7 @@ async fn chat_completions_impl(
         )
         .await
     };
-    track_response(
+    let response = track_response(
         ResponseTracking::new(
             served.class,
             &served.provider,
@@ -3397,7 +3527,8 @@ async fn chat_completions_impl(
             &served.model,
         )),
         response,
-    )
+    );
+    sharing::hold(response, permit)
 }
 
 async fn responses(
@@ -3423,10 +3554,18 @@ async fn responses_impl(
     headers: HeaderMap,
     body: Value,
 ) -> Response {
-    let state = match request_state(shared, launcher_token) {
-        Ok(state) => state,
-        Err(response) => return *response,
-    };
+    match request_state(shared, launcher_token) {
+        Ok(state) => responses_with_state(state, launcher_token, headers, body).await,
+        Err(response) => *response,
+    }
+}
+
+pub(crate) async fn responses_with_state(
+    state: AppState,
+    launcher_token: Option<&str>,
+    headers: HeaderMap,
+    body: Value,
+) -> Response {
     trace_client_request(
         "responses",
         launcher_token,
@@ -3451,7 +3590,7 @@ async fn responses_impl(
             &enforcement,
         );
     }
-    let routing_audit = if state.triage_enabled() {
+    let mut routing_audit = if state.triage_enabled() {
         let policy = InterceptionPolicy::for_responses(&headers, &body);
         let local_chat_request = responses_to_chat_request(&body);
         match maybe_intercept(
@@ -3473,14 +3612,18 @@ async fn responses_impl(
     };
 
     let mut rewritten = body;
-    let provider = match rewrite_proxy_request_value(&state, &headers, &mut rewritten).await {
-        Ok(provider) => provider,
-        Err(error_response) => {
-            if let Some(audit) = routing_audit {
-                audit.record_route_error("normal routing rejected the request");
-            }
-            return *error_response;
-        }
+    let (provider, permit) = match schedule_and_rewrite(
+        &state,
+        &headers,
+        InterceptorProtocol::Responses,
+        &mut rewritten,
+        started,
+        &mut routing_audit,
+    )
+    .await
+    {
+        Ok(scheduled) => scheduled,
+        Err(error_response) => return *error_response,
     };
     let passthrough = state.config.responses.mode == ResponsesMode::Passthrough
         && matches!(
@@ -3532,7 +3675,7 @@ async fn responses_impl(
         )
         .await
     };
-    track_response(
+    let response = track_response(
         ResponseTracking::new(
             served.class,
             &served.provider,
@@ -3548,7 +3691,8 @@ async fn responses_impl(
             &served.model,
         )),
         response,
-    )
+    );
+    sharing::hold(response, permit)
 }
 
 async fn anthropic_messages(
@@ -3574,10 +3718,18 @@ async fn anthropic_messages_impl(
     headers: HeaderMap,
     body: Value,
 ) -> Response {
-    let state = match request_state(shared, launcher_token) {
-        Ok(state) => state,
-        Err(response) => return *response,
-    };
+    match request_state(shared, launcher_token) {
+        Ok(state) => anthropic_messages_with_state(state, launcher_token, headers, body).await,
+        Err(response) => *response,
+    }
+}
+
+pub(crate) async fn anthropic_messages_with_state(
+    state: AppState,
+    launcher_token: Option<&str>,
+    headers: HeaderMap,
+    body: Value,
+) -> Response {
     trace_client_request(
         "anthropic_messages",
         launcher_token,
@@ -3603,7 +3755,7 @@ async fn anthropic_messages_impl(
             &enforcement,
         );
     }
-    let routing_audit = if state.triage_enabled() {
+    let mut routing_audit = if state.triage_enabled() {
         let local_chat_request = anthropic_message_to_chat_request(&body);
         match maybe_intercept(
             &state,
@@ -3624,14 +3776,18 @@ async fn anthropic_messages_impl(
     };
 
     let mut rewritten = body;
-    let provider = match rewrite_proxy_request_value(&state, &headers, &mut rewritten).await {
-        Ok(provider) => provider,
-        Err(error_response) => {
-            if let Some(audit) = routing_audit {
-                audit.record_route_error("normal routing rejected the request");
-            }
-            return *error_response;
-        }
+    let (provider, permit) = match schedule_and_rewrite(
+        &state,
+        &headers,
+        InterceptorProtocol::AnthropicMessages,
+        &mut rewritten,
+        started,
+        &mut routing_audit,
+    )
+    .await
+    {
+        Ok(scheduled) => scheduled,
+        Err(error_response) => return *error_response,
     };
     let native_anthropic = provider.config.kind == ProviderKind::Anthropic
         || (provider.config.kind == ProviderKind::Copilot
@@ -3675,7 +3831,7 @@ async fn anthropic_messages_impl(
         };
         let model_started = Instant::now();
         let response = proxy_json(&provider, &provider_headers, upstream_path, &rewritten).await;
-        return track_response(
+        let response = track_response(
             ResponseTracking::new(
                 class,
                 &provider.name,
@@ -3688,6 +3844,7 @@ async fn anthropic_messages_impl(
             .with_pricing(request_pricing(&state.config, &provider.name, &model)),
             response,
         );
+        return sharing::hold(response, permit);
     }
     let mut chat_request = anthropic_message_to_chat_request(&rewritten);
     normalize_chat_completion_request(&mut chat_request, &state.config);
@@ -3706,7 +3863,7 @@ async fn anthropic_messages_impl(
         screened_hop,
     )
     .await;
-    track_response(
+    let response = track_response(
         ResponseTracking::new(
             served.class,
             &served.provider,
@@ -3722,7 +3879,8 @@ async fn anthropic_messages_impl(
             &served.model,
         )),
         response,
-    )
+    );
+    sharing::hold(response, permit)
 }
 
 async fn anthropic_count_tokens(Json(body): Json<Value>) -> Response {
@@ -4052,6 +4210,51 @@ async fn rewrite_proxy_request_value(
     value: &mut Value,
 ) -> ResponseResult<ProviderState> {
     let provider = route_request(state, value)?;
+    rewrite_routed_request_value(state, incoming_headers, value, provider).await
+}
+
+/// Sharing scheduling (which may serve the request on a peer or reject it)
+/// followed by normal model rewriting for the provider it settled on.
+async fn schedule_and_rewrite(
+    state: &AppState,
+    incoming_headers: &HeaderMap,
+    wire: InterceptorProtocol,
+    value: &mut Value,
+    started: Instant,
+    audit: &mut Option<Box<interceptor::RoutingAuditDraft>>,
+) -> ResponseResult<(ProviderState, Option<sharing::SlotPermit>)> {
+    let scheduled = match sharing::schedule(state, incoming_headers, wire, value, started, audit)
+        .await
+    {
+        Ok(scheduled) => scheduled,
+        Err(response) => {
+            if let Some(audit) = audit.take() {
+                audit.record_route_error(if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                    "no execution slot or overflow tier was available"
+                } else {
+                    "normal routing rejected the request"
+                });
+            }
+            return Err(response);
+        }
+    };
+    match rewrite_routed_request_value(state, incoming_headers, value, scheduled.provider).await {
+        Ok(provider) => Ok((provider, scheduled.permit)),
+        Err(response) => {
+            if let Some(audit) = audit.take() {
+                audit.record_route_error("normal routing rejected the request");
+            }
+            Err(response)
+        }
+    }
+}
+
+async fn rewrite_routed_request_value(
+    state: &AppState,
+    incoming_headers: &HeaderMap,
+    value: &mut Value,
+    provider: ProviderState,
+) -> ResponseResult<ProviderState> {
     if state.config.model_routing == ModelRoutingMode::Passthrough {
         return Ok(provider);
     }
@@ -4126,7 +4329,7 @@ fn route_request(state: &AppState, value: &Value) -> ResponseResult<ProviderStat
         .providers
         .get(&provider_name)
         .cloned()
-        .ok_or_else(|| Box::new(unknown_provider_response(&provider_name)))
+        .ok_or_else(|| Box::new(unknown_provider_response(&state.config, &provider_name)))
 }
 
 fn collect_routed_providers(value: &Value, config: &Config, providers: &mut HashSet<String>) {
@@ -4161,12 +4364,17 @@ fn namespaced_model_target<'a>(config: &Config, model: &'a str) -> Option<(&'a s
         .then_some((provider, target))
 }
 
-fn unknown_provider_response(provider: &str) -> Response {
+fn unknown_provider_response(config: &Config, provider: &str) -> Response {
+    let message = if config.providers.contains_key(provider) {
+        format!("upstream provider {provider} is turned off")
+    } else {
+        format!("unknown upstream provider: {provider}")
+    };
     (
         StatusCode::BAD_REQUEST,
         Json(json!({
             "error": {
-                "message": format!("unknown upstream provider: {provider}"),
+                "message": message,
                 "type": "invalid_request_error"
             }
         })),
@@ -4862,7 +5070,6 @@ struct FailoverHop {
 pub(crate) struct ServedBy {
     pub(crate) provider: String,
     pub(crate) model: String,
-    #[allow(dead_code)]
     pub(crate) class: RouteClass,
 }
 
@@ -5389,6 +5596,50 @@ impl AppState {
             launcher_kind: None,
             launcher_mode: Some(session.mode()),
             forward_caller_credentials: false,
+            sharing: self.sharing.clone(),
+        })
+    }
+
+    /// The state an inbound peer job runs under: the on-prem provider is the only
+    /// destination, with no aliases, rules, triage, fallbacks, or sharing
+    /// scheduling, and caller credentials are never forwarded. Unknown models
+    /// map to the on-prem provider's configured or first catalog model.
+    fn inbound_peer_state(&self) -> Result<Self> {
+        let local_name = self.config.sharing.onprem_provider.clone();
+        let local = self
+            .providers
+            .get(&local_name)
+            .with_context(|| format!("sharing.onprem_provider {local_name:?} is not running"))?;
+        let mut config = (*self.config).clone();
+        if config.default_provider != local_name {
+            config.default_model = None;
+            config.upstream = (*local.config).clone();
+        }
+        config.default_provider = local_name.clone();
+        config.upstream.fallback.clear();
+        config.providers.clear();
+        config.model_aliases.clear();
+        config.routing_rules.clear();
+        config.model_routing = ModelRoutingMode::Remap;
+        config.set_routing_mode(RoutingMode::Proxy);
+        config.interceptor.reject_sensitive = false;
+        // The sole destination is the validated on-prem provider, so the
+        // public-dispatch boundary has nothing to guard here.
+        config.privacy = PrivacyConfig::default();
+        let mut local_config = (*local.config).clone();
+        local_config.fallback.clear();
+        let provider = ProviderState {
+            config: Arc::new(local_config),
+            privacy_state: None,
+            ..local.clone()
+        };
+        Ok(Self {
+            config: Arc::new(config),
+            providers: Arc::new(HashMap::from([(local_name, provider)])),
+            launcher_kind: None,
+            launcher_mode: None,
+            forward_caller_credentials: false,
+            sharing: None,
         })
     }
 
@@ -5401,6 +5652,7 @@ impl AppState {
             launcher_kind: None,
             launcher_mode: Some(session.mode()),
             forward_caller_credentials: false,
+            sharing: self.sharing.clone(),
         })
     }
 
@@ -5464,6 +5716,7 @@ impl AppState {
             launcher_kind: Some(session.kind()),
             launcher_mode: Some(session.mode()),
             forward_caller_credentials: true,
+            sharing: self.sharing.clone(),
         })
     }
 }
@@ -8245,7 +8498,26 @@ fn unix_timestamp() -> i64 {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
-    let providers = effective_provider_configs(config)?;
+    let providers = configured_provider_configs(config)?;
+    let turned_off = |name: &str| providers.get(name).is_some_and(|p| !p.enabled);
+    if turned_off(&config.default_provider) {
+        bail!(
+            "the default provider {:?} cannot be turned off",
+            config.default_provider
+        );
+    }
+    if config.routing_mode != RoutingMode::Proxy && turned_off(&config.interceptor.provider) {
+        bail!(
+            "triage provider {:?} is turned off; turn it on or choose another",
+            config.interceptor.provider
+        );
+    }
+    if config.sharing.schedules() && turned_off(&config.sharing.onprem_provider) {
+        bail!(
+            "on-prem provider {:?} is turned off; sharing needs it",
+            config.sharing.onprem_provider
+        );
+    }
     for (name, provider) in &providers {
         if name.is_empty() || name.contains('/') {
             bail!("provider names must be non-empty and cannot contain '/': {name:?}");
@@ -8372,6 +8644,7 @@ fn validate_config(config: &Config) -> Result<()> {
             );
         }
     }
+    sharing::validate(config)?;
     Ok(())
 }
 

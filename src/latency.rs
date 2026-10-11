@@ -258,6 +258,9 @@ pub(crate) struct RequestTiming {
     /// slow-to-first-token request does not bill the provider's time to the
     /// proxy's own overhead.
     upstream_micros: AtomicU32,
+    /// Time spent waiting for a sharing execution slot. It is neither the
+    /// proxy's work nor the provider's, so it is excluded from both.
+    queue_micros: AtomicU32,
 }
 
 impl RequestTiming {
@@ -272,6 +275,10 @@ impl RequestTiming {
 
     pub(crate) fn upstream_wait(&self) -> Duration {
         Duration::from_micros(u64::from(self.upstream_micros.load(Ordering::Relaxed)))
+    }
+
+    pub(crate) fn queue_wait(&self) -> Duration {
+        Duration::from_micros(u64::from(self.queue_micros.load(Ordering::Relaxed)))
     }
 }
 
@@ -297,6 +304,15 @@ pub(crate) fn current_timing() -> Option<Arc<RequestTiming>> {
 /// no-op rather than an error: unattributed work simply is not attributed.
 pub(crate) fn add_upstream_wait(elapsed: Duration) {
     let _ = REQUEST_TIMING.try_with(|timing| timing.add_upstream(elapsed));
+}
+
+/// Record the current request's wait for a sharing execution slot.
+pub(crate) fn add_queue_wait(elapsed: Duration) {
+    let _ = REQUEST_TIMING.try_with(|timing| {
+        timing
+            .queue_micros
+            .fetch_add(saturating_micros(elapsed), Ordering::Relaxed)
+    });
 }
 
 /// The upstream wait accumulated so far for the current request. Production

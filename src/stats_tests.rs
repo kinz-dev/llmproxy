@@ -536,3 +536,11 @@ fn previews_are_single_line_and_truncated_to_the_budget() {
     assert!(big.starts_with(r#"{"content":"yyy"#), "got: {big}");
     assert!(big.ends_with('…'));
 }
+
+fn usage_tokens(usage: &Value) -> Option<(u64, u64)> {
+    let (input, output) = usage_token_fields(usage);
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    Some((input.unwrap_or(0), output.unwrap_or(0)))
+}
